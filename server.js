@@ -2,9 +2,13 @@
 // home router, so nothing on the internet can reach it directly); viewers
 // on any phone/browser watch the latest frames as an MJPEG stream.
 //
-//   POST /push       camera → relay   (header X-Cam-Key: $CAM_KEY, body: JPEG)
-//                    replies with the live viewer count so the camera can
-//                    slow down when nobody is watching
+//   GET  /ws         camera → relay WebSocket (header X-Cam-Key: $CAM_KEY).
+//                    Binary messages are JPEG frames; the relay sends the
+//                    live viewer count as a text message every second so the
+//                    camera can slow down when nobody is watching
+//   POST /push       older one-request-per-frame uplink (same key, body: JPEG,
+//                    replies with the viewer count). Much slower over long
+//                    distances: every frame waits a full round trip
 //   GET  /?key=      viewer page      (key: $VIEW_KEY)
 //   GET  /stream     MJPEG stream     (?key=)
 //   GET  /snapshot   latest JPEG      (?key=)
@@ -66,16 +70,20 @@ function handlePush(req, res) {
   });
   req.on('end', () => {
     if (res.writableEnded) return;
-    const frame = Buffer.concat(chunks);
-    if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) return send(res, 400, 'text/plain', 'not a JPEG');
-    latestFrame = frame;
-    latestAt = Date.now();
-    for (const v of streamViewers) {
-      if (v.writableLength > 2 * frame.length) continue;   // slow viewer: drop this frame for them
-      writeFrame(v, frame);
-    }
+    if (!acceptFrame(Buffer.concat(chunks))) return send(res, 400, 'text/plain', 'not a JPEG');
     send(res, 200, 'text/plain', String(viewerCount()));
   });
+}
+
+function acceptFrame(frame) {
+  if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) return false;
+  latestFrame = frame;
+  latestAt = Date.now();
+  for (const v of streamViewers) {
+    if (v.writableLength > 2 * frame.length) continue;   // slow viewer: drop this frame for them
+    writeFrame(v, frame);
+  }
+  return true;
 }
 
 function handleStream(req, res) {
@@ -87,6 +95,7 @@ function handleStream(req, res) {
   });
   if (latestFrame) writeFrame(res, latestFrame);
   streamViewers.add(res);
+  notifyCamera();   // speed the camera up now, not at the next tick
   // res (not req): req 'close' fires once the request body is consumed, not on disconnect
   const drop = () => streamViewers.delete(res);
   res.on('close', drop);
@@ -126,6 +135,76 @@ const server = http.createServer((req, res) => {
     default:
       return send(res, 404, 'text/plain', 'not found');
   }
+});
+
+// ── Camera WebSocket uplink ─────────────────────────────────────────────
+// Minimal RFC 6455 server for the single camera connection, so the relay
+// stays dependency-free.
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+let camSocket = null;
+
+function wsFrame(opcode, payload) {
+  const n = payload.length;
+  const head = n < 126 ? Buffer.from([0x80 | opcode, n])
+    : n < 65536 ? Buffer.from([0x80 | opcode, 126, n >> 8, n & 0xff])
+    : (() => { const h = Buffer.alloc(10); h[0] = 0x80 | opcode; h[1] = 127; h.writeBigUInt64BE(BigInt(n), 2); return h; })();
+  return Buffer.concat([head, payload]);
+}
+
+function notifyCamera() {
+  if (camSocket && !camSocket.destroyed) camSocket.write(wsFrame(0x1, Buffer.from(String(viewerCount()))));
+}
+setInterval(notifyCamera, 1000);
+
+server.on('upgrade', (req, socket) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname !== '/ws' || String(req.headers.upgrade).toLowerCase() !== 'websocket' ||
+      !req.headers['sec-websocket-key'] || !keyMatches(req.headers['x-cam-key'], CAM_KEY)) {
+    socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    return;
+  }
+  const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + WS_GUID).digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+               `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
+  socket.setNoDelay(true);
+  if (camSocket) camSocket.destroy();   // newest camera connection wins
+  camSocket = socket;
+  console.log('camera connected');
+  notifyCamera();
+
+  let buf = Buffer.alloc(0);
+  let parts = [];
+  let partsLen = 0;
+  socket.on('data', (chunk) => {
+    buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+    for (;;) {
+      if (buf.length < 2) return;
+      const fin = buf[0] & 0x80, opcode = buf[0] & 0x0f, masked = buf[1] & 0x80;
+      let len = buf[1] & 0x7f, off = 2;
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+      if (partsLen + len > MAX_FRAME_BYTES) { socket.destroy(); return; }
+      const maskAt = off;
+      if (masked) off += 4;
+      if (buf.length < off + len) return;   // wait for the rest of this message
+      const payload = Buffer.from(buf.subarray(off, off + len));
+      if (masked) for (let i = 0; i < len; i++) payload[i] ^= buf[maskAt + (i & 3)];
+      buf = buf.subarray(off + len);
+
+      if (opcode === 0x8) { socket.end(wsFrame(0x8, Buffer.alloc(0))); return; }   // close
+      if (opcode === 0x9) { socket.write(wsFrame(0xA, payload)); continue; }        // ping → pong
+      if (opcode === 0x2 || opcode === 0x0) {                                        // binary / continuation
+        parts.push(payload);
+        partsLen += len;
+        if (fin) { acceptFrame(Buffer.concat(parts)); parts = []; partsLen = 0; }
+      }
+    }
+  });
+  socket.on('error', () => socket.destroy());
+  socket.on('close', () => {
+    if (camSocket === socket) camSocket = null;
+    console.log('camera disconnected');
+  });
 });
 
 server.listen(PORT, () => console.log(`cam relay listening on :${PORT}`));

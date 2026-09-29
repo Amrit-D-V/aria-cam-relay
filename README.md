@@ -3,7 +3,7 @@
 Lets you watch an ESP32-CAM from any phone or browser. The camera sits behind a home router, so it pushes JPEG frames out to this relay, which serves them to viewers as a live MJPEG stream.
 
 ```
-ESP32-CAM ──POST /push (HTTPS)──▶ relay (Render) ──MJPEG──▶ viewers
+ESP32-CAM ──WebSocket (wss)──▶ relay (Render) ──MJPEG──▶ viewers
 ```
 
 It has no dependencies and runs on Node's `http` module only. The relay tells the camera how many people are watching, so the camera slows to one frame every 3 seconds when nobody is.
@@ -23,7 +23,8 @@ To revoke everyone's access, change `VIEW_KEY`.
 
 | Route | Auth | |
 |---|---|---|
-| `POST /push` | `X-Cam-Key` | JPEG body. Responds with the current viewer count. |
+| `GET /ws` | `X-Cam-Key` | Camera WebSocket. Binary messages are JPEG frames, and the relay sends the viewer count as text every second. |
+| `POST /push` | `X-Cam-Key` | Older uplink: one JPEG per request. Responds with the viewer count. It's slower because every frame waits a full round trip. |
 | `GET /?key=` | view key | Mobile-friendly viewer page |
 | `GET /stream?key=` | view key | MJPEG stream |
 | `GET /snapshot?key=` | view key | Latest JPEG |
