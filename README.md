@@ -25,7 +25,9 @@ To revoke everyone's access, change `VIEW_KEY`.
 |---|---|---|
 | `GET /ws` | `X-Cam-Key` | Camera WebSocket. Binary messages are JPEG frames, and the relay sends the viewer count as text every second. |
 | `POST /push` | `X-Cam-Key` | Older uplink: one JPEG per request. Responds with the viewer count. It's slower because every frame waits a full round trip. |
-| `GET /?key=` | view key | Mobile-friendly viewer page |
+| `POST /meta` | `X-Cam-Key` | JSON from the face tracker: face boxes, names, emotions and the robot's mood, drawn over the video. |
+| `GET /events?key=` | view key | Server-Sent Events stream of `/meta` updates |
+| `GET /?key=` | view key | Mobile-friendly viewer page with the face overlay |
 | `GET /stream?key=` | view key | MJPEG stream |
 | `GET /snapshot?key=` | view key | Latest JPEG |
 | `GET /status?key=` | view key | `{online, lastFrameAgeMs, viewers}` |

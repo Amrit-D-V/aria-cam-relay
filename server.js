@@ -9,6 +9,9 @@
 //   POST /push       older one-request-per-frame uplink (same key, body: JPEG,
 //                    replies with the viewer count). Much slower over long
 //                    distances: every frame waits a full round trip
+//   POST /meta       tracker → relay  (header X-Cam-Key, JSON body): face boxes,
+//                    names, emotions and the robot's mood, drawn over the video
+//   GET  /events     Server-Sent Events stream of /meta updates (?key=)
 //   GET  /?key=      viewer page      (key: $VIEW_KEY)
 //   GET  /stream     MJPEG stream     (?key=)
 //   GET  /snapshot   latest JPEG      (?key=)
@@ -33,10 +36,14 @@ if (!CAM_KEY || !VIEW_KEY) {
   process.exit(1);
 }
 
+const MAX_META_BYTES = 8 * 1024;
+
 let latestFrame = null;
 let latestAt = 0;
 let lastPollAt = 0;
 const streamViewers = new Set();
+let latestMeta = null;            // JSON string of the last /meta
+const metaSubscribers = new Set();
 
 function keyMatches(given, expected) {
   const a = Buffer.from(String(given || ''));
@@ -73,6 +80,38 @@ function handlePush(req, res) {
     if (!acceptFrame(Buffer.concat(chunks))) return send(res, 400, 'text/plain', 'not a JPEG');
     send(res, 200, 'text/plain', String(viewerCount()));
   });
+}
+
+function handleMeta(req, res) {
+  if (!keyMatches(req.headers['x-cam-key'], CAM_KEY)) return send(res, 401, 'text/plain', 'bad key');
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => {
+    size += c.length;
+    if (size > MAX_META_BYTES) { send(res, 413, 'text/plain', 'too large'); req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on('end', () => {
+    if (res.writableEnded) return;
+    let meta;
+    try { meta = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
+    latestMeta = JSON.stringify(meta);            // re-serialised: only valid JSON reaches viewers
+    for (const s of metaSubscribers) s.write(`data: ${latestMeta}\n\n`);
+    send(res, 204, 'text/plain', '');
+  });
+}
+
+function handleEvents(req, res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-store',
+    'X-Accel-Buffering': 'no',
+    Connection: 'keep-alive',
+  });
+  if (latestMeta) res.write(`data: ${latestMeta}\n\n`);
+  metaSubscribers.add(res);
+  const ping = setInterval(() => res.write(': ping\n\n'), 15000);   // keep proxies from idling it out
+  res.on('close', () => { clearInterval(ping); metaSubscribers.delete(res); });
 }
 
 function acceptFrame(frame) {
@@ -113,6 +152,7 @@ const server = http.createServer((req, res) => {
   const authed = keyMatches(key, VIEW_KEY);
 
   if (req.method === 'POST' && url.pathname === '/push') return handlePush(req, res);
+  if (req.method === 'POST' && url.pathname === '/meta') return handleMeta(req, res);
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'text/plain', 'method not allowed');
 
   switch (url.pathname) {
@@ -129,6 +169,9 @@ const server = http.createServer((req, res) => {
       lastPollAt = Date.now();
       if (!latestFrame) return send(res, 503, 'text/plain', 'no frame yet');
       return send(res, 200, 'image/jpeg', latestFrame);
+    case '/events':
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return handleEvents(req, res);
     case '/status':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(status()));
@@ -220,8 +263,18 @@ const STYLE = `
   .pill { font-size: 13px; padding: 4px 10px; border-radius: 999px; background: #1f2329; white-space: nowrap; }
   .pill.live { background: #12391f; color: #6ee7a0; }
   .pill.off { background: #3a1616; color: #fca5a5; }
-  main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 0 16px; }
-  img { width: 100%; max-width: 960px; aspect-ratio: 4 / 3; object-fit: contain; background: #000; border-radius: 10px; }
+  main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+         gap: 12px; padding: 0 16px; }
+  .stage { position: relative; width: 100%; max-width: 960px; }
+  img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #000; border-radius: 10px; }
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .info { display: flex; gap: 10px; width: 100%; max-width: 960px; flex-wrap: wrap; }
+  .card { flex: 1 1 200px; background: #15181c; border: 1px solid #2d333b; border-radius: 10px; padding: 10px 14px; }
+  .card .label { font-size: 12px; color: #9aa0a6; text-transform: uppercase; letter-spacing: .04em; }
+  .card .value { font-size: 17px; margin-top: 2px; }
+  .card .sub { font-size: 13px; color: #9aa0a6; }
+  .meter { height: 4px; background: #2d333b; border-radius: 2px; margin-top: 6px; overflow: hidden; }
+  .meter > span { display: block; height: 100%; background: #6ee7a0; width: 0; transition: width .6s; }
   footer { display: flex; gap: 10px; justify-content: center; padding: 16px; flex-wrap: wrap; }
   button, a.btn { background: #1f2329; color: #e8eaed; border: 1px solid #2d333b; border-radius: 8px;
                   padding: 10px 16px; font: inherit; text-decoration: none; cursor: pointer; }
@@ -248,7 +301,14 @@ function viewerPage() {
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>ARIA Cam</title>
 <style>${STYLE}</style></head><body>
 <header><h1>ARIA Cam</h1><span id="pill" class="pill">Connecting…</span></header>
-<main><img id="feed" alt="Live camera feed"></main>
+<main>
+  <div class="stage"><img id="feed" alt="Live camera feed"><canvas id="overlay"></canvas></div>
+  <div class="info">
+    <div class="card"><div class="label">In view</div><div class="value" id="who">—</div><div class="sub" id="who-sub">face tracker offline</div></div>
+    <div class="card"><div class="label">ARIA's mood</div><div class="value" id="mood">—</div>
+      <div class="sub">energy</div><div class="meter"><span id="energy"></span></div></div>
+  </div>
+</main>
 <footer>
   <button id="fs" type="button">Fullscreen</button>
   <a id="snap" class="btn" download="aria-cam.jpg">Save snapshot</a>
@@ -259,7 +319,9 @@ function viewerPage() {
   const img = document.getElementById('feed');
   const pill = document.getElementById('pill');
   document.getElementById('snap').href = '/snapshot' + q;
-  document.getElementById('fs').onclick = () => (img.requestFullscreen || img.webkitRequestFullscreen || (() => {})).call(img);
+  const stage = document.querySelector('.stage');   // fullscreen the video + overlay together
+  document.getElementById('fs').onclick = () =>
+    (stage.requestFullscreen || stage.webkitRequestFullscreen || (() => {})).call(stage);
 
   // MJPEG stream; if the browser can't render it, fall back to polling snapshots.
   let polling = false;
@@ -288,5 +350,75 @@ function viewerPage() {
   }
   refresh();
   setInterval(refresh, 3000);
+
+  // ── Face tracker overlay (from the laptop tracker via /meta → /events) ──
+  const EMOJI = { happy: '😊', surprise: '😮', sad: '😢', angry: '😠', neutral: '🙂' };
+  const EXPR_MOOD = { purr: '😌 purring', heart: '😍 in love', yawn: '🥱 yawning', sideeye: '😒 sulking',
+                      wink: '😉 winking', surprise: '😲 surprised', think: '🤔 thinking',
+                      curious: '🧐 curious', squint: '🤨 suspicious', wake: '😪 waking up' };
+  const canvas = document.getElementById('overlay'), ctx = canvas.getContext('2d');
+  let meta = null, metaAt = 0;
+  const shown = [];                        // smoothed boxes being drawn
+
+  const es = new EventSource('/events' + q);
+  es.onmessage = (e) => { try { meta = JSON.parse(e.data); metaAt = Date.now(); updateCards(); } catch {} };
+
+  function updateCards() {
+    const fresh = meta && Date.now() - metaAt < 3000;
+    const faces = fresh ? (meta.faces || []) : [];
+    const who = document.getElementById('who'), sub = document.getElementById('who-sub');
+    if (!fresh) { who.textContent = '—'; sub.textContent = 'face tracker offline'; }
+    else if (!faces.length) { who.textContent = 'Nobody'; sub.textContent = 'watching the room'; }
+    else {
+      const f = faces[0];
+      const name = f.id === 'known' ? f.name : f.id === 'unknown' ? 'Stranger' : 'Someone';
+      who.textContent = name + ' ' + (EMOJI[f.emo] || '');
+      sub.textContent = (faces.length > 1 ? faces.length + ' people · ' : '') + (f.emo || 'neutral')
+        + (f.look ? ' · looking at the camera' : '');
+    }
+    const r = fresh && meta.robot;
+    const mood = document.getElementById('mood');
+    if (!r) { mood.textContent = '—'; }
+    else {
+      mood.textContent = r.sleeping ? '😴 asleep' : EXPR_MOOD[r.expr]
+        || (r.energy < 0.3 ? '😩 tired' : r.boredom > 0.5 ? '😐 bored' : r.affection > 0.7 ? '🥰 affectionate' : '🙂 calm');
+      document.getElementById('energy').style.width = Math.round((r.energy || 0) * 100) + '%';
+    }
+  }
+  setInterval(updateCards, 1000);
+
+  function draw() {
+    const W = img.clientWidth, H = img.clientHeight, dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(W * dpr)) { canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr); }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    // where the picture actually sits inside the letterboxed <img>
+    const nw = img.naturalWidth || 4, nh = img.naturalHeight || 3, s = Math.min(W / nw, H / nh);
+    const dw = nw * s, dh = nh * s, ox = (W - dw) / 2, oy = (H - dh) / 2;
+    const faces = meta && Date.now() - metaAt < 2500 ? (meta.faces || []) : [];
+    faces.forEach((f, i) => {                // ease each box toward its latest position
+      const t = shown[i] || (shown[i] = { ...f });
+      for (const k of ['x', 'y', 'w', 'h']) t[k] += (f[k] - t[k]) * 0.35;
+    });
+    shown.length = faces.length;
+    faces.forEach((f, i) => {
+      const b = shown[i], x = ox + b.x * dw, y = oy + b.y * dh, w = b.w * dw, h = b.h * dh;
+      const color = f.id === 'known' ? '#6ee7a0' : f.id === 'unknown' ? '#fbbf24' : '#e8eaed';
+      ctx.strokeStyle = color; ctx.lineWidth = 2;
+      const c = Math.min(w, h) * 0.22;         // corner brackets
+      ctx.beginPath();
+      [[x, y, 1, 1], [x + w, y, -1, 1], [x, y + h, 1, -1], [x + w, y + h, -1, -1]].forEach(([px, py, sx, sy]) => {
+        ctx.moveTo(px + sx * c, py); ctx.lineTo(px, py); ctx.lineTo(px, py + sy * c);
+      });
+      ctx.stroke();
+      const label = (f.id === 'known' ? f.name : f.id === 'unknown' ? 'Stranger' : '…') + ' ' + (EMOJI[f.emo] || '');
+      ctx.font = '600 13px system-ui, sans-serif';
+      const tw = ctx.measureText(label).width + 12, ly = Math.max(0, y - 22);
+      ctx.fillStyle = 'rgba(11,13,16,0.75)'; ctx.fillRect(x, ly, tw, 20);
+      ctx.fillStyle = color; ctx.fillText(label, x + 6, ly + 14);
+    });
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
 </script></body></html>`;
 }
