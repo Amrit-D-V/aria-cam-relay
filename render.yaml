@@ -4,6 +4,7 @@ services:
     name: aria-cam
     runtime: node
     plan: free
+    region: singapore   # closest Render region to India; cannot be changed after creation
     buildCommand: npm install
     startCommand: node server.js
     healthCheckPath: /healthz
