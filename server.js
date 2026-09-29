@@ -108,6 +108,7 @@ function handleEvents(req, res) {
     'X-Accel-Buffering': 'no',
     Connection: 'keep-alive',
   });
+  res.write(': connected\n\n');          // flush headers now — Node holds them until the first write
   if (latestMeta) res.write(`data: ${latestMeta}\n\n`);
   metaSubscribers.add(res);
   const ping = setInterval(() => res.write(': ping\n\n'), 15000);   // keep proxies from idling it out
