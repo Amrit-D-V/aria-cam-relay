@@ -1,0 +1,14 @@
+# Render Blueprint — ARIA ESP32-CAM relay (this repo)
+services:
+  - type: web
+    name: aria-cam
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: CAM_KEY      # must match RELAY_KEY in the camera firmware secrets.h
+        sync: false
+      - key: VIEW_KEY     # share https://<service>.onrender.com/?key=<VIEW_KEY>
+        sync: false

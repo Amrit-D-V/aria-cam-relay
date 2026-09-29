@@ -1,0 +1,13 @@
+{
+  "name": "aria-cam-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Relays ESP32-CAM frames to viewers anywhere (deployed on Render)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
