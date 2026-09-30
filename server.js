@@ -14,6 +14,10 @@
 //   GET  /events     Server-Sent Events: /meta updates as messages, plus named
 //                    "log" events for the activity timeline (?key=)
 //   GET  /?key=      viewer page      (key: $VIEW_KEY)
+//   POST /cmd        page → camera command (header X-Admin-Key: $ADMIN_KEY,
+//                    else $CAM_KEY; JSON {cmd, args}) — LED, night mode,
+//                    privacy, resolution, restart
+//   GET  /gallery    JSON list of event snapshots (?key=); /gallery/<id>.jpg
 //   GET  /stream     MJPEG stream     (?key=)
 //   GET  /snapshot   latest JPEG      (?key=)
 //   GET  /status     JSON             (?key=)
@@ -28,6 +32,7 @@ const crypto = require('crypto');
 const PORT = process.env.PORT || 10000;
 const CAM_KEY = process.env.CAM_KEY || '';
 const VIEW_KEY = process.env.VIEW_KEY || '';
+const ADMIN_KEY = process.env.ADMIN_KEY || CAM_KEY;   // controls; defaults to the camera's key
 const MAX_FRAME_BYTES = 512 * 1024;
 const OFFLINE_AFTER_MS = 10000;   // no frame for this long → camera offline
 const POLL_VIEWER_MS = 5000;      // snapshot-polling viewers count for this long
@@ -53,6 +58,70 @@ let frameSize = null;             // {w, h} from the latest JPEG's header
 const LOG_MAX = 30;
 const activity = [];              // newest first: {t, kind, text}
 const presence = { here: false, lastFace: 0, who: null, sleeping: null };
+
+// Camera state reported over its WebSocket every ~2 s (settings + health).
+let camState = null;
+
+// Event snapshots, newest first. Motion snapshots use the first frame that
+// arrives after the camera reports motion (it pushes one immediately).
+const GALLERY_MAX = 20;
+const gallery = [];               // {id, t, kind, text, jpeg}
+let galleryId = 0;
+let pendingSnapshot = null;       // {kind, text} waiting for the next frame
+
+function broadcast(event, obj) {
+  const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
+  for (const s of metaSubscribers) s.write(line);
+}
+
+function addSnapshot(kind, text, jpeg) {
+  if (!jpeg) return;
+  const item = { id: ++galleryId, t: Date.now(), kind, text, jpeg };
+  gallery.unshift(item);
+  if (gallery.length > GALLERY_MAX) gallery.pop();
+  broadcast('gallery', { id: item.id, t: item.t, kind, text });
+}
+
+function handleCamText(text) {
+  let m;
+  try { m = JSON.parse(text); } catch { return; }
+  if (m.t === 'state') {
+    delete m.t;
+    const wasPrivate = camState && camState.privacy;
+    camState = m;
+    broadcast('cam', camState);
+    if (camState.privacy && !wasPrivate) logEvent('privacy', 'Privacy mode on');
+    if (!camState.privacy && wasPrivate) logEvent('privacy', 'Privacy mode off');
+  } else if (m.t === 'motion') {
+    logEvent('motion', 'Motion detected');
+    pendingSnapshot = { kind: 'motion', text: 'Motion detected' };
+  }
+}
+
+const COMMANDS = {                // name → argument validator
+  led: (a) => /^\d{1,3}$/.test(a[0]) && +a[0] <= 100,
+  ledauto: (a) => /^[01]$/.test(a[0]),
+  night: (a) => ['auto', 'on', 'off'].includes(a[0]),
+  privacy: (a) => /^[01]$/.test(a[0]),
+  privhours: (a) => a.length === 2 && a.every((h) => /^\d{1,2}$/.test(h) && +h < 24),
+  profile: (a) => ['auto', '0', '1'].includes(a[0]),
+  restart: (a) => a.length === 0,
+};
+
+function handleCmd(req, res) {
+  if (!keyMatches(req.headers['x-admin-key'], ADMIN_KEY)) return send(res, 401, 'text/plain', 'bad admin key');
+  const chunks = [];
+  req.on('data', (c) => { chunks.push(c); if (chunks.length > 8) req.destroy(); });
+  req.on('end', () => {
+    let body;
+    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
+    const cmd = String(body.cmd || ''), args = (body.args || []).map(String);
+    if (!COMMANDS[cmd] || !COMMANDS[cmd](args)) return send(res, 400, 'text/plain', 'unknown command or bad arguments');
+    if (!camSocket || camSocket.destroyed) return send(res, 503, 'text/plain', 'camera not connected');
+    camSocket.write(wsFrame(0x1, Buffer.from([cmd, ...args].join(' '))));
+    send(res, 202, 'text/plain', 'sent');
+  });
+}
 
 function keyMatches(given, expected) {
   const a = Buffer.from(String(given || ''));
@@ -95,6 +164,7 @@ function fps() {
 }
 
 function logEvent(kind, text) {
+  if (kind === 'arrive' || kind === 'known' || kind === 'stranger') addSnapshot(kind, text, latestFrame);
   const e = { t: Date.now(), kind, text };
   activity.unshift(e);
   if (activity.length > LOG_MAX) activity.pop();
@@ -176,6 +246,8 @@ function handleEvents(req, res) {
   res.write(': connected\n\n');          // flush headers now — Node holds them until the first write
   if (latestMeta) res.write(`data: ${latestMeta}\n\n`);
   for (const e of [...activity].reverse()) res.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
+  if (camState) res.write(`event: cam\ndata: ${JSON.stringify(camState)}\n\n`);
+  for (const g of [...gallery].reverse()) res.write(`event: gallery\ndata: ${JSON.stringify({ id: g.id, t: g.t, kind: g.kind, text: g.text })}\n\n`);
   metaSubscribers.add(res);
   const ping = setInterval(() => res.write(': ping\n\n'), 15000);   // keep proxies from idling it out
   res.on('close', () => { clearInterval(ping); metaSubscribers.delete(res); });
@@ -187,6 +259,7 @@ function acceptFrame(frame) {
   latestAt = Date.now();
   frameTimes.push(latestAt);
   frameSize = jpegSize(frame) || frameSize;
+  if (pendingSnapshot) { addSnapshot(pendingSnapshot.kind, pendingSnapshot.text, frame); pendingSnapshot = null; }
   for (const v of streamViewers) {
     if (v.writableLength > 2 * frame.length) continue;   // slow viewer: drop this frame for them
     writeFrame(v, frame);
@@ -223,6 +296,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/push') return handlePush(req, res);
   if (req.method === 'POST' && url.pathname === '/meta') return handleMeta(req, res);
+  if (req.method === 'POST' && url.pathname === '/cmd') return handleCmd(req, res);
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'text/plain', 'method not allowed');
 
   switch (url.pathname) {
@@ -239,14 +313,25 @@ const server = http.createServer((req, res) => {
       lastPollAt = Date.now();
       if (!latestFrame) return send(res, 503, 'text/plain', 'no frame yet');
       return send(res, 200, 'image/jpeg', latestFrame);
+    case '/gallery':
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return send(res, 200, 'application/json',
+        JSON.stringify(gallery.map((g) => ({ id: g.id, t: g.t, kind: g.kind, text: g.text }))));
     case '/events':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return handleEvents(req, res);
     case '/status':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(status()));
-    default:
+    default: {
+      const g = /^\/gallery\/(\d+)\.jpg$/.exec(url.pathname);
+      if (g) {
+        if (!authed) return send(res, 401, 'text/plain', 'bad key');
+        const item = gallery.find((it) => it.id === +g[1]);
+        return item ? send(res, 200, 'image/jpeg', item.jpeg) : send(res, 404, 'text/plain', 'gone');
+      }
       return send(res, 404, 'text/plain', 'not found');
+    }
   }
 });
 
@@ -306,6 +391,7 @@ server.on('upgrade', (req, socket) => {
 
       if (opcode === 0x8) { socket.end(wsFrame(0x8, Buffer.alloc(0))); return; }   // close
       if (opcode === 0x9) { socket.write(wsFrame(0xA, payload)); continue; }        // ping → pong
+      if (opcode === 0x1 && fin) { handleCamText(payload.toString('utf8')); continue; }   // state / motion
       if (opcode === 0x2 || opcode === 0x0) {                                        // binary / continuation
         parts.push(payload);
         partsLen += len;
@@ -315,7 +401,7 @@ server.on('upgrade', (req, socket) => {
   });
   socket.on('error', () => socket.destroy());
   socket.on('close', () => {
-    if (camSocket === socket) camSocket = null;
+    if (camSocket === socket) { camSocket = null; camState = null; broadcast('cam', null); }
     console.log('camera disconnected');
   });
 });
@@ -333,6 +419,7 @@ const STYLE = `
     --radius: 16px;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }   /* component display rules must not beat hidden */
   html, body { margin: 0; background: var(--bg); color: var(--text); }
   body { min-height: 100vh; font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
          -webkit-font-smoothing: antialiased; }
@@ -433,6 +520,44 @@ const STYLE = `
   .log li.new { animation: slidein .4s ease; }
   @keyframes slidein { from { opacity: 0; transform: translateY(-4px); } }
 
+
+  .seg { display: inline-flex; background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 3px; gap: 2px; }
+  .seg button { border: 0; background: transparent; color: var(--muted); padding: 6px 10px; border-radius: 7px; cursor: pointer; font-size: 13px; }
+  .seg button[aria-pressed="true"] { background: var(--accent-dim); color: var(--accent); font-weight: 600; }
+  .seg button:disabled { cursor: not-allowed; opacity: .5; }
+  .ctl { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 10px; padding: 9px 0;
+         border-bottom: 1px solid var(--line); font-size: 14px; }
+  .ctl:last-of-type { border-bottom: 0; }
+  .ctl small { display: block; color: var(--muted); font-size: 12px; }
+  .switch { position: relative; width: 44px; height: 26px; border-radius: 999px; border: 1px solid var(--line);
+            background: var(--surface-2); cursor: pointer; padding: 0; }
+  .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%;
+                   background: var(--muted); transition: transform .2s, background .2s; }
+  .switch[aria-checked="true"] { background: var(--accent-dim); border-color: rgba(94,234,212,.4); }
+  .switch[aria-checked="true"]::after { transform: translateX(18px); background: var(--accent); }
+  .hours { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+  .hours select { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 5px; font: inherit; }
+  .btn { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; cursor: pointer; font-size: 13px; }
+  .btn.primary { background: var(--accent); color: #04110f; border: 0; font-weight: 700; }
+  .btn.danger { color: var(--bad); }
+  .health { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 12px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+  .health b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .locked { color: var(--muted); font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .gallery { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .gallery a { position: relative; display: block; aspect-ratio: 4 / 3; border-radius: 10px; overflow: hidden;
+               background: #000; border: 1px solid var(--line); }
+  .gallery img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .gallery span { position: absolute; left: 4px; bottom: 4px; right: 4px; font-size: 10px; padding: 2px 5px; border-radius: 6px;
+                  background: rgba(7,9,12,.7); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .gallery .empty { grid-column: 1 / -1; color: var(--muted); font-size: 13px; }
+  .log li.motion i { background: #fb923c; } .log li.privacy i { background: var(--violet); }
+  .privacy-screen { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px;
+                    background: repeating-linear-gradient(135deg, #0b0e13 0 14px, #0e1218 14px 28px); color: var(--muted); text-align: center; }
+  .privacy-screen[hidden] { display: none; }
+  .privacy-screen svg { width: 44px; height: 44px; color: var(--violet); }
+  .privacy-screen b { color: var(--text); font-size: 17px; }
+  .chip.night { color: #c4b5fd; }
+
   .foot { max-width: 1280px; margin: 0 auto; padding: 4px 16px 24px; color: var(--muted); font-size: 12px; }
 
   .login { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
@@ -481,7 +606,11 @@ function viewerPage() {
       <img id="feed" alt="Live camera feed">
       <canvas id="overlay" aria-hidden="true"></canvas>
       <div class="hud tl"><span class="rec"><i></i>LIVE</span><span class="chip" id="hud-time"></span></div>
-      <div class="hud tr"><span class="chip" id="hud-res">—</span><span class="chip" id="hud-fps">— fps</span></div>
+      <div class="hud tr"><span class="chip night" id="hud-night" hidden>☾ Night</span><span class="chip" id="hud-res">—</span><span class="chip" id="hud-fps">— fps</span></div>
+      <div class="privacy-screen" id="privacy-screen" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+        <b>Privacy mode on</b><span id="privacy-text">The camera isn&rsquo;t streaming or detecting.</span>
+      </div>
       <div class="offline" id="offline" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
           <path d="M3 3l18 18M10.6 6H15a2 2 0 0 1 2 2v2l4-3v10M17 17H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2"/></svg>
@@ -524,6 +653,31 @@ function viewerPage() {
     <section class="card" aria-label="Activity">
       <div class="card-head"><h2>Activity</h2></div>
       <ol class="log" id="log"><li class="empty">Nothing yet</li></ol>
+    </section>
+
+    <section class="card" aria-label="Snapshots">
+      <div class="card-head"><h2>Snapshots</h2><span class="badge" id="gal-count">0</span></div>
+      <div class="gallery" id="gallery"><div class="empty">Motion and arrivals are saved here.</div></div>
+    </section>
+
+    <section class="card" aria-label="Camera controls">
+      <div class="card-head"><h2>Camera</h2><span class="mood" id="cam-conn">—</span></div>
+      <div class="locked" id="locked"><span>Controls are locked.</span><button class="btn primary" id="unlock">Unlock</button></div>
+      <div id="controls" hidden>
+        <div class="ctl"><div>Privacy<small id="priv-sub">Stops streaming and detection</small></div>
+          <button class="switch" id="priv" role="switch" aria-checked="false" aria-label="Privacy mode"></button></div>
+        <div class="ctl"><div>Private hours<small>Daily</small></div>
+          <div class="hours"><select id="ph-s" aria-label="From"></select>–<select id="ph-e" aria-label="To"></select>
+            <button class="btn" id="ph-save">Set</button></div></div>
+        <div class="ctl"><div>Night mode<small id="night-sub">Black &amp; white in the dark</small></div>
+          <div class="seg" data-cmd="night"><button data-v="auto">Auto</button><button data-v="on">On</button><button data-v="off">Off</button></div></div>
+        <div class="ctl"><div>Light<small>Flash LED</small></div>
+          <div class="seg" data-cmd="light"><button data-v="off">Off</button><button data-v="auto">Auto</button><button data-v="30">Low</button><button data-v="100">High</button></div></div>
+        <div class="ctl"><div>Resolution</div>
+          <div class="seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400p</button><button data-v="1">640p</button></div></div>
+        <div class="ctl"><div>Restart camera<small>Takes about 15 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
+      </div>
+      <div class="health" id="health"></div>
     </section>
   </aside>
 </main>
@@ -657,6 +811,102 @@ function viewerPage() {
     list.prepend(li);
     while (list.children.length > LOG_MAX) list.lastChild.remove();
   }
+
+
+  // ── Camera: state, controls, privacy screen ──
+  var cam = null;
+  es.addEventListener('cam', function (e) { try { cam = JSON.parse(e.data); renderCam(); } catch (x) {} });
+  var adminKey = null;
+  try { adminKey = localStorage.getItem('aria-admin'); } catch (e) {}
+  function fmtUp(s) { var h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60; return h ? h + 'h ' + m + 'm' : m + 'm'; }
+  function renderCam() {
+    $('cam-conn').textContent = cam ? 'Connected' : 'Not connected';
+    $('locked').hidden = !!adminKey; $('controls').hidden = !adminKey;
+    var ps = $('privacy-screen');
+    ps.hidden = !(cam && cam.privacy);
+    $('hud-night').hidden = !(cam && cam.night && !cam.privacy);
+    if (!cam) { $('health').textContent = ''; return; }
+    if (cam.privacy) $('privacy-text').textContent = cam.privacy_manual ? 'Switched on from this page.'
+      : 'Private hours ' + cam.priv_hours[0] + ':00–' + cam.priv_hours[1] + ':00.';
+    $('priv').setAttribute('aria-checked', String(!!cam.privacy_manual));
+    $('priv-sub').textContent = cam.privacy ? 'On — nothing is leaving the camera' : 'Stops streaming and detection';
+    $('night-sub').textContent = cam.night ? 'Active now' : 'Black & white in the dark';
+    setSeg('night', cam.night_mode);
+    setSeg('light', cam.ledauto ? 'auto' : cam.led === 0 ? 'off' : cam.led <= 40 ? '30' : '100');
+    setSeg('profile', cam.adaptive ? 'auto' : cam.profile === 'VGA' ? '1' : '0');
+    if (document.activeElement !== $('ph-s') && document.activeElement !== $('ph-e')) {
+      $('ph-s').value = cam.priv_hours[0]; $('ph-e').value = cam.priv_hours[1];
+    }
+    var h = $('health'); h.textContent = '';
+    [['Signal', cam.rssi + ' dBm'], ['Uptime', fmtUp(cam.up)], ['Memory free', cam.heap_kb + ' KB'],
+     ['Last restart', cam.reset], ['Brightness', cam.brightness < 0 ? '–' : Math.round(cam.brightness / 2.55) + '%'],
+     ['Last motion', cam.motion_ago ? ago(cam.motion_ago * 1000) + ' ago' : '–']].forEach(function (kv) {
+      var d = document.createElement('div'); d.textContent = kv[0] + ' ';
+      var b = document.createElement('b'); b.textContent = kv[1]; d.append(b); h.append(d);
+    });
+  }
+  function setSeg(cmd, v) {
+    document.querySelectorAll('.seg[data-cmd="' + cmd + '"] button').forEach(function (b) {
+      b.setAttribute('aria-pressed', String(b.dataset.v === v));
+    });
+  }
+  for (var hr = 0; hr < 24; hr++) {
+    ['ph-s', 'ph-e'].forEach(function (id) {
+      var o = document.createElement('option'); o.value = hr; o.textContent = pad(hr) + ':00'; $(id).append(o);
+    });
+  }
+  async function send(cmd, args) {
+    try {
+      var r = await fetch('/cmd', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+                                    body: JSON.stringify({ cmd: cmd, args: args || [] }) });
+      if (r.status === 401) { lock(); alert('That admin key was not accepted.'); }
+      else if (r.status === 503) alert('The camera is not connected right now.');
+    } catch (e) { alert('Could not reach the relay.'); }
+  }
+  function lock() { adminKey = null; try { localStorage.removeItem('aria-admin'); } catch (e) {} renderCam(); }
+  $('unlock').onclick = function () {
+    var k = prompt('Admin key (the camera key, unless you set ADMIN_KEY on Render):');
+    if (!k) return;
+    adminKey = k.trim();
+    try { localStorage.setItem('aria-admin', adminKey); } catch (e) {}
+    renderCam();
+  };
+  $('priv').onclick = function () {
+    var on = $('priv').getAttribute('aria-checked') !== 'true';
+    $('priv').setAttribute('aria-checked', String(on));      // optimistic; the next state report confirms
+    send('privacy', [on ? '1' : '0']);
+  };
+  $('ph-save').onclick = function () { send('privhours', [$('ph-s').value, $('ph-e').value]); };
+  document.querySelectorAll('.seg').forEach(function (seg) {
+    seg.addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      var v = b.dataset.v, cmd = seg.dataset.cmd;
+      setSeg(cmd, v);
+      if (cmd === 'light') { if (v === 'auto') send('ledauto', ['1']); else send('led', [v === 'off' ? '0' : v]); }
+      else send(cmd, [v]);
+    });
+  });
+  $('restart').onclick = function () { if (confirm('Restart the camera? The stream drops for ~15 seconds.')) send('restart'); };
+  renderCam();
+
+  // ── Snapshot gallery ──
+  var GAL_MAX = 12, KIND = { motion: 'Motion', arrive: 'Arrived', known: 'Known', stranger: 'Stranger' };
+  es.addEventListener('gallery', function (e) {
+    try {
+      var g = JSON.parse(e.data), box = $('gallery'), empty = box.querySelector('.empty');
+      if (empty) empty.remove();
+      var a = document.createElement('a');
+      a.href = '/gallery/' + g.id + '.jpg' + q; a.target = '_blank'; a.rel = 'noopener';
+      a.title = g.text + ' — ' + new Date(g.t).toLocaleString();
+      var im = document.createElement('img'); im.loading = 'lazy'; im.alt = g.text; im.src = a.href;
+      var cap = document.createElement('span');
+      cap.textContent = (KIND[g.kind] || g.kind) + ' · ' + new Date(g.t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      a.append(im, cap);
+      box.prepend(a);
+      while (box.children.length > GAL_MAX) box.lastChild.remove();
+      $('gal-count').textContent = box.querySelectorAll('a').length;
+    } catch (x) {}
+  });
 
   // ── ARIA's live face (the OLED's 128×64 frame, 1 bit per pixel) ──
   var rc = $('robot'), rctx = rc.getContext('2d'), rimg = rctx.createImageData(128, 64), lastFrame = null;
