@@ -24,6 +24,9 @@
 //   GET  /stream     MJPEG stream     (?key=)
 //   GET  /snapshot   latest JPEG      (?key=)
 //   GET  /status     JSON             (?key=)
+//   GET  /health     camera health history (?key=): fps / WiFi / memory samples
+//                    every 30 s for 24 h, and restarts with their reasons. Kept
+//                    in memory, so it starts over when Render restarts the relay
 //   GET  /healthz    Render health check
 //
 // Zero dependencies — Node's http module only.
@@ -65,6 +68,33 @@ const presence = { here: false, lastFace: 0, who: null, sleeping: null };
 // Camera state reported over its WebSocket every ~2 s (settings + health).
 let camState = null;
 
+// Health history for the page's charts: a sample every 30 s for 24 h, plus
+// camera restarts (seen as its uptime going backwards) with the reason it
+// gave. In memory only — a relay restart starts it over.
+const HEALTH_EVERY_MS = 30000;
+const HEALTH_KEEP = 24 * 3600 * 1000 / HEALTH_EVERY_MS;
+const healthSamples = [];         // {t, on, fps, rssi, heap}
+const restarts = [];              // newest first: {t, reason}
+let lastUp = null;
+let lastGesture = 0;
+
+function noteCamUptime(m) {
+  if (typeof m.up !== 'number') return;
+  if ((lastUp !== null && m.up < lastUp) || (lastUp === null && m.up < 60)) {
+    restarts.unshift({ t: Date.now() - m.up * 1000, reason: String(m.reset || 'unknown') });
+    if (restarts.length > 50) restarts.pop();
+    logEvent('restart', `Camera restarted (${m.reset || 'unknown'})`);
+  }
+  lastUp = m.up;
+}
+
+setInterval(() => {
+  const on = status().online;
+  healthSamples.push({ t: Date.now(), on, fps: on ? Math.round(fps() * 10) / 10 : null,
+                       rssi: on && camState ? camState.rssi : null, heap: on && camState ? camState.heap_kb : null });
+  if (healthSamples.length > HEALTH_KEEP) healthSamples.shift();
+}, HEALTH_EVERY_MS);
+
 // What the admin has asked of the OLED display. Ids let the display tell a
 // new message/emotion from one it has already shown.
 const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'shy', 'dizzy',
@@ -84,6 +114,7 @@ function handleCamText(text) {
     delete m.t;
     const wasPrivate = camState && camState.privacy;
     camState = m;
+    noteCamUptime(m);
     broadcast('cam', camState);
     if (camState.privacy && !wasPrivate) logEvent('privacy', 'Privacy mode on');
     if (!camState.privacy && wasPrivate) logEvent('privacy', 'Privacy mode off');
@@ -100,6 +131,7 @@ const COMMANDS = {                // name → argument validator
   privhours: (a) => a.length === 2 && a.every((h) => /^\d{1,2}$/.test(h) && +h < 24),
   profile: (a) => ['auto', '0', '1', '2', '3', '4'].includes(a[0]),
   sensitivity: (a) => ['low', 'medium', 'high'].includes(a[0]),
+  zones: (a) => /^[0-9a-f]{12}$/.test(a[0]) && a[0] !== '000000000000',
   restart: (a) => a.length === 0,
 };
 
@@ -211,6 +243,11 @@ function trackActivity(meta) {
       if (f.id === 'known') logEvent('known', `${who} is here`);
       else logEvent('stranger', 'Unknown person in view');
     }
+  }
+  const g = meta.gesture;           // {name, who, t} from the tracker's hand-sign reader
+  if (g && typeof g.t === 'number' && g.t > lastGesture) {
+    lastGesture = g.t;
+    logEvent('gesture', `${String(g.name).slice(0, 40)}${g.who ? ' from ' + String(g.who).slice(0, 30) : ''}`);
   }
   const r = meta.robot;
   if (r && typeof r.sleeping === 'boolean' && r.sleeping !== presence.sleeping) {
@@ -349,6 +386,9 @@ const server = http.createServer((req, res) => {
     case '/status':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(status()));
+    case '/health':
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return send(res, 200, 'application/json', JSON.stringify({ every: HEALTH_EVERY_MS, samples: healthSamples, restarts }));
     default:
       return send(res, 404, 'text/plain', 'not found');
   }
@@ -588,6 +628,49 @@ const STYLE = `
   .showing { font-size: 12px; color: var(--accent); min-height: 16px; }
   .log li.message i { background: var(--accent); }
   .sub-h { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin: 14px 0 4px; }
+  .log li.restart i { background: var(--bad); } .log li.gesture i { background: #f472b6; }
+
+  /* Detection zones editor: an 8x6 grid over the video */
+  .zones { position: absolute; display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(6, 1fr);
+           touch-action: none; user-select: none; -webkit-user-select: none; }
+  .zones[hidden] { display: none; }
+  .zones button { border: 1px solid rgba(94,234,212,.35); background: transparent; padding: 0; cursor: pointer; }
+  .zones button.off { background: repeating-linear-gradient(135deg, rgba(248,113,113,.55) 0 6px, rgba(7,9,12,.7) 6px 12px);
+                      border-color: rgba(248,113,113,.4); }
+  .zone-bar { position: absolute; left: 12px; right: 12px; bottom: 12px; display: flex; flex-wrap: wrap; gap: 8px;
+              align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 12px;
+              background: rgba(7,9,12,.8); border: 1px solid var(--line); font-size: 13px; }
+  .zone-bar[hidden] { display: none; }
+  .zone-bar span { color: var(--muted); }
+
+  /* Health charts */
+  .hc { margin-top: 12px; }
+  .hc-head { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .hc-head b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .hc svg { display: block; width: 100%; height: 64px; overflow: visible; margin-bottom: 16px; }
+  .hc .grid-l { stroke: var(--line); stroke-width: 1; }
+  .hc .ax { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+  .hc .ln { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .hc .ar { fill: var(--accent-dim); stroke: none; }
+  .hc .rs { stroke: var(--bad); stroke-width: 1; stroke-dasharray: 3 3; }
+  .hc .off-band { fill: rgba(248,113,113,.10); }
+  .hc .xh { stroke: var(--muted); stroke-width: 1; }
+  .hc .dot { fill: var(--accent); stroke: var(--surface); stroke-width: 2; }
+  .h-sum { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 2px; }
+  .h-sum div { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px; font-size: 11px; color: var(--muted); }
+  .h-sum b { display: block; font-size: 17px; color: var(--text); font-variant-numeric: tabular-nums; }
+  .h-tip { position: fixed; pointer-events: none; z-index: 5; padding: 6px 9px; border-radius: 8px; font-size: 12px;
+           background: var(--surface-2); border: 1px solid var(--line); box-shadow: 0 4px 16px rgba(0,0,0,.4); white-space: nowrap; }
+  .h-tip[hidden] { display: none; }
+  .rs-list { list-style: none; margin: 10px 0 0; padding: 0; font-size: 13px; }
+  .rs-list li { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--line); }
+  .rs-list li:last-child { border-bottom: 0; }
+  .rs-list time { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .rs-list .why { display: inline-flex; align-items: center; gap: 6px; }
+  .rs-list .why::before { content: "⚠"; color: var(--warn); }
+  .rs-list .why.ok::before { content: "↻"; color: var(--muted); }
+  .note { font-size: 11px; color: var(--muted); margin-top: 8px; }
+
   .foot { max-width: 1280px; margin: 0 auto; padding: 4px 16px 24px; color: var(--muted); font-size: 12px; }
 
   .login { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
@@ -646,7 +729,13 @@ function viewerPage() {
           <path d="M3 3l18 18M10.6 6H15a2 2 0 0 1 2 2v2l4-3v10M17 17H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2"/></svg>
         <b>Camera offline</b><span id="offline-text">Waiting for the camera…</span>
       </div>
-      <div class="controls">
+      <div class="zones" id="zones" hidden aria-label="Detection zones: tap cells to watch or ignore them"></div>
+      <div class="zone-bar" id="zone-bar" hidden>
+        <span id="zone-info">Tap cells to ignore them</span>
+        <span><button class="btn" id="zone-all">Watch all</button> <button class="btn" id="zone-cancel">Cancel</button>
+          <button class="btn primary" id="zone-save">Save</button></span>
+      </div>
+      <div class="controls" id="stage-controls">
         <button class="icon" id="btn-overlay" aria-pressed="true" title="Face boxes" aria-label="Toggle face boxes">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
             <path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/>
@@ -732,13 +821,27 @@ function viewerPage() {
           <div class="seg" data-cmd="light"><button data-v="off">Off</button><button data-v="auto">Auto</button><button data-v="30">Low</button><button data-v="100">High</button></div></div>
         <div class="ctl"><div>Motion alerts<small>Low ignores curtains &amp; plants moving</small></div>
           <div class="seg" data-cmd="sensitivity"><button data-v="low">Low</button><button data-v="medium">Med</button><button data-v="high">High</button></div></div>
+        <div class="ctl"><div>Detection zones<small id="zone-sub">Watching the whole picture</small></div>
+          <button class="btn" id="zone-edit">Edit</button></div>
         <div class="ctl wide"><div>Resolution<small>Higher = sharper but fewer fps</small></div>
           <div class="seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400</button><button data-v="1">640</button><button data-v="2">800</button><button data-v="3">720p</button><button data-v="4">1600</button></div></div>
         <div class="ctl"><div>Restart system<small>Camera + display, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
       </div>
       <div class="health" id="health"></div>
     </section>
+
+    <section class="card" aria-label="Camera health">
+      <div class="card-head"><h2>Health</h2>
+        <div class="seg" id="h-range"><button data-h="1">1h</button><button data-h="6" aria-pressed="true">6h</button><button data-h="24">24h</button></div></div>
+      <div class="h-sum">
+        <div>Online<b id="h-online">–</b></div><div>Restarts<b id="h-rcount">–</b></div><div>Avg fps<b id="h-fps">–</b></div>
+      </div>
+      <div id="h-charts"></div>
+      <ol class="rs-list" id="h-restarts"></ol>
+      <div class="note" id="h-note"></div>
+    </section>
   </aside>
+  <div class="h-tip" id="h-tip" hidden></div>
 </main>
 <footer class="foot">ESP32-CAM · streamed via Render · <span id="viewers">0</span> watching</footer>
 
@@ -908,6 +1011,10 @@ function viewerPage() {
     setSeg('light', cam.ledauto ? 'auto' : cam.led === 0 ? 'off' : cam.led <= 40 ? '30' : '100');
     setSeg('profile', cam.adaptive ? 'auto' : String(cam.profile_i !== undefined ? cam.profile_i : cam.profile === 'VGA' ? 1 : 0));
     if (cam.sensitivity) setSeg('sensitivity', cam.sensitivity);
+    if (cam.zones) {
+      var ignored = zonesFromHex(cam.zones).filter(function (w) { return !w; }).length;
+      $('zone-sub').textContent = ignored ? 'Ignoring ' + ignored + ' of 48 areas' : 'Watching the whole picture';
+    }
     if (document.activeElement !== $('ph-s') && document.activeElement !== $('ph-e')) {
       $('ph-s').value = cam.priv_hours[0]; $('ph-e').value = cam.priv_hours[1];
     }
@@ -1004,6 +1111,197 @@ function viewerPage() {
     b.classList.add('sent'); setTimeout(function () { b.classList.remove('sent'); }, 900);
   });
   renderCam();
+
+  // ── Detection zones: 8x6 grid, bit = row*8 + col, 1 = watched ──
+  var ZC = 8, ZR = 6, zoneEdit = null, zonePaint = null;
+  var zonesEl = $('zones');
+  function zonesFromHex(h) {
+    var v = BigInt('0x' + (h || 'ffffffffffff')), m = [];
+    for (var i = 0; i < ZC * ZR; i++) m.push(((v >> BigInt(i)) & BigInt(1)) === BigInt(1));
+    return m;
+  }
+  function zonesToHex(m) {
+    var v = BigInt(0);
+    m.forEach(function (on, i) { if (on) v |= BigInt(1) << BigInt(i); });
+    return v.toString(16).padStart(12, '0');
+  }
+  for (var zi = 0; zi < ZC * ZR; zi++) {
+    var zb = document.createElement('button'); zb.type = 'button'; zb.dataset.i = zi;
+    zb.setAttribute('aria-label', 'Row ' + (Math.floor(zi / ZC) + 1) + ', column ' + (zi % ZC + 1));
+    zonesEl.append(zb);
+  }
+  function placeZones() {                    // over the picture itself (object-fit: contain leaves bars)
+    var W = stage.clientWidth, H = stage.clientHeight;
+    var nw = img.naturalWidth || 4, nh = img.naturalHeight || 3, k = Math.min(W / nw, H / nh);
+    zonesEl.style.width = nw * k + 'px'; zonesEl.style.height = nh * k + 'px';
+    zonesEl.style.left = (W - nw * k) / 2 + 'px'; zonesEl.style.top = (H - nh * k) / 2 + 'px';
+  }
+  function drawZones() {
+    var off = 0;
+    zonesEl.querySelectorAll('button').forEach(function (b, i) {
+      b.classList.toggle('off', !zoneEdit[i]); b.setAttribute('aria-pressed', String(!zoneEdit[i]));
+      if (!zoneEdit[i]) off++;
+    });
+    $('zone-info').textContent = off ? off + ' of 48 areas ignored' : 'Tap or drag over areas to ignore';
+  }
+  function setCell(el) {
+    if (!el || el.parentNode !== zonesEl) return;
+    var i = +el.dataset.i;
+    if (zoneEdit[i] !== zonePaint) { zoneEdit[i] = zonePaint; drawZones(); }
+  }
+  zonesEl.addEventListener('pointerdown', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    e.preventDefault();
+    zonePaint = !zoneEdit[+b.dataset.i];
+    setCell(b);
+  });
+  zonesEl.addEventListener('pointermove', function (e) {
+    if (zonePaint === null) return;
+    setCell(document.elementFromPoint(e.clientX, e.clientY));
+  });
+  window.addEventListener('pointerup', function () { zonePaint = null; });
+  function zoneMode(on) {
+    zonesEl.hidden = !on; $('zone-bar').hidden = !on; $('stage-controls').hidden = on;
+    if (on) { placeZones(); drawZones(); stage.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+    else zoneEdit = null;
+  }
+  $('zone-edit').onclick = function () { zoneEdit = zonesFromHex(cam && cam.zones); zoneMode(true); };
+  $('zone-cancel').onclick = function () { zoneMode(false); };
+  $('zone-all').onclick = function () { zoneEdit = zoneEdit.map(function () { return true; }); drawZones(); };
+  $('zone-save').onclick = async function () {
+    if (!zoneEdit.some(Boolean)) { alert('Leave at least one area watched.'); return; }
+    if (await send('zones', [zonesToHex(zoneEdit)]) === 202) zoneMode(false);
+  };
+  window.addEventListener('resize', function () { if (zoneEdit) placeZones(); });
+
+  // ── Health history: fps, WiFi, memory, restarts ──
+  var hData = null, hHours = 6, hCharts = [];
+  var REASONS = { brownout: ['Brownout — the power dipped', 1], 'power-on': ['Power was cut', 1],
+                  software: ['Restarted itself or by command', 0], crash: ['Crashed', 1], 'task-wdt': ['Froze (watchdog)', 1],
+                  'interrupt-wdt': ['Froze (watchdog)', 1], watchdog: ['Froze (watchdog)', 1], external: ['Reset button', 0] };
+  var METRICS = [
+    { key: 'fps', title: 'Frames per second', fmt: function (v) { return v.toFixed(1); }, zero: true },
+    { key: 'rssi', title: 'WiFi signal', fmt: function (v) { return v + ' dBm'; } },
+    { key: 'heap', title: 'Free memory', fmt: function (v) { return v + ' KB'; } },
+  ];
+  async function loadHealth() {
+    try { hData = await (await fetch('/health' + q, { cache: 'no-store' })).json(); renderHealth(); } catch (e) {}
+  }
+  document.querySelector('#h-range').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    hHours = +b.dataset.h;
+    this.querySelectorAll('button').forEach(function (x) { x.setAttribute('aria-pressed', String(x === b)); });
+    renderHealth();
+  });
+  function hm(t) { return new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+  function svgEl(tag, attrs) {
+    var el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (var k in attrs) el.setAttribute(k, attrs[k]);
+    return el;
+  }
+  function renderHealth() {
+    if (!hData) return;
+    var now = Date.now(), t0 = now - hHours * 3600e3;
+    var S = hData.samples.filter(function (x) { return x.t >= t0; });
+    var R = hData.restarts.filter(function (x) { return x.t >= t0; });
+    var on = S.filter(function (x) { return x.on; });
+    $('h-online').textContent = S.length ? Math.round(on.length / S.length * 100) + '%' : '–';
+    $('h-rcount').textContent = S.length ? String(R.length) : '–';
+    $('h-fps').textContent = on.length ? (on.reduce(function (a, x) { return a + x.fps; }, 0) / on.length).toFixed(1) : '–';
+    var box = $('h-charts'); box.textContent = ''; hCharts = [];
+    if (S.length < 2) {
+      $('h-note').textContent = 'Collecting — the first points appear within a minute.';
+    } else {
+      $('h-note').textContent = 'Since ' + hm(hData.samples[0].t) + ' · history starts over when the server restarts.';
+      t0 = Math.max(t0, S[0].t);
+    }
+    var W = box.clientWidth || 300, H = 64, pad = 6, top = 16;
+    // Average into ~3 px buckets so 24 h of 30 s samples reads as a line, not noise.
+    // A bucket with any offline sample is offline.
+    var span = now - t0, nb = Math.max(2, Math.floor(W / 3)), B = [];
+    S.forEach(function (x) {
+      var k = Math.min(nb - 1, Math.floor((x.t - t0) / span * nb));
+      var b = B[k] || (B[k] = { t: 0, n: 0, on: true, fps: 0, rssi: 0, heap: 0 });
+      b.t += x.t; b.n++; if (!x.on) b.on = false;
+      if (x.on) { b.fps += x.fps || 0; b.rssi += x.rssi || 0; b.heap += x.heap || 0; }
+    });
+    var Sb = B.filter(Boolean).map(function (b) {
+      var n = b.n;
+      return { t: b.t / n, on: b.on, fps: b.on ? Math.round(b.fps / n * 10) / 10 : null,
+               rssi: b.on ? Math.round(b.rssi / n) : null, heap: b.on ? Math.round(b.heap / n) : null };
+    });
+    var enough = S.length >= 2;
+    METRICS.forEach(function (m) {
+      if (!enough) return;
+      var S = Sb;                                  // this chart draws the buckets
+      var vals = S.filter(function (x) { return x[m.key] !== null; }).map(function (x) { return x[m.key]; });
+      var lo = vals.length ? Math.min.apply(null, vals) : 0, hi = vals.length ? Math.max.apply(null, vals) : 1;
+      if (m.zero) lo = 0;
+      if (hi - lo < 2) { hi += 1; lo -= m.zero ? 0 : 1; }
+      var X = function (t) { return (t - t0) / (now - t0) * W; };
+      var Y = function (v) { return top + (1 - (v - lo) / (hi - lo)) * (H - top - pad); };
+      var wrap = document.createElement('div'); wrap.className = 'hc';
+      var last = hData.samples[hData.samples.length - 1][m.key];
+      wrap.innerHTML = '<div class="hc-head"><span>' + m.title + '</span><b>' + (last === null ? 'offline' : m.fmt(last)) + '</b></div>';
+      var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img',
+        'aria-label': m.title + ', last ' + hHours + ' hours, ' + m.fmt(lo) + ' to ' + m.fmt(hi) });
+      svg.append(svgEl('line', { class: 'grid-l', x1: 0, x2: W, y1: H - pad, y2: H - pad }));
+      svg.append(svgEl('line', { class: 'grid-l', x1: 0, x2: W, y1: top, y2: top }));
+      var tHi = svgEl('text', { class: 'ax', x: 0, y: top - 4 }); tHi.textContent = m.fmt(hi); svg.append(tHi);
+      var tLo = svgEl('text', { class: 'ax', x: W, y: H + 11, 'text-anchor': 'end' }); tLo.textContent = 'min ' + m.fmt(lo); svg.append(tLo);
+      var segs = [], cur = null;                  // offline stretches break the line and get a red band
+      S.forEach(function (x, i) {
+        if (x[m.key] === null) {
+          cur = null;
+          var nx = S[i + 1] ? X(S[i + 1].t) : W, px = X(x.t);
+          svg.append(svgEl('rect', { class: 'off-band', x: px, y: 0, width: Math.max(1, nx - px), height: H }));
+        } else { if (!cur) segs.push(cur = []); cur.push([X(x.t), Y(x[m.key])]); }
+      });
+      segs.forEach(function (pts) {
+        var d = pts.map(function (p, i) { return (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1); }).join('');
+        if (pts.length > 1) svg.append(svgEl('path', { class: 'ar', d: d + 'L' + pts[pts.length - 1][0].toFixed(1) + ' ' + (H - pad) + 'L' + pts[0][0].toFixed(1) + ' ' + (H - pad) + 'Z' }));
+        svg.append(svgEl('path', { class: 'ln', d: pts.length > 1 ? d : d + 'l0.1 0' }));
+      });
+      R.forEach(function (r) { var x = X(r.t); svg.append(svgEl('line', { class: 'rs', x1: x, x2: x, y1: 0, y2: H })); });
+      var xh = svgEl('line', { class: 'xh', y1: 0, y2: H, visibility: 'hidden' });
+      var dot = svgEl('circle', { class: 'dot', r: 4, visibility: 'hidden' });
+      svg.append(xh, dot);
+      hCharts.push({ m: m, xh: xh, dot: dot, X: X, Y: Y });
+      svg.addEventListener('pointermove', function (e) { hover(e, svg, Sb, X); });
+      svg.addEventListener('pointerleave', unhover);
+      wrap.append(svg); box.append(wrap);
+    });
+    var list = $('h-restarts'); list.textContent = '';
+    R.slice(0, 8).forEach(function (r) {
+      var why = REASONS[r.reason] || [r.reason, 1];
+      var li = document.createElement('li');
+      var sp = document.createElement('span'); sp.className = 'why' + (why[1] ? '' : ' ok'); sp.textContent = why[0];
+      var tm = document.createElement('time'); tm.textContent = hm(r.t);
+      li.append(sp, tm); list.append(li);
+    });
+  }
+  function hover(e, svg, S, X) {                 // crosshair on every chart at the nearest sample
+    var rect = svg.getBoundingClientRect(), x = (e.clientX - rect.left) / rect.width * (svg.viewBox.baseVal.width);
+    var best = S[0], bd = Infinity;
+    S.forEach(function (s) { var d = Math.abs(X(s.t) - x); if (d < bd) { bd = d; best = s; } });
+    var lines = [hm(best.t) + (best.on ? '' : ' · offline')];
+    hCharts.forEach(function (c) {
+      var v = best[c.m.key], px = c.X(best.t);
+      c.xh.setAttribute('x1', px); c.xh.setAttribute('x2', px); c.xh.setAttribute('visibility', 'visible');
+      if (v === null) c.dot.setAttribute('visibility', 'hidden');
+      else { c.dot.setAttribute('cx', px); c.dot.setAttribute('cy', c.Y(v)); c.dot.setAttribute('visibility', 'visible'); }
+      if (v !== null) lines.push(c.m.title + ': ' + c.m.fmt(v));
+    });
+    var tip = $('h-tip'); tip.innerHTML = lines.join('<br>'); tip.hidden = false;
+    tip.style.left = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8) + 'px';
+    tip.style.top = (e.clientY - tip.offsetHeight - 12) + 'px';
+  }
+  function unhover() {
+    $('h-tip').hidden = true;
+    hCharts.forEach(function (c) { c.xh.setAttribute('visibility', 'hidden'); c.dot.setAttribute('visibility', 'hidden'); });
+  }
+  loadHealth(); setInterval(loadHealth, 30000);
+  window.addEventListener('resize', renderHealth);
 
   // ── ARIA's live face (the OLED's 128×64 frame, 1 bit per pixel) ──
   var rc = $('robot'), rctx = rc.getContext('2d'), rimg = rctx.createImageData(128, 64), lastFrame = null;
