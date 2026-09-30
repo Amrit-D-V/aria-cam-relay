@@ -712,7 +712,8 @@ function viewerPage() {
   var EMOJI = { happy: '😊', surprise: '😮', sad: '😢', angry: '😠', neutral: '🙂' };
   var EXPR_MOOD = { purr: '😌 Purring', heart: '😍 In love', yawn: '🥱 Yawning', sideeye: '😒 Sulking',
                     wink: '😉 Winking', surprise: '😲 Surprised', think: '🤔 Thinking', curious: '🧐 Curious',
-                    squint: '🤨 Suspicious', wake: '😪 Waking up' };
+                    squint: '🤨 Suspicious', wake: '😪 Waking up', nod: '🙂 Nodding', giggle: '😆 Giggling',
+                    shy: '☺️ Shy', dizzy: '😵 Dizzy', roll: '🙄 Rolling its eyes' };
   var meta = null, metaAt = 0, shown = [];
   var es = new EventSource('/events' + q);
   es.onmessage = function (e) { try { meta = JSON.parse(e.data); metaAt = Date.now(); render(); } catch (x) {} };
