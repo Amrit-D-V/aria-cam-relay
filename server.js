@@ -105,6 +105,7 @@ const COMMANDS = {                // name → argument validator
   privacy: (a) => /^[01]$/.test(a[0]),
   privhours: (a) => a.length === 2 && a.every((h) => /^\d{1,2}$/.test(h) && +h < 24),
   profile: (a) => ['auto', '0', '1'].includes(a[0]),
+  sensitivity: (a) => ['low', 'medium', 'high'].includes(a[0]),
   restart: (a) => a.length === 0,
 };
 
@@ -673,6 +674,8 @@ function viewerPage() {
           <div class="seg" data-cmd="night"><button data-v="auto">Auto</button><button data-v="on">On</button><button data-v="off">Off</button></div></div>
         <div class="ctl"><div>Light<small>Flash LED</small></div>
           <div class="seg" data-cmd="light"><button data-v="off">Off</button><button data-v="auto">Auto</button><button data-v="30">Low</button><button data-v="100">High</button></div></div>
+        <div class="ctl"><div>Motion alerts<small>Low ignores curtains &amp; plants moving</small></div>
+          <div class="seg" data-cmd="sensitivity"><button data-v="low">Low</button><button data-v="medium">Med</button><button data-v="high">High</button></div></div>
         <div class="ctl"><div>Resolution</div>
           <div class="seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400p</button><button data-v="1">640p</button></div></div>
         <div class="ctl"><div>Restart camera<small>Takes about 15 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
@@ -834,13 +837,15 @@ function viewerPage() {
     setSeg('night', cam.night_mode);
     setSeg('light', cam.ledauto ? 'auto' : cam.led === 0 ? 'off' : cam.led <= 40 ? '30' : '100');
     setSeg('profile', cam.adaptive ? 'auto' : cam.profile === 'VGA' ? '1' : '0');
+    if (cam.sensitivity) setSeg('sensitivity', cam.sensitivity);
     if (document.activeElement !== $('ph-s') && document.activeElement !== $('ph-e')) {
       $('ph-s').value = cam.priv_hours[0]; $('ph-e').value = cam.priv_hours[1];
     }
     var h = $('health'); h.textContent = '';
     [['Signal', cam.rssi + ' dBm'], ['Uptime', fmtUp(cam.up)], ['Memory free', cam.heap_kb + ' KB'],
      ['Last restart', cam.reset], ['Brightness', cam.brightness < 0 ? '–' : Math.round(cam.brightness / 2.55) + '%'],
-     ['Last motion', cam.motion_ago ? ago(cam.motion_ago * 1000) + ' ago' : '–']].forEach(function (kv) {
+     ['Last motion', cam.motion_ago ? ago(cam.motion_ago * 1000) + ' ago' : '–'],
+     ['Motion level', cam.motion_level === undefined ? '–' : (cam.motion_level / 10).toFixed(1) + '%']].forEach(function (kv) {
       var d = document.createElement('div'); d.textContent = kv[0] + ' ';
       var b = document.createElement('b'); b.textContent = kv[1]; d.append(b); h.append(d);
     });
