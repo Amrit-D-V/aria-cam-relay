@@ -98,7 +98,7 @@ const COMMANDS = {                // name → argument validator
   night: (a) => ['auto', 'on', 'off'].includes(a[0]),
   privacy: (a) => /^[01]$/.test(a[0]),
   privhours: (a) => a.length === 2 && a.every((h) => /^\d{1,2}$/.test(h) && +h < 24),
-  profile: (a) => ['auto', '0', '1'].includes(a[0]),
+  profile: (a) => ['auto', '0', '1', '2', '3', '4'].includes(a[0]),
   sensitivity: (a) => ['low', 'medium', 'high'].includes(a[0]),
   restart: (a) => a.length === 0,
 };
@@ -543,6 +543,7 @@ const STYLE = `
   .ctl { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 10px; padding: 9px 0;
          border-bottom: 1px solid var(--line); font-size: 14px; }
   .ctl:last-of-type { border-bottom: 0; }
+  .ctl.wide { grid-template-columns: 1fr; }   /* label above a long button row */
   .ctl small { display: block; color: var(--muted); font-size: 12px; }
   .switch { position: relative; width: 44px; height: 26px; border-radius: 999px; border: 1px solid var(--line);
             background: var(--surface-2); cursor: pointer; padding: 0; }
@@ -725,8 +726,8 @@ function viewerPage() {
           <div class="seg" data-cmd="light"><button data-v="off">Off</button><button data-v="auto">Auto</button><button data-v="30">Low</button><button data-v="100">High</button></div></div>
         <div class="ctl"><div>Motion alerts<small>Low ignores curtains &amp; plants moving</small></div>
           <div class="seg" data-cmd="sensitivity"><button data-v="low">Low</button><button data-v="medium">Med</button><button data-v="high">High</button></div></div>
-        <div class="ctl"><div>Resolution</div>
-          <div class="seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400p</button><button data-v="1">640p</button></div></div>
+        <div class="ctl wide"><div>Resolution<small>Higher = sharper but fewer fps</small></div>
+          <div class="seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400</button><button data-v="1">640</button><button data-v="2">800</button><button data-v="3">720p</button><button data-v="4">1600</button></div></div>
         <div class="ctl"><div>Restart camera<small>Takes about 15 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
       </div>
       <div class="health" id="health"></div>
@@ -899,7 +900,7 @@ function viewerPage() {
     $('night-sub').textContent = cam.night ? 'Active now' : 'Black & white in the dark';
     setSeg('night', cam.night_mode);
     setSeg('light', cam.ledauto ? 'auto' : cam.led === 0 ? 'off' : cam.led <= 40 ? '30' : '100');
-    setSeg('profile', cam.adaptive ? 'auto' : cam.profile === 'VGA' ? '1' : '0');
+    setSeg('profile', cam.adaptive ? 'auto' : String(cam.profile_i !== undefined ? cam.profile_i : cam.profile === 'VGA' ? 1 : 0));
     if (cam.sensitivity) setSeg('sensitivity', cam.sensitivity);
     if (document.activeElement !== $('ph-s') && document.activeElement !== $('ph-e')) {
       $('ph-s').value = cam.priv_hours[0]; $('ph-e').value = cam.priv_hours[1];

@@ -1,7 +1,7 @@
 # Render Blueprint — ARIA ESP32-CAM relay (this repo)
 services:
   - type: web
-    name: aria-cam
+    name: aria-cam-relay   # keeps the URL aria-cam-relay.onrender.com when recreated
     runtime: node
     plan: free
     region: singapore   # closest Render region to India; cannot be changed after creation
