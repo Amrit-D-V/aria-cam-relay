@@ -472,6 +472,7 @@ const STYLE = `
   .avatar { width: 48px; height: 48px; flex: none; border-radius: 50%; display: grid; place-items: center;
             font-weight: 700; font-size: 18px; background: var(--surface-2); border: 2px solid var(--line); color: var(--muted); }
   .avatar.known { border-color: var(--good); color: var(--good); background: rgba(74,222,128,.1); }
+  .avatar.admin { box-shadow: 0 0 0 3px rgba(250,204,21,.35); border-color: #facc15; color: #facc15; }
   .avatar.stranger { border-color: var(--warn); color: var(--warn); background: rgba(251,191,36,.1); }
   .avatar.seeing { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
   .p-name { font-weight: 600; font-size: 16px; }
@@ -611,6 +612,7 @@ function viewerPage() {
       <div class="person"><div class="avatar" id="avatar">–</div>
         <div><div class="p-name" id="who">—</div><div class="p-sub" id="who-sub">Face tracker offline</div></div>
         <div class="emo" id="emo" aria-hidden="true"></div></div>
+      <div class="health" id="detect"></div>
     </section>
 
     <section class="card" aria-label="Activity">
@@ -739,6 +741,17 @@ function viewerPage() {
       av.className = 'avatar ' + (known ? 'known' : stranger ? 'stranger' : 'seeing');
       av.textContent = known ? f.name.charAt(0).toUpperCase() : stranger ? '?' : '…';
       $('emo').textContent = EMOJI[f.emo] || '';
+    }
+    var dt = $('detect'); dt.textContent = '';
+    if (fresh()) {
+      var bodies = (meta.bodies || []).length, admin = !!(f && f.admin);
+      [['Faces', String(faces.length ? (meta.n || faces.length) : 0)], ['Bodies', String(bodies)],
+       ['Admin', admin ? '👑 ' + f.name + ' present' : 'away'],
+       ['Motion', cam && cam.motion_level !== undefined ? (cam.motion_level / 10).toFixed(1) + '%' : '–']].forEach(function (kv) {
+        var d = document.createElement('div'); d.textContent = kv[0] + ' ';
+        var b = document.createElement('b'); b.textContent = kv[1]; d.append(b); dt.append(d);
+      });
+      if (admin) { av.className = 'avatar known admin'; }
     }
     var r = fresh() && meta.robot;
     if (r) {
@@ -884,6 +897,15 @@ function viewerPage() {
     var nw = img.naturalWidth || 4, nh = img.naturalHeight || 3, s = Math.min(W / nw, H / nh);
     var dw = nw * s, dh = nh * s, ox = (W - dw) / 2, oy = (H - dh) / 2;
     var faces = showBoxes && meta && Date.now() - metaAt < 2500 ? (meta.faces || []) : [];
+    var bodies = showBoxes && meta && Date.now() - metaAt < 2500 ? (meta.bodies || []) : [];
+    ctx.setLineDash([6, 5]); ctx.lineWidth = 1.5; ctx.strokeStyle = '#60a5fa'; ctx.shadowBlur = 0;
+    ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif'; ctx.fillStyle = '#60a5fa';
+    bodies.forEach(function (b) {
+      var x = ox + b[0] * dw, y = oy + b[1] * dh;
+      ctx.strokeRect(x, y, b[2] * dw, b[3] * dh);
+      ctx.fillText('person', x + 5, y + 14);
+    });
+    ctx.setLineDash([]);
     faces.forEach(function (f, i) {
       var t = shown[i] || (shown[i] = { x: f.x, y: f.y, w: f.w, h: f.h });
       ['x', 'y', 'w', 'h'].forEach(function (k) { t[k] += (f[k] - t[k]) * 0.35; });
@@ -891,7 +913,7 @@ function viewerPage() {
     shown.length = faces.length;
     faces.forEach(function (f, i) {
       var b = shown[i], x = ox + b.x * dw, y = oy + b.y * dh, w = b.w * dw, h = b.h * dh;
-      var color = f.id === 'known' ? '#4ade80' : f.id === 'unknown' ? '#fbbf24' : '#5eead4';
+      var color = f.admin ? '#facc15' : f.id === 'known' ? '#4ade80' : f.id === 'unknown' ? '#fbbf24' : '#5eead4';
       ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
       ctx.shadowColor = color; ctx.shadowBlur = 8;
       var c = Math.min(w, h) * 0.24;
@@ -901,7 +923,8 @@ function viewerPage() {
       });
       ctx.stroke();
       ctx.shadowBlur = 0;
-      var label = (f.id === 'known' ? f.name : f.id === 'unknown' ? 'Stranger' : 'Identifying…') + '  ' + (EMOJI[f.emo] || '');
+      var label = (f.admin ? '👑 ' : '') + (f.id === 'known' ? f.name : f.id === 'unknown' ? 'Stranger' : 'Identifying…') +
+        (f.admin ? ' · admin' : '') + '  ' + (EMOJI[f.emo] || '');
       ctx.font = '600 13px ui-sans-serif, system-ui, sans-serif';
       var tw = ctx.measureText(label).width + 16, ly = Math.max(4, y - 28);
       ctx.fillStyle = 'rgba(7,9,12,.72)';
