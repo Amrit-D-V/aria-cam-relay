@@ -70,7 +70,7 @@ let camState = null;
 const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'shy', 'dizzy',
                   'roll', 'nod', 'yawn', 'purr', 'squint', 'sleep', 'wake'];
 const MSG_MAX = 120;
-const displayState = { screen: 1, msg: null, emotion: null, seq: 0 };
+const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0 };
 
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
@@ -106,7 +106,7 @@ const COMMANDS = {                // name → argument validator
 function publicDisplay() {
   const m = displayState.msg;
   return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
-           emotion: displayState.emotion };
+           emotion: displayState.emotion, restart: displayState.restart };
 }
 
 function handleCmd(req, res) {
@@ -132,6 +132,12 @@ function handleCmd(req, res) {
       if (text) logEvent('message', `Message: "${text}"`);
       broadcast('display', publicDisplay());
       return send(res, 202, 'text/plain', 'queued');
+    }
+    if (cmd === 'restart_all') {       // camera now; the display picks it up on its next poll (≤2 s)
+      if (camSocket && !camSocket.destroyed) camSocket.write(wsFrame(0x1, Buffer.from('restart')));
+      displayState.restart = Date.now();
+      logEvent('privacy', 'System restart (camera + display)');
+      return send(res, 202, 'text/plain', 'restarting');
     }
     if (cmd === 'emotion') {
       if (!EMOTIONS.includes(args[0])) return send(res, 400, 'text/plain', 'unknown emotion');
@@ -728,7 +734,7 @@ function viewerPage() {
           <div class="seg" data-cmd="sensitivity"><button data-v="low">Low</button><button data-v="medium">Med</button><button data-v="high">High</button></div></div>
         <div class="ctl wide"><div>Resolution<small>Higher = sharper but fewer fps</small></div>
           <div class="seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400</button><button data-v="1">640</button><button data-v="2">800</button><button data-v="3">720p</button><button data-v="4">1600</button></div></div>
-        <div class="ctl"><div>Restart camera<small>Takes about 15 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
+        <div class="ctl"><div>Restart system<small>Camera + display, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
       </div>
       <div class="health" id="health"></div>
     </section>
@@ -959,7 +965,9 @@ function viewerPage() {
       else send(cmd, [v]);
     });
   });
-  $('restart').onclick = function () { if (confirm('Restart the camera? The stream drops for ~15 seconds.')) send('restart'); };
+  $('restart').onclick = function () {
+    if (confirm('Restart the camera and the display? The stream drops for about 20 seconds.')) send('restart_all');
+  };
 
   // ── Talk to ARIA: display on/off, messages, emotions ──
   var disp = null;
