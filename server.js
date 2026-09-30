@@ -17,6 +17,10 @@
 //   POST /cmd        page → camera command (header X-Admin-Key: $ADMIN_KEY,
 //                    else $CAM_KEY; JSON {cmd, args}) — LED, night mode,
 //                    privacy, resolution, restart
+//   GET  /display    the OLED display's pending state (?key=): screen on/off,
+//                    latest admin message, latest emotion request — it polls
+//                    this every 2 s (admin sets them via /cmd: screen, message,
+//                    emotion)
 //   GET  /stream     MJPEG stream     (?key=)
 //   GET  /snapshot   latest JPEG      (?key=)
 //   GET  /status     JSON             (?key=)
@@ -61,6 +65,13 @@ const presence = { here: false, lastFace: 0, who: null, sleeping: null };
 // Camera state reported over its WebSocket every ~2 s (settings + health).
 let camState = null;
 
+// What the admin has asked of the OLED display. Ids let the display tell a
+// new message/emotion from one it has already shown.
+const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'shy', 'dizzy',
+                  'roll', 'nod', 'yawn', 'purr', 'squint', 'sleep', 'wake'];
+const MSG_MAX = 120;
+const displayState = { screen: 1, msg: null, emotion: null, seq: 0 };
+
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
   for (const s of metaSubscribers) s.write(line);
@@ -92,6 +103,12 @@ const COMMANDS = {                // name → argument validator
   restart: (a) => a.length === 0,
 };
 
+function publicDisplay() {
+  const m = displayState.msg;
+  return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
+           emotion: displayState.emotion };
+}
+
 function handleCmd(req, res) {
   if (!keyMatches(req.headers['x-admin-key'], ADMIN_KEY)) return send(res, 401, 'text/plain', 'bad admin key');
   const chunks = [];
@@ -100,6 +117,28 @@ function handleCmd(req, res) {
     let body;
     try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
     const cmd = String(body.cmd || ''), args = (body.args || []).map(String);
+    // Display commands are kept here for the display to pick up (/display).
+    if (cmd === 'screen') {
+      if (!['on', 'off'].includes(args[0])) return send(res, 400, 'text/plain', 'screen on|off');
+      displayState.screen = args[0] === 'on' ? 1 : 0;
+      broadcast('display', publicDisplay());
+      return send(res, 202, 'text/plain', 'queued');
+    }
+    if (cmd === 'message') {
+      // The OLED fonts are ASCII: anything else becomes '?'. Blank clears it.
+      const text = String(body.text || '').replace(/[\r\n\t]+/g, ' ').replace(/[^\x20-\x7e]/g, '?').trim().slice(0, MSG_MAX);
+      const secs = Math.min(Math.max(parseInt(body.secs, 10) || 15, 5), 600);
+      displayState.msg = text ? { id: ++displayState.seq, text, secs, t: Date.now() } : null;
+      if (text) logEvent('message', `Message: "${text}"`);
+      broadcast('display', publicDisplay());
+      return send(res, 202, 'text/plain', 'queued');
+    }
+    if (cmd === 'emotion') {
+      if (!EMOTIONS.includes(args[0])) return send(res, 400, 'text/plain', 'unknown emotion');
+      displayState.emotion = { id: ++displayState.seq, name: args[0], t: Date.now() };
+      broadcast('display', publicDisplay());
+      return send(res, 202, 'text/plain', 'queued');
+    }
     if (!COMMANDS[cmd] || !COMMANDS[cmd](args)) return send(res, 400, 'text/plain', 'unknown command or bad arguments');
     if (!camSocket || camSocket.destroyed) return send(res, 503, 'text/plain', 'camera not connected');
     camSocket.write(wsFrame(0x1, Buffer.from([cmd, ...args].join(' '))));
@@ -230,6 +269,7 @@ function handleEvents(req, res) {
   if (latestMeta) res.write(`data: ${latestMeta}\n\n`);
   for (const e of [...activity].reverse()) res.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
   if (camState) res.write(`event: cam\ndata: ${JSON.stringify(camState)}\n\n`);
+  res.write(`event: display\ndata: ${JSON.stringify(publicDisplay())}\n\n`);
   metaSubscribers.add(res);
   const ping = setInterval(() => res.write(': ping\n\n'), 15000);   // keep proxies from idling it out
   res.on('close', () => { clearInterval(ping); metaSubscribers.delete(res); });
@@ -297,6 +337,9 @@ const server = http.createServer((req, res) => {
     case '/events':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return handleEvents(req, res);
+    case '/display':
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return send(res, 200, 'application/json', JSON.stringify(publicDisplay()));
     case '/status':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(status()));
@@ -486,6 +529,7 @@ const STYLE = `
   .log li i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
   .log li.known i { background: var(--good); } .log li.stranger i { background: var(--warn); }
   .log li.arrive i { background: var(--accent); } .log li.sleep i, .log li.wake i { background: var(--violet); }
+  .log li span { overflow-wrap: anywhere; min-width: 0; }
   .log li time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .log li.empty { display: block; color: var(--muted); border: 0; }
   .log li.new { animation: slidein .4s ease; }
@@ -522,6 +566,21 @@ const STYLE = `
   .privacy-screen b { color: var(--text); font-size: 17px; }
   .chip.night { color: #c4b5fd; }
 
+  .emo-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 8px; }
+  .emo-grid button { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 2px;
+                     cursor: pointer; font-size: 12px; color: var(--muted); display: grid; gap: 2px; justify-items: center; }
+  .emo-grid button b { font-size: 20px; line-height: 1; }
+  .emo-grid button:hover { border-color: rgba(94,234,212,.4); color: var(--text); }
+  .emo-grid button.sent { border-color: var(--accent); color: var(--accent); }
+  .msg-box { display: grid; gap: 8px; margin-top: 4px; }
+  .msg-box textarea { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); border-radius: 10px;
+                      padding: 10px; font: inherit; resize: vertical; min-height: 64px; }
+  .msg-box textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .msg-row { display: flex; gap: 8px; align-items: center; justify-content: space-between; font-size: 12px; color: var(--muted); }
+  .msg-row select { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 5px; font: inherit; }
+  .showing { font-size: 12px; color: var(--accent); min-height: 16px; }
+  .log li.message i { background: var(--accent); }
+  .sub-h { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin: 14px 0 4px; }
   .foot { max-width: 1280px; margin: 0 auto; padding: 4px 16px 24px; color: var(--muted); font-size: 12px; }
 
   .login { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
@@ -620,12 +679,43 @@ function viewerPage() {
       <ol class="log" id="log"><li class="empty">Nothing yet</li></ol>
     </section>
 
+    <section class="card" aria-label="ARIA controls">
+      <div class="card-head"><h2>Talk to ARIA</h2><span class="mood" id="disp-state">—</span></div>
+      <div class="locked" id="aria-locked"><span>Controls are locked.</span><button class="btn primary" id="unlock2">Unlock</button></div>
+      <div id="aria-controls" hidden>
+        <div class="ctl"><div>Display<small>Turn the OLED screen on or off</small></div>
+          <button class="switch" id="screen" role="switch" aria-checked="true" aria-label="Display on"></button></div>
+        <div class="sub-h">Message on the display</div>
+        <div class="msg-box">
+          <textarea id="msg" maxlength="120" placeholder="Type a message… (e.g. Dinner is ready!)"></textarea>
+          <div class="msg-row">
+            <span><span id="msg-count">0</span>/120 · show for
+              <select id="msg-secs" aria-label="Show for"><option value="10">10 s</option><option value="30" selected>30 s</option>
+                <option value="60">1 min</option><option value="300">5 min</option><option value="600">10 min</option></select></span>
+            <span><button class="btn" id="msg-clear">Clear</button> <button class="btn primary" id="msg-send">Send</button></span>
+          </div>
+          <div class="showing" id="msg-showing"></div>
+        </div>
+        <div class="sub-h">Emotion</div>
+        <div class="emo-grid" id="emo-grid">
+          <button data-e="giggle"><b>😆</b>Giggle</button><button data-e="wink"><b>😉</b>Wink</button>
+          <button data-e="heart"><b>😍</b>Love</button><button data-e="surprise"><b>😲</b>Surprise</button>
+          <button data-e="curious"><b>🧐</b>Curious</button><button data-e="think"><b>🤔</b>Think</button>
+          <button data-e="shy"><b>☺️</b>Shy</button><button data-e="dizzy"><b>😵</b>Dizzy</button>
+          <button data-e="roll"><b>🙄</b>Eye-roll</button><button data-e="nod"><b>🙂</b>Nod</button>
+          <button data-e="squint"><b>🤨</b>Suspicious</button><button data-e="purr"><b>😌</b>Purr</button>
+          <button data-e="yawn"><b>🥱</b>Yawn</button><button data-e="sleep"><b>😴</b>Sleep</button>
+          <button data-e="wake"><b>☀️</b>Wake up</button>
+        </div>
+      </div>
+    </section>
+
     <section class="card" aria-label="Camera controls">
       <div class="card-head"><h2>Camera</h2><span class="mood" id="cam-conn">—</span></div>
       <div class="locked" id="locked"><span>Controls are locked.</span><button class="btn primary" id="unlock">Unlock</button></div>
       <div id="controls" hidden>
-        <div class="ctl"><div>Privacy<small id="priv-sub">Stops streaming and detection</small></div>
-          <button class="switch" id="priv" role="switch" aria-checked="false" aria-label="Privacy mode"></button></div>
+        <div class="ctl"><div>Camera<small id="priv-sub">On — streaming and detecting</small></div>
+          <button class="switch" id="priv" role="switch" aria-checked="true" aria-label="Camera on"></button></div>
         <div class="ctl"><div>Private hours<small>Daily</small></div>
           <div class="hours"><select id="ph-s" aria-label="From"></select>–<select id="ph-e" aria-label="To"></select>
             <button class="btn" id="ph-save">Set</button></div></div>
@@ -796,14 +886,16 @@ function viewerPage() {
   function renderCam() {
     $('cam-conn').textContent = cam ? 'Connected' : 'Not connected';
     $('locked').hidden = !!adminKey; $('controls').hidden = !adminKey;
+    $('aria-locked').hidden = !!adminKey; $('aria-controls').hidden = !adminKey;
     var ps = $('privacy-screen');
     ps.hidden = !(cam && cam.privacy);
     $('hud-night').hidden = !(cam && cam.night && !cam.privacy);
     if (!cam) { $('health').textContent = ''; return; }
     if (cam.privacy) $('privacy-text').textContent = cam.privacy_manual ? 'Switched on from this page.'
       : 'Private hours ' + cam.priv_hours[0] + ':00–' + cam.priv_hours[1] + ':00.';
-    $('priv').setAttribute('aria-checked', String(!!cam.privacy_manual));
-    $('priv-sub').textContent = cam.privacy ? 'On — nothing is leaving the camera' : 'Stops streaming and detection';
+    $('priv').setAttribute('aria-checked', String(!cam.privacy_manual));      // switch = camera ON
+    $('priv-sub').textContent = cam.privacy ? (cam.privacy_manual ? 'Off — private, nothing leaves the camera'
+      : 'Off — private hours') : 'On — streaming and detecting';
     $('night-sub').textContent = cam.night ? 'Active now' : 'Black & white in the dark';
     setSeg('night', cam.night_mode);
     setSeg('light', cam.ledauto ? 'auto' : cam.led === 0 ? 'off' : cam.led <= 40 ? '30' : '100');
@@ -831,15 +923,19 @@ function viewerPage() {
       var o = document.createElement('option'); o.value = hr; o.textContent = pad(hr) + ':00'; $(id).append(o);
     });
   }
-  async function send(cmd, args) {
+  async function send(cmd, args, extra) {
     try {
+      var body = { cmd: cmd, args: args || [] };
+      for (var k in (extra || {})) body[k] = extra[k];
       var r = await fetch('/cmd', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
-                                    body: JSON.stringify({ cmd: cmd, args: args || [] }) });
+                                    body: JSON.stringify(body) });
       if (r.status === 401) { lock(); alert('That admin key was not accepted.'); }
       else if (r.status === 503) alert('The camera is not connected right now.');
-    } catch (e) { alert('Could not reach the relay.'); }
+      return r.status;
+    } catch (e) { alert('Could not reach the relay.'); return 0; }
   }
   function lock() { adminKey = null; try { localStorage.removeItem('aria-admin'); } catch (e) {} renderCam(); }
+  $('unlock2').onclick = function () { $('unlock').onclick(); };
   $('unlock').onclick = function () {
     var k = prompt('Admin key (the camera key, unless you set ADMIN_KEY on Render):');
     if (!k) return;
@@ -848,9 +944,9 @@ function viewerPage() {
     renderCam();
   };
   $('priv').onclick = function () {
-    var on = $('priv').getAttribute('aria-checked') !== 'true';
-    $('priv').setAttribute('aria-checked', String(on));      // optimistic; the next state report confirms
-    send('privacy', [on ? '1' : '0']);
+    var cameraOn = $('priv').getAttribute('aria-checked') !== 'true';
+    $('priv').setAttribute('aria-checked', String(cameraOn));   // optimistic; the next state report confirms
+    send('privacy', [cameraOn ? '0' : '1']);
   };
   $('ph-save').onclick = function () { send('privhours', [$('ph-s').value, $('ph-e').value]); };
   document.querySelectorAll('.seg').forEach(function (seg) {
@@ -863,6 +959,41 @@ function viewerPage() {
     });
   });
   $('restart').onclick = function () { if (confirm('Restart the camera? The stream drops for ~15 seconds.')) send('restart'); };
+
+  // ── Talk to ARIA: display on/off, messages, emotions ──
+  var disp = null;
+  es.addEventListener('display', function (e) { try { disp = JSON.parse(e.data); renderDisp(); } catch (x) {} });
+  function renderDisp() {
+    if (!disp) return;
+    $('screen').setAttribute('aria-checked', String(!!disp.screen));
+    $('disp-state').textContent = disp.screen ? 'Display on' : 'Display off';
+    var m = disp.msg;
+    if (m) {
+      var left = Math.max(0, Math.round((m.t + m.secs * 1000 - Date.now()) / 1000));
+      $('msg-showing').textContent = left ? 'Showing: “' + m.text + '” · ' + left + 's left' : '';
+    } else $('msg-showing').textContent = '';
+  }
+  setInterval(renderDisp, 1000);
+  $('screen').onclick = function () {
+    var on = $('screen').getAttribute('aria-checked') !== 'true';
+    $('screen').setAttribute('aria-checked', String(on));
+    send('screen', [on ? 'on' : 'off']);
+  };
+  $('msg').oninput = function () { $('msg-count').textContent = $('msg').value.length; };
+  $('msg-send').onclick = async function () {
+    var text = $('msg').value.trim();
+    if (!text) return;
+    if (await send('message', [], { text: text, secs: +$('msg-secs').value }) === 202) {
+      $('msg').value = ''; $('msg-count').textContent = '0';
+    }
+  };
+  $('msg').onkeydown = function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('msg-send').onclick(); } };
+  $('msg-clear').onclick = function () { send('message', [], { text: '' }); };
+  $('emo-grid').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    send('emotion', [b.dataset.e]);
+    b.classList.add('sent'); setTimeout(function () { b.classList.remove('sent'); }, 900);
+  });
   renderCam();
 
   // ── ARIA's live face (the OLED's 128×64 frame, 1 bit per pixel) ──
