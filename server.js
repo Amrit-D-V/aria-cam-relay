@@ -630,6 +630,26 @@ const STYLE = `
   .sub-h { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin: 14px 0 4px; }
   .log li.restart i { background: var(--bad); } .log li.gesture i { background: #f472b6; }
 
+  /* A hand sign seen by the tracker: big emoji pops over the video */
+  .g-pop { position: absolute; left: 50%; top: 42%; transform: translate(-50%, -50%); display: grid; justify-items: center;
+           gap: 6px; pointer-events: none; z-index: 3; }
+  .g-pop[hidden] { display: none; }
+  .g-pop .e { font-size: min(22vw, 120px); line-height: 1; filter: drop-shadow(0 6px 18px rgba(0,0,0,.6)); }
+  .g-pop .t { padding: 5px 12px; border-radius: 999px; background: rgba(7,9,12,.75); border: 1px solid rgba(244,114,182,.5);
+              color: #fbcfe8; font-size: 14px; font-weight: 600; white-space: nowrap; }
+  .g-pop .ring { position: absolute; top: 50%; left: 50%; width: 60px; height: 60px; margin: -30px 0 0 -30px; border-radius: 50%;
+                 border: 3px solid #f472b6; opacity: 0; }
+  .g-pop.go .e { animation: gpop 1.9s cubic-bezier(.2,1.4,.4,1) both; }
+  .g-pop.go .t { animation: gcap 1.9s ease both; }
+  .g-pop.go .ring { animation: gring .8s ease-out both; }
+  .g-pop.go .ring + .ring { animation-delay: .15s; }
+  @keyframes gpop { 0% { transform: scale(.2) rotate(-25deg); opacity: 0; } 18% { transform: scale(1.25) rotate(8deg); opacity: 1; }
+                    30% { transform: scale(.95) rotate(-3deg); } 40%, 80% { transform: scale(1) rotate(0); opacity: 1; }
+                    100% { transform: scale(.85) translateY(-30px); opacity: 0; } }
+  @keyframes gcap { 0%, 15% { opacity: 0; transform: translateY(8px); } 30%, 80% { opacity: 1; transform: none; } 100% { opacity: 0; } }
+  @keyframes gring { from { transform: scale(.4); opacity: .9; } to { transform: scale(4.5); opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .g-pop.go .e, .g-pop.go .t { animation: gcap 1.9s ease both; } .g-pop.go .ring { animation: none; } }
+
   /* Detection zones editor: an 8x6 grid over the video */
   .zones { position: absolute; display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(6, 1fr);
            touch-action: none; user-select: none; -webkit-user-select: none; }
@@ -729,6 +749,8 @@ function viewerPage() {
           <path d="M3 3l18 18M10.6 6H15a2 2 0 0 1 2 2v2l4-3v10M17 17H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2"/></svg>
         <b>Camera offline</b><span id="offline-text">Waiting for the camera…</span>
       </div>
+      <div class="g-pop" id="g-pop" hidden aria-live="polite"><i class="ring"></i><i class="ring"></i>
+        <span class="e" id="g-emoji"></span><span class="t" id="g-text"></span></div>
       <div class="zones" id="zones" hidden aria-label="Detection zones: tap cells to watch or ignore them"></div>
       <div class="zone-bar" id="zone-bar" hidden>
         <span id="zone-info">Tap cells to ignore them</span>
@@ -916,9 +938,26 @@ function viewerPage() {
                     wink: '😉 Winking', surprise: '😲 Surprised', think: '🤔 Thinking', curious: '🧐 Curious',
                     squint: '🤨 Suspicious', wake: '😪 Waking up', nod: '🙂 Nodding', giggle: '😆 Giggling',
                     shy: '☺️ Shy', dizzy: '😵 Dizzy', roll: '🙄 Rolling its eyes' };
-  var meta = null, metaAt = 0, shown = [];
+  var meta = null, metaAt = 0, shown = [], handShown = null;
   var es = new EventSource('/events' + q);
-  es.onmessage = function (e) { try { meta = JSON.parse(e.data); metaAt = Date.now(); render(); } catch (x) {} };
+  es.onmessage = function (e) { try { meta = JSON.parse(e.data); metaAt = Date.now(); render(); gesturePop(); } catch (x) {} };
+
+  // A new hand sign: pop its emoji over the video (only ones made in the last few seconds,
+  // so opening the page doesn't replay an old one)
+  var lastSign = Date.now() - 4000, popTimer = null;
+  function gesturePop() {
+    var g = meta && meta.gesture;
+    if (!g || typeof g.t !== 'number' || g.t <= lastSign) return;
+    lastSign = g.t;
+    var parts = String(g.name).split(' '), emoji = parts.shift();
+    $('g-emoji').textContent = emoji;
+    $('g-text').textContent = (g.who ? g.who + ' · ' : '') + parts.join(' ');
+    var el = $('g-pop');
+    el.hidden = false; el.classList.remove('go'); void el.offsetWidth; el.classList.add('go');
+    clearTimeout(popTimer);
+    popTimer = setTimeout(function () { el.hidden = true; el.classList.remove('go'); }, 2000);
+    if (navigator.vibrate) navigator.vibrate(30);
+  }
   es.addEventListener('log', function (e) { try { addLog(JSON.parse(e.data)); } catch (x) {} });
 
   function fresh() { return meta && Date.now() - metaAt < 3000; }
@@ -1344,6 +1383,21 @@ function viewerPage() {
       ctx.fillText('person', x + 5, y + 14);
     });
     ctx.setLineDash([]);
+    var hand = showBoxes && meta && Date.now() - metaAt < 1500 ? meta.hand : null;
+    if (hand) {                                  // the hand the gesture reader is watching (pink)
+      var hs = handShown || (handShown = { x: hand.x, y: hand.y, w: hand.w, h: hand.h });
+      ['x', 'y', 'w', 'h'].forEach(function (k) { hs[k] += (hand[k] - hs[k]) * 0.4; });
+      var hx = ox + hs.x * dw - 4, hy = oy + hs.y * dh - 4, hw = hs.w * dw + 8, hh = hs.h * dh + 8;
+      ctx.strokeStyle = '#f472b6'; ctx.lineWidth = 2; ctx.shadowColor = '#f472b6'; ctx.shadowBlur = 10;
+      ctx.beginPath(); ctx.roundRect ? ctx.roundRect(hx, hy, hw, hh, 10) : ctx.rect(hx, hy, hw, hh); ctx.stroke();
+      ctx.shadowBlur = 0;
+      var hl = hand.g || '✋ hand';
+      ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
+      var hlw = ctx.measureText(hl).width + 14, hly = hy + hh + 4;
+      ctx.fillStyle = 'rgba(7,9,12,.72)';
+      ctx.beginPath(); ctx.roundRect ? ctx.roundRect(hx, hly, hlw, 20, 10) : ctx.rect(hx, hly, hlw, 20); ctx.fill();
+      ctx.fillStyle = '#f9a8d4'; ctx.fillText(hl, hx + 7, hly + 14);
+    } else handShown = null;
     faces.forEach(function (f, i) {
       var t = shown[i] || (shown[i] = { x: f.x, y: f.y, w: f.w, h: f.h });
       ['x', 'y', 'w', 'h'].forEach(function (k) { t[k] += (f[k] - t[k]) * 0.35; });
