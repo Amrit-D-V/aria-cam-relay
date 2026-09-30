@@ -11,7 +11,8 @@
 //                    distances: every frame waits a full round trip
 //   POST /meta       tracker → relay  (header X-Cam-Key, JSON body): face boxes,
 //                    names, emotions and the robot's mood, drawn over the video
-//   GET  /events     Server-Sent Events stream of /meta updates (?key=)
+//   GET  /events     Server-Sent Events: /meta updates as messages, plus named
+//                    "log" events for the activity timeline (?key=)
 //   GET  /?key=      viewer page      (key: $VIEW_KEY)
 //   GET  /stream     MJPEG stream     (?key=)
 //   GET  /snapshot   latest JPEG      (?key=)
@@ -44,6 +45,14 @@ let lastPollAt = 0;
 const streamViewers = new Set();
 let latestMeta = null;            // JSON string of the last /meta
 const metaSubscribers = new Set();
+const frameTimes = [];            // arrival times of recent frames, for the fps readout
+let frameSize = null;             // {w, h} from the latest JPEG's header
+
+// Activity timeline, derived from /meta. Presence is debounced — a face that
+// drops out for a frame or two doesn't log "left" and "arrived" again.
+const LOG_MAX = 30;
+const activity = [];              // newest first: {t, kind, text}
+const presence = { here: false, lastFace: 0, who: null, sleeping: null };
 
 function keyMatches(given, expected) {
   const a = Buffer.from(String(given || ''));
@@ -65,6 +74,61 @@ function writeFrame(res, frame) {
   res.write(frame);
   res.write('\r\n');
 }
+
+// Width/height from a baseline or progressive JPEG's SOF marker.
+function jpegSize(buf) {
+  let i = 2;
+  while (i + 9 < buf.length) {
+    if (buf[i] !== 0xff) { i++; continue; }
+    const marker = buf[i + 1];
+    if (marker === 0xc0 || marker === 0xc2) return { h: buf.readUInt16BE(i + 5), w: buf.readUInt16BE(i + 7) };
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+    i += 2 + buf.readUInt16BE(i + 2);
+  }
+  return null;
+}
+
+function fps() {
+  const now = Date.now();
+  while (frameTimes.length && now - frameTimes[0] > 5000) frameTimes.shift();
+  return frameTimes.length / 5;
+}
+
+function logEvent(kind, text) {
+  const e = { t: Date.now(), kind, text };
+  activity.unshift(e);
+  if (activity.length > LOG_MAX) activity.pop();
+  for (const s of metaSubscribers) s.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
+}
+
+function trackActivity(meta) {
+  const now = Date.now();
+  const f = (meta.faces || [])[0];
+  if (f) {
+    presence.lastFace = now;
+    if (!presence.here) { presence.here = true; logEvent('arrive', 'Someone appeared'); }
+    const who = f.id === 'known' ? f.name : f.id === 'unknown' ? 'stranger' : null;
+    if (who && who !== presence.who) {
+      presence.who = who;
+      if (f.id === 'known') logEvent('known', `${who} is here`);
+      else logEvent('stranger', 'Unknown person in view');
+    }
+  }
+  const r = meta.robot;
+  if (r && typeof r.sleeping === 'boolean' && r.sleeping !== presence.sleeping) {
+    if (presence.sleeping !== null) logEvent(r.sleeping ? 'sleep' : 'wake', r.sleeping ? 'ARIA fell asleep' : 'ARIA woke up');
+    presence.sleeping = r.sleeping;
+  }
+}
+
+setInterval(() => {                               // "left" once nobody's been seen for 6s
+  if (presence.here && Date.now() - presence.lastFace > 6000) {
+    const who = presence.who && presence.who !== 'stranger' ? presence.who : 'Everyone';
+    presence.here = false;
+    presence.who = null;
+    logEvent('leave', `${who} left`);
+  }
+}, 1000);
 
 function handlePush(req, res) {
   if (!keyMatches(req.headers['x-cam-key'], CAM_KEY)) return send(res, 401, 'text/plain', 'bad key');
@@ -96,6 +160,7 @@ function handleMeta(req, res) {
     let meta;
     try { meta = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
     latestMeta = JSON.stringify(meta);            // re-serialised: only valid JSON reaches viewers
+    trackActivity(meta);
     for (const s of metaSubscribers) s.write(`data: ${latestMeta}\n\n`);
     send(res, 204, 'text/plain', '');
   });
@@ -110,6 +175,7 @@ function handleEvents(req, res) {
   });
   res.write(': connected\n\n');          // flush headers now — Node holds them until the first write
   if (latestMeta) res.write(`data: ${latestMeta}\n\n`);
+  for (const e of [...activity].reverse()) res.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
   metaSubscribers.add(res);
   const ping = setInterval(() => res.write(': ping\n\n'), 15000);   // keep proxies from idling it out
   res.on('close', () => { clearInterval(ping); metaSubscribers.delete(res); });
@@ -119,6 +185,8 @@ function acceptFrame(frame) {
   if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) return false;
   latestFrame = frame;
   latestAt = Date.now();
+  frameTimes.push(latestAt);
+  frameSize = jpegSize(frame) || frameSize;
   for (const v of streamViewers) {
     if (v.writableLength > 2 * frame.length) continue;   // slow viewer: drop this frame for them
     writeFrame(v, frame);
@@ -144,7 +212,8 @@ function handleStream(req, res) {
 
 function status() {
   const age = latestAt ? Date.now() - latestAt : null;
-  return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount() };
+  return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
+           fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h };
 }
 
 const server = http.createServer((req, res) => {
@@ -254,169 +323,396 @@ server.on('upgrade', (req, socket) => {
 server.listen(PORT, () => console.log(`cam relay listening on :${PORT}`));
 
 // ── Pages ───────────────────────────────────────────────────────────────
+// Dark "smart camera" dashboard. No external assets: system fonts, inline SVG.
 const STYLE = `
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    --bg: #07090c; --surface: #0e1217; --surface-2: #141920; --line: #202833;
+    --text: #e6edf3; --muted: #8b97a6; --accent: #5eead4; --accent-dim: rgba(94,234,212,.14);
+    --good: #4ade80; --warn: #fbbf24; --bad: #f87171; --violet: #a78bfa;
+    --radius: 16px;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; min-height: 100vh; background: #0b0d10; color: #e8eaed;
-         font: 15px/1.4 system-ui, -apple-system, sans-serif; display: flex; flex-direction: column; }
-  header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; gap: 12px; }
-  h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  .pill { font-size: 13px; padding: 4px 10px; border-radius: 999px; background: #1f2329; white-space: nowrap; }
-  .pill.live { background: #12391f; color: #6ee7a0; }
-  .pill.off { background: #3a1616; color: #fca5a5; }
-  main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
-         gap: 12px; padding: 0 16px; }
-  .stage { position: relative; width: 100%; max-width: 960px; }
-  img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #000; border-radius: 10px; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { min-height: 100vh; font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         -webkit-font-smoothing: antialiased; }
+  button, a { font: inherit; color: inherit; }
+
+  .top { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+         max-width: 1280px; margin: 0 auto; padding: 16px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo { width: 40px; height: 40px; border-radius: 12px; background: var(--surface-2); border: 1px solid var(--line);
+          display: grid; place-items: center; }
+  .logo svg { width: 26px; height: 26px; }
+  .name { font-weight: 700; letter-spacing: .08em; }
+  .tag { font-size: 12px; color: var(--muted); }
+  .top-right { display: flex; align-items: center; gap: 10px; }
+  .clock { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 14px; }
+  .live { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
+          background: var(--surface-2); border: 1px solid var(--line); font-size: 13px; white-space: nowrap; }
+  .live i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .live.on i { background: var(--good); box-shadow: 0 0 0 0 rgba(74,222,128,.6); animation: pulse 1.8s infinite; }
+  .live.off i { background: var(--bad); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(74,222,128,.55); } 70% { box-shadow: 0 0 0 8px rgba(74,222,128,0); }
+                     100% { box-shadow: 0 0 0 0 rgba(74,222,128,0); } }
+
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px;
+          max-width: 1280px; margin: 0 auto; padding: 0 16px 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+
+  .stage { position: relative; aspect-ratio: 4 / 3; background: #000; border-radius: var(--radius);
+           overflow: hidden; border: 1px solid var(--line); }
+  .stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
   #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-  .info { display: flex; gap: 10px; width: 100%; max-width: 960px; flex-wrap: wrap; }
-  .card { flex: 1 1 200px; background: #15181c; border: 1px solid #2d333b; border-radius: 10px; padding: 10px 14px; }
-  .card .label { font-size: 12px; color: #9aa0a6; text-transform: uppercase; letter-spacing: .04em; }
-  .card .value { font-size: 17px; margin-top: 2px; }
-  .card .sub { font-size: 13px; color: #9aa0a6; }
-  .meter { height: 4px; background: #2d333b; border-radius: 2px; margin-top: 6px; overflow: hidden; }
-  .meter > span { display: block; height: 100%; background: #6ee7a0; width: 0; transition: width .6s; }
-  footer { display: flex; gap: 10px; justify-content: center; padding: 16px; flex-wrap: wrap; }
-  button, a.btn { background: #1f2329; color: #e8eaed; border: 1px solid #2d333b; border-radius: 8px;
-                  padding: 10px 16px; font: inherit; text-decoration: none; cursor: pointer; }
-  form { margin: auto; padding: 24px 16px; display: flex; flex-direction: column; gap: 12px; width: 100%; max-width: 360px; }
-  input { background: #15181c; color: inherit; border: 1px solid #2d333b; border-radius: 8px; padding: 10px 12px; font: inherit; }
-  .err { color: #fca5a5; margin: 0; }
+  .hud { position: absolute; display: flex; gap: 6px; align-items: center; pointer-events: none; }
+  .hud.tl { top: 12px; left: 12px; } .hud.tr { top: 12px; right: 12px; }
+  @media (max-width: 420px) { #hud-res { display: none; } }   /* keep the two chip rows apart on small phones */
+  .chip, .rec { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+                background: rgba(7,9,12,.6); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+                border: 1px solid rgba(255,255,255,.08); font-variant-numeric: tabular-nums; }
+  .rec { display: inline-flex; align-items: center; gap: 6px; color: #fff; }
+  .rec i { width: 7px; height: 7px; border-radius: 50%; background: var(--bad); animation: blink 1.2s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+  .controls { position: absolute; right: 12px; bottom: 12px; display: flex; gap: 8px; opacity: 0; transition: opacity .2s; }
+  .stage:hover .controls, .stage:focus-within .controls { opacity: 1; }
+  @media (hover: none) { .controls { opacity: 1; } }
+  .icon { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 12px; cursor: pointer;
+          background: rgba(7,9,12,.65); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+          border: 1px solid rgba(255,255,255,.1); text-decoration: none; }
+  .icon svg { width: 20px; height: 20px; }
+  .icon[aria-pressed="true"] { color: var(--accent); border-color: rgba(94,234,212,.4); }
+  .offline { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 10px;
+             background: radial-gradient(circle at center, rgba(20,25,32,.85), rgba(7,9,12,.95)); color: var(--muted);
+             text-align: center; padding: 16px; }
+  .offline[hidden] { display: none; }
+  .offline svg { width: 40px; height: 40px; opacity: .7; }
+  .offline b { color: var(--text); font-size: 17px; }
+  .stage:fullscreen { border-radius: 0; border: 0; }
+
+  .side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+  .card h2 { margin: 0; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; }
+  .mood { font-size: 14px; }
+  .badge { min-width: 24px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2);
+           border: 1px solid var(--line); font-size: 12px; text-align: center; font-variant-numeric: tabular-nums; }
+
+  .robot-wrap { position: relative; background: #020304; border-radius: 12px; border: 1px solid var(--line); overflow: hidden; }
+  #robot { display: block; width: 100%; aspect-ratio: 2 / 1; image-rendering: pixelated;
+           filter: drop-shadow(0 0 4px rgba(94,234,212,.55)); }
+  .robot-off { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
+  .robot-off[hidden] { display: none; }
+  .meters { display: grid; gap: 8px; margin-top: 14px; }
+  .meter { display: grid; grid-template-columns: 76px 1fr 34px; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  .meter .bar { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+  .meter .bar span { display: block; height: 100%; width: 0; border-radius: 999px; transition: width .8s ease; }
+  .meter .val { text-align: right; font-variant-numeric: tabular-nums; }
+  #m-energy { background: linear-gradient(90deg, #22d3ee, var(--accent)); }
+  #m-affection { background: linear-gradient(90deg, #f472b6, #fb7185); }
+  #m-boredom { background: linear-gradient(90deg, #64748b, #94a3b8); }
+
+  .person { display: flex; align-items: center; gap: 12px; }
+  .avatar { width: 48px; height: 48px; flex: none; border-radius: 50%; display: grid; place-items: center;
+            font-weight: 700; font-size: 18px; background: var(--surface-2); border: 2px solid var(--line); color: var(--muted); }
+  .avatar.known { border-color: var(--good); color: var(--good); background: rgba(74,222,128,.1); }
+  .avatar.stranger { border-color: var(--warn); color: var(--warn); background: rgba(251,191,36,.1); }
+  .avatar.seeing { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+  .p-name { font-weight: 600; font-size: 16px; }
+  .p-sub { font-size: 13px; color: var(--muted); }
+  .emo { margin-left: auto; font-size: 28px; line-height: 1; }
+
+  .log { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-height: 260px; overflow-y: auto; }
+  .log li { display: grid; grid-template-columns: 10px 1fr auto; align-items: center; gap: 10px;
+            padding: 8px 4px; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .log li:last-child { border-bottom: 0; }
+  .log li i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .log li.known i { background: var(--good); } .log li.stranger i { background: var(--warn); }
+  .log li.arrive i { background: var(--accent); } .log li.sleep i, .log li.wake i { background: var(--violet); }
+  .log li time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .log li.empty { display: block; color: var(--muted); border: 0; }
+  .log li.new { animation: slidein .4s ease; }
+  @keyframes slidein { from { opacity: 0; transform: translateY(-4px); } }
+
+  .foot { max-width: 1280px; margin: 0 auto; padding: 4px 16px 24px; color: var(--muted); font-size: 12px; }
+
+  .login { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+  .login form { width: 100%; max-width: 360px; background: var(--surface); border: 1px solid var(--line);
+                border-radius: var(--radius); padding: 24px; display: grid; gap: 14px; }
+  .login h1 { margin: 0; font-size: 20px; }
+  .login p { margin: 0; color: var(--muted); }
+  .login input { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); border-radius: 10px;
+                 padding: 12px; font: inherit; }
+  .login input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .login button { background: var(--accent); color: #04110f; border: 0; border-radius: 10px; padding: 12px; font-weight: 700; cursor: pointer; }
+  .err { color: var(--bad); }
 `;
 
+const LOGO = `<svg viewBox="0 0 26 26" fill="#5eead4" aria-hidden="true">
+  <rect x="3" y="7" width="8" height="10" rx="3"/><rect x="15" y="7" width="8" height="10" rx="3"/>
+  <rect x="5" y="9" width="2.5" height="2" rx="1" fill="#07090c"/><rect x="17" y="9" width="2.5" height="2" rx="1" fill="#07090c"/></svg>`;
+
 function keyPage(wrongKey) {
-  return `<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>ARIA Cam</title>
-<style>${STYLE}</style></head><body>
-<form method="get" action="/">
-  <h1>ARIA Cam</h1>
-  <p>Enter the view key to watch the live feed.</p>
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#07090c">
+<title>ARIA Cam</title><style>${STYLE}</style></head><body>
+<div class="login"><form method="get" action="/">
+  <div class="brand"><div class="logo">${LOGO}</div><div><div class="name">ARIA</div><div class="tag">Home camera</div></div></div>
+  <h1>Enter view key</h1>
+  <p>This camera is private. Ask its owner for the key.</p>
   ${wrongKey ? '<p class="err">That key is not valid.</p>' : ''}
-  <input name="key" type="password" placeholder="View key" autocomplete="off" required autofocus>
+  <input name="key" type="password" placeholder="View key" autocomplete="off" required autofocus aria-label="View key">
   <button type="submit">Watch</button>
-</form></body></html>`;
+</form></div></body></html>`;
 }
 
 function viewerPage() {
-  return `<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>ARIA Cam</title>
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#07090c"><title>ARIA Cam</title>
 <style>${STYLE}</style></head><body>
-<header><h1>ARIA Cam</h1><span id="pill" class="pill">Connecting…</span></header>
-<main>
-  <div class="stage"><img id="feed" alt="Live camera feed"><canvas id="overlay"></canvas></div>
-  <div class="info">
-    <div class="card"><div class="label">In view</div><div class="value" id="who">—</div><div class="sub" id="who-sub">face tracker offline</div></div>
-    <div class="card"><div class="label">ARIA's mood</div><div class="value" id="mood">—</div>
-      <div class="sub">energy</div><div class="meter"><span id="energy"></span></div></div>
-  </div>
-</main>
-<footer>
-  <button id="fs" type="button">Fullscreen</button>
-  <a id="snap" class="btn" download="aria-cam.jpg">Save snapshot</a>
-</footer>
-<script>
-  const key = new URLSearchParams(location.search).get('key');
-  const q = '?key=' + encodeURIComponent(key);
-  const img = document.getElementById('feed');
-  const pill = document.getElementById('pill');
-  document.getElementById('snap').href = '/snapshot' + q;
-  const stage = document.querySelector('.stage');   // fullscreen the video + overlay together
-  document.getElementById('fs').onclick = () =>
-    (stage.requestFullscreen || stage.webkitRequestFullscreen || (() => {})).call(stage);
+<header class="top">
+  <div class="brand"><div class="logo">${LOGO}</div><div><div class="name">ARIA</div><div class="tag">Home camera</div></div></div>
+  <div class="top-right"><span class="clock" id="clock"></span><span class="live" id="live"><i></i><span id="live-text">Connecting</span></span></div>
+</header>
 
-  // MJPEG stream; if the browser can't render it, fall back to polling snapshots.
-  let polling = false;
-  img.onerror = () => {
+<main class="grid">
+  <section aria-label="Live video">
+    <div class="stage" id="stage">
+      <img id="feed" alt="Live camera feed">
+      <canvas id="overlay" aria-hidden="true"></canvas>
+      <div class="hud tl"><span class="rec"><i></i>LIVE</span><span class="chip" id="hud-time"></span></div>
+      <div class="hud tr"><span class="chip" id="hud-res">—</span><span class="chip" id="hud-fps">— fps</span></div>
+      <div class="offline" id="offline" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+          <path d="M3 3l18 18M10.6 6H15a2 2 0 0 1 2 2v2l4-3v10M17 17H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2"/></svg>
+        <b>Camera offline</b><span id="offline-text">Waiting for the camera…</span>
+      </div>
+      <div class="controls">
+        <button class="icon" id="btn-overlay" aria-pressed="true" title="Face boxes" aria-label="Toggle face boxes">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/>
+            <circle cx="12" cy="11" r="3"/><path d="M7.5 17.5a5 5 0 0 1 9 0"/></svg></button>
+        <a class="icon" id="btn-snap" title="Save snapshot" aria-label="Save snapshot" download="aria-cam.jpg">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <path d="M4 8a2 2 0 0 1 2-2h2l1.5-2h5L16 6h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><circle cx="12" cy="12.5" r="3.5"/></svg></a>
+        <button class="icon" id="btn-fs" title="Fullscreen" aria-label="Fullscreen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+      </div>
+    </div>
+  </section>
+
+  <aside class="side">
+    <section class="card" aria-label="ARIA">
+      <div class="card-head"><h2>ARIA</h2><span class="mood" id="mood">—</span></div>
+      <div class="robot-wrap"><canvas id="robot" width="128" height="64" aria-label="ARIA's face, live"></canvas>
+        <div class="robot-off" id="robot-off">ARIA's face appears when the tracker is running</div></div>
+      <div class="meters">
+        <div class="meter"><span>Energy</span><div class="bar"><span id="m-energy"></span></div><span class="val" id="v-energy">–</span></div>
+        <div class="meter"><span>Affection</span><div class="bar"><span id="m-affection"></span></div><span class="val" id="v-affection">–</span></div>
+        <div class="meter"><span>Boredom</span><div class="bar"><span id="m-boredom"></span></div><span class="val" id="v-boredom">–</span></div>
+      </div>
+    </section>
+
+    <section class="card" aria-label="In view">
+      <div class="card-head"><h2>In view</h2><span class="badge" id="count">0</span></div>
+      <div class="person"><div class="avatar" id="avatar">–</div>
+        <div><div class="p-name" id="who">—</div><div class="p-sub" id="who-sub">Face tracker offline</div></div>
+        <div class="emo" id="emo" aria-hidden="true"></div></div>
+    </section>
+
+    <section class="card" aria-label="Activity">
+      <div class="card-head"><h2>Activity</h2></div>
+      <ol class="log" id="log"><li class="empty">Nothing yet</li></ol>
+    </section>
+  </aside>
+</main>
+<footer class="foot">ESP32-CAM · streamed via Render · <span id="viewers">0</span> watching</footer>
+
+<script>
+  var key = new URLSearchParams(location.search).get('key');
+  var q = '?key=' + encodeURIComponent(key);
+  var $ = function (id) { return document.getElementById(id); };
+  var img = $('feed'), stage = $('stage');
+
+  // ── Video (MJPEG; falls back to polling snapshots) ──
+  var polling = false;
+  img.onerror = function () {
     if (polling) return;
     polling = true;
-    const tick = () => { img.src = '/snapshot' + q + '&t=' + Date.now(); };
-    img.onload = () => setTimeout(tick, 250);
-    img.onerror = () => setTimeout(tick, 2000);
+    var tick = function () { img.src = '/snapshot' + q + '&t=' + Date.now(); };
+    img.onload = function () { setTimeout(tick, 250); };
+    img.onerror = function () { setTimeout(tick, 2000); };
     tick();
   };
   img.src = '/stream' + q;
+  $('btn-snap').href = '/snapshot' + q;
+  $('btn-fs').onclick = function () {
+    if (document.fullscreenElement) return document.exitFullscreen();
+    (stage.requestFullscreen || stage.webkitRequestFullscreen || function () {}).call(stage);
+  };
+  var showBoxes = true;
+  try { showBoxes = localStorage.getItem('aria-boxes') !== '0'; } catch (e) {}
+  var boxBtn = $('btn-overlay');
+  boxBtn.setAttribute('aria-pressed', String(showBoxes));
+  boxBtn.onclick = function () {
+    showBoxes = !showBoxes;
+    boxBtn.setAttribute('aria-pressed', String(showBoxes));
+    try { localStorage.setItem('aria-boxes', showBoxes ? '1' : '0'); } catch (e) {}
+  };
+
+  // ── Clock + camera status ──
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  setInterval(function () {
+    var d = new Date();
+    $('clock').textContent = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    $('hud-time').textContent = d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' ' +
+      pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }, 1000);
 
   async function refresh() {
+    var live = $('live'), off = $('offline');
     try {
-      const s = await (await fetch('/status' + q, { cache: 'no-store' })).json();
+      var s = await (await fetch('/status' + q, { cache: 'no-store' })).json();
+      $('viewers').textContent = s.viewers;
       if (s.online) {
-        pill.className = 'pill live';
-        pill.textContent = 'Live · ' + s.viewers + ' watching';
+        live.className = 'live on'; $('live-text').textContent = 'Live';
+        off.hidden = true;
+        $('hud-fps').textContent = (s.fps || 0).toFixed(1) + ' fps';
+        if (s.width) $('hud-res').textContent = s.width + '×' + s.height;
       } else {
-        pill.className = 'pill off';
-        pill.textContent = s.lastFrameAgeMs === null ? 'Camera offline'
-          : 'Camera offline · last frame ' + Math.round(s.lastFrameAgeMs / 1000) + 's ago';
+        live.className = 'live off'; $('live-text').textContent = 'Offline';
+        off.hidden = false;
+        $('offline-text').textContent = s.lastFrameAgeMs === null ? 'Waiting for the camera…'
+          : 'Last frame ' + ago(s.lastFrameAgeMs) + ' ago';
       }
-    } catch { pill.className = 'pill off'; pill.textContent = 'Relay unreachable'; }
+    } catch (e) { live.className = 'live off'; $('live-text').textContent = 'Unreachable'; }
   }
-  refresh();
-  setInterval(refresh, 3000);
+  function ago(ms) {
+    var s = Math.round(ms / 1000);
+    return s < 60 ? s + 's' : s < 3600 ? Math.round(s / 60) + ' min' : Math.round(s / 3600) + ' h';
+  }
+  refresh(); setInterval(refresh, 3000);
 
-  // ── Face tracker overlay (from the laptop tracker via /meta → /events) ──
-  const EMOJI = { happy: '😊', surprise: '😮', sad: '😢', angry: '😠', neutral: '🙂' };
-  const EXPR_MOOD = { purr: '😌 purring', heart: '😍 in love', yawn: '🥱 yawning', sideeye: '😒 sulking',
-                      wink: '😉 winking', surprise: '😲 surprised', think: '🤔 thinking',
-                      curious: '🧐 curious', squint: '🤨 suspicious', wake: '😪 waking up' };
-  const canvas = document.getElementById('overlay'), ctx = canvas.getContext('2d');
-  let meta = null, metaAt = 0;
-  const shown = [];                        // smoothed boxes being drawn
+  // ── Tracker data (faces, ARIA's mood + face) over Server-Sent Events ──
+  var EMOJI = { happy: '😊', surprise: '😮', sad: '😢', angry: '😠', neutral: '🙂' };
+  var EXPR_MOOD = { purr: '😌 Purring', heart: '😍 In love', yawn: '🥱 Yawning', sideeye: '😒 Sulking',
+                    wink: '😉 Winking', surprise: '😲 Surprised', think: '🤔 Thinking', curious: '🧐 Curious',
+                    squint: '🤨 Suspicious', wake: '😪 Waking up' };
+  var meta = null, metaAt = 0, shown = [];
+  var es = new EventSource('/events' + q);
+  es.onmessage = function (e) { try { meta = JSON.parse(e.data); metaAt = Date.now(); render(); } catch (x) {} };
+  es.addEventListener('log', function (e) { try { addLog(JSON.parse(e.data)); } catch (x) {} });
 
-  const es = new EventSource('/events' + q);
-  es.onmessage = (e) => { try { meta = JSON.parse(e.data); metaAt = Date.now(); updateCards(); } catch {} };
+  function fresh() { return meta && Date.now() - metaAt < 3000; }
 
-  function updateCards() {
-    const fresh = meta && Date.now() - metaAt < 3000;
-    const faces = fresh ? (meta.faces || []) : [];
-    const who = document.getElementById('who'), sub = document.getElementById('who-sub');
-    if (!fresh) { who.textContent = '—'; sub.textContent = 'face tracker offline'; }
-    else if (!faces.length) { who.textContent = 'Nobody'; sub.textContent = 'watching the room'; }
-    else {
-      const f = faces[0];
-      const name = f.id === 'known' ? f.name : f.id === 'unknown' ? 'Stranger' : 'Someone';
-      who.textContent = name + ' ' + (EMOJI[f.emo] || '');
-      sub.textContent = (faces.length > 1 ? faces.length + ' people · ' : '') + (f.emo || 'neutral')
-        + (f.look ? ' · looking at the camera' : '');
+  function render() {
+    var faces = fresh() ? (meta.faces || []) : [];
+    $('count').textContent = fresh() ? (meta.n || faces.length) : 0;
+    var av = $('avatar'), f = faces[0];
+    if (!fresh()) {
+      $('who').textContent = '—'; $('who-sub').textContent = 'Face tracker offline';
+      av.className = 'avatar'; av.textContent = '–'; $('emo').textContent = '';
+    } else if (!f) {
+      $('who').textContent = 'Nobody'; $('who-sub').textContent = 'Watching the room';
+      av.className = 'avatar'; av.textContent = '·'; $('emo').textContent = '';
+    } else {
+      var known = f.id === 'known', stranger = f.id === 'unknown';
+      $('who').textContent = known ? f.name : stranger ? 'Stranger' : 'Someone';
+      $('who-sub').textContent = (f.emo || 'neutral') + (f.look ? ' · looking at the camera' : '') +
+        (faces.length > 1 ? ' · +' + (faces.length - 1) : '');
+      av.className = 'avatar ' + (known ? 'known' : stranger ? 'stranger' : 'seeing');
+      av.textContent = known ? f.name.charAt(0).toUpperCase() : stranger ? '?' : '…';
+      $('emo').textContent = EMOJI[f.emo] || '';
     }
-    const r = fresh && meta.robot;
-    const mood = document.getElementById('mood');
-    if (!r) { mood.textContent = '—'; }
-    else {
-      mood.textContent = r.sleeping ? '😴 asleep' : EXPR_MOOD[r.expr]
-        || (r.energy < 0.3 ? '😩 tired' : r.boredom > 0.5 ? '😐 bored' : r.affection > 0.7 ? '🥰 affectionate' : '🙂 calm');
-      document.getElementById('energy').style.width = Math.round((r.energy || 0) * 100) + '%';
+    var r = fresh() && meta.robot;
+    if (r) {
+      $('mood').textContent = r.sleeping ? '😴 Asleep' : EXPR_MOOD[r.expr] ||
+        (r.energy < 0.3 ? '😩 Tired' : r.boredom > 0.5 ? '😐 Bored' : r.affection > 0.7 ? '🥰 Affectionate' : '🙂 Calm');
+      [['energy', r.energy], ['affection', r.affection], ['boredom', r.boredom]].forEach(function (m) {
+        var v = Math.round((m[1] || 0) * 100);
+        $('m-' + m[0]).style.width = v + '%'; $('v-' + m[0]).textContent = v + '%';
+      });
+    } else {                                   // tracker offline: don't show stale numbers
+      $('mood').textContent = '—';
+      ['energy', 'affection', 'boredom'].forEach(function (k) {
+        $('m-' + k).style.width = '0'; $('v-' + k).textContent = '–';
+      });
     }
   }
-  setInterval(updateCards, 1000);
+  setInterval(render, 1000);
 
+  // ── Activity timeline ──
+  var LOG_MAX = 20;
+  function addLog(e) {
+    var list = $('log'), empty = list.querySelector('.empty');
+    if (empty) empty.remove();
+    var li = document.createElement('li');
+    li.className = e.kind + ' new';
+    var dot = document.createElement('i');
+    var text = document.createElement('span'); text.textContent = e.text;
+    var t = document.createElement('time');
+    t.textContent = new Date(e.t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    li.append(dot, text, t);
+    list.prepend(li);
+    while (list.children.length > LOG_MAX) list.lastChild.remove();
+  }
+
+  // ── ARIA's live face (the OLED's 128×64 frame, 1 bit per pixel) ──
+  var rc = $('robot'), rctx = rc.getContext('2d'), rimg = rctx.createImageData(128, 64), lastFrame = null;
+  function drawRobot() {
+    var b64 = fresh() && meta.face_frame;
+    $('robot-off').hidden = !!b64;
+    if (!b64) { rctx.clearRect(0, 0, 128, 64); lastFrame = null; return; }
+    if (b64 === lastFrame) return;
+    lastFrame = b64;
+    var bin = atob(b64), px = rimg.data;
+    for (var y = 0; y < 64; y++) for (var xb = 0; xb < 16; xb++) {
+      var byte = bin.charCodeAt(y * 16 + xb);
+      for (var bit = 0; bit < 8; bit++) {
+        var i = (y * 128 + xb * 8 + bit) * 4, lit = byte & (0x80 >> bit);
+        px[i] = lit ? 94 : 0; px[i + 1] = lit ? 234 : 0; px[i + 2] = lit ? 212 : 0; px[i + 3] = 255;
+      }
+    }
+    rctx.putImageData(rimg, 0, 0);
+  }
+
+  // ── Face boxes over the video ──
+  var canvas = $('overlay'), ctx = canvas.getContext('2d');
   function draw() {
-    const W = img.clientWidth, H = img.clientHeight, dpr = window.devicePixelRatio || 1;
-    if (canvas.width !== Math.round(W * dpr)) { canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr); }
+    drawRobot();
+    var W = canvas.clientWidth, H = canvas.clientHeight, dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+      canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
-    // where the picture actually sits inside the letterboxed <img>
-    const nw = img.naturalWidth || 4, nh = img.naturalHeight || 3, s = Math.min(W / nw, H / nh);
-    const dw = nw * s, dh = nh * s, ox = (W - dw) / 2, oy = (H - dh) / 2;
-    const faces = meta && Date.now() - metaAt < 2500 ? (meta.faces || []) : [];
-    faces.forEach((f, i) => {                // ease each box toward its latest position
-      const t = shown[i] || (shown[i] = { ...f });
-      for (const k of ['x', 'y', 'w', 'h']) t[k] += (f[k] - t[k]) * 0.35;
+    var nw = img.naturalWidth || 4, nh = img.naturalHeight || 3, s = Math.min(W / nw, H / nh);
+    var dw = nw * s, dh = nh * s, ox = (W - dw) / 2, oy = (H - dh) / 2;
+    var faces = showBoxes && meta && Date.now() - metaAt < 2500 ? (meta.faces || []) : [];
+    faces.forEach(function (f, i) {
+      var t = shown[i] || (shown[i] = { x: f.x, y: f.y, w: f.w, h: f.h });
+      ['x', 'y', 'w', 'h'].forEach(function (k) { t[k] += (f[k] - t[k]) * 0.35; });
     });
     shown.length = faces.length;
-    faces.forEach((f, i) => {
-      const b = shown[i], x = ox + b.x * dw, y = oy + b.y * dh, w = b.w * dw, h = b.h * dh;
-      const color = f.id === 'known' ? '#6ee7a0' : f.id === 'unknown' ? '#fbbf24' : '#e8eaed';
-      ctx.strokeStyle = color; ctx.lineWidth = 2;
-      const c = Math.min(w, h) * 0.22;         // corner brackets
+    faces.forEach(function (f, i) {
+      var b = shown[i], x = ox + b.x * dw, y = oy + b.y * dh, w = b.w * dw, h = b.h * dh;
+      var color = f.id === 'known' ? '#4ade80' : f.id === 'unknown' ? '#fbbf24' : '#5eead4';
+      ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+      ctx.shadowColor = color; ctx.shadowBlur = 8;
+      var c = Math.min(w, h) * 0.24;
       ctx.beginPath();
-      [[x, y, 1, 1], [x + w, y, -1, 1], [x, y + h, 1, -1], [x + w, y + h, -1, -1]].forEach(([px, py, sx, sy]) => {
-        ctx.moveTo(px + sx * c, py); ctx.lineTo(px, py); ctx.lineTo(px, py + sy * c);
+      [[x, y, 1, 1], [x + w, y, -1, 1], [x, y + h, 1, -1], [x + w, y + h, -1, -1]].forEach(function (p) {
+        ctx.moveTo(p[0] + p[2] * c, p[1]); ctx.lineTo(p[0], p[1]); ctx.lineTo(p[0], p[1] + p[3] * c);
       });
       ctx.stroke();
-      const label = (f.id === 'known' ? f.name : f.id === 'unknown' ? 'Stranger' : '…') + ' ' + (EMOJI[f.emo] || '');
-      ctx.font = '600 13px system-ui, sans-serif';
-      const tw = ctx.measureText(label).width + 12, ly = Math.max(0, y - 22);
-      ctx.fillStyle = 'rgba(11,13,16,0.75)'; ctx.fillRect(x, ly, tw, 20);
-      ctx.fillStyle = color; ctx.fillText(label, x + 6, ly + 14);
+      ctx.shadowBlur = 0;
+      var label = (f.id === 'known' ? f.name : f.id === 'unknown' ? 'Stranger' : 'Identifying…') + '  ' + (EMOJI[f.emo] || '');
+      ctx.font = '600 13px ui-sans-serif, system-ui, sans-serif';
+      var tw = ctx.measureText(label).width + 16, ly = Math.max(4, y - 28);
+      ctx.fillStyle = 'rgba(7,9,12,.72)';
+      ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, ly, tw, 22, 11) : ctx.rect(x, ly, tw, 22); ctx.fill();
+      ctx.fillStyle = color; ctx.fillText(label, x + 8, ly + 15);
     });
     requestAnimationFrame(draw);
   }
