@@ -29,7 +29,6 @@ Camera controls on the page (privacy, night mode, light, resolution, restart) ne
 | `POST /push` | `X-Cam-Key` | Older uplink: one JPEG per request. Responds with the viewer count. It's slower because every frame waits a full round trip. |
 | `POST /meta` | `X-Cam-Key` | JSON from the face tracker: face boxes, names, emotions and the robot's mood, drawn over the video. |
 | `POST /cmd` | `X-Admin-Key` (`ADMIN_KEY`, else `CAM_KEY`) | Camera command `{cmd, args}`: `led`, `ledauto`, `night`, `privacy`, `privhours`, `profile`, `restart` |
-| `GET /gallery?key=` | view key | Event snapshots (motion, arrivals); images at `/gallery/<id>.jpg` |
 | `GET /events?key=` | view key | Server-Sent Events stream of `/meta` updates |
 | `GET /?key=` | view key | Mobile-friendly viewer page with the face overlay |
 | `GET /stream?key=` | view key | MJPEG stream |

@@ -17,7 +17,6 @@
 //   POST /cmd        page → camera command (header X-Admin-Key: $ADMIN_KEY,
 //                    else $CAM_KEY; JSON {cmd, args}) — LED, night mode,
 //                    privacy, resolution, restart
-//   GET  /gallery    JSON list of event snapshots (?key=); /gallery/<id>.jpg
 //   GET  /stream     MJPEG stream     (?key=)
 //   GET  /snapshot   latest JPEG      (?key=)
 //   GET  /status     JSON             (?key=)
@@ -62,24 +61,9 @@ const presence = { here: false, lastFace: 0, who: null, sleeping: null };
 // Camera state reported over its WebSocket every ~2 s (settings + health).
 let camState = null;
 
-// Event snapshots, newest first. Motion snapshots use the first frame that
-// arrives after the camera reports motion (it pushes one immediately).
-const GALLERY_MAX = 20;
-const gallery = [];               // {id, t, kind, text, jpeg}
-let galleryId = 0;
-let pendingSnapshot = null;       // {kind, text} waiting for the next frame
-
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
   for (const s of metaSubscribers) s.write(line);
-}
-
-function addSnapshot(kind, text, jpeg) {
-  if (!jpeg) return;
-  const item = { id: ++galleryId, t: Date.now(), kind, text, jpeg };
-  gallery.unshift(item);
-  if (gallery.length > GALLERY_MAX) gallery.pop();
-  broadcast('gallery', { id: item.id, t: item.t, kind, text });
 }
 
 function handleCamText(text) {
@@ -94,7 +78,6 @@ function handleCamText(text) {
     if (!camState.privacy && wasPrivate) logEvent('privacy', 'Privacy mode off');
   } else if (m.t === 'motion') {
     logEvent('motion', 'Motion detected');
-    pendingSnapshot = { kind: 'motion', text: 'Motion detected' };
   }
 }
 
@@ -165,7 +148,6 @@ function fps() {
 }
 
 function logEvent(kind, text) {
-  if (kind === 'arrive' || kind === 'known' || kind === 'stranger') addSnapshot(kind, text, latestFrame);
   const e = { t: Date.now(), kind, text };
   activity.unshift(e);
   if (activity.length > LOG_MAX) activity.pop();
@@ -248,7 +230,6 @@ function handleEvents(req, res) {
   if (latestMeta) res.write(`data: ${latestMeta}\n\n`);
   for (const e of [...activity].reverse()) res.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
   if (camState) res.write(`event: cam\ndata: ${JSON.stringify(camState)}\n\n`);
-  for (const g of [...gallery].reverse()) res.write(`event: gallery\ndata: ${JSON.stringify({ id: g.id, t: g.t, kind: g.kind, text: g.text })}\n\n`);
   metaSubscribers.add(res);
   const ping = setInterval(() => res.write(': ping\n\n'), 15000);   // keep proxies from idling it out
   res.on('close', () => { clearInterval(ping); metaSubscribers.delete(res); });
@@ -260,7 +241,6 @@ function acceptFrame(frame) {
   latestAt = Date.now();
   frameTimes.push(latestAt);
   frameSize = jpegSize(frame) || frameSize;
-  if (pendingSnapshot) { addSnapshot(pendingSnapshot.kind, pendingSnapshot.text, frame); pendingSnapshot = null; }
   for (const v of streamViewers) {
     if (v.writableLength > 2 * frame.length) continue;   // slow viewer: drop this frame for them
     writeFrame(v, frame);
@@ -314,25 +294,14 @@ const server = http.createServer((req, res) => {
       lastPollAt = Date.now();
       if (!latestFrame) return send(res, 503, 'text/plain', 'no frame yet');
       return send(res, 200, 'image/jpeg', latestFrame);
-    case '/gallery':
-      if (!authed) return send(res, 401, 'text/plain', 'bad key');
-      return send(res, 200, 'application/json',
-        JSON.stringify(gallery.map((g) => ({ id: g.id, t: g.t, kind: g.kind, text: g.text }))));
     case '/events':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return handleEvents(req, res);
     case '/status':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(status()));
-    default: {
-      const g = /^\/gallery\/(\d+)\.jpg$/.exec(url.pathname);
-      if (g) {
-        if (!authed) return send(res, 401, 'text/plain', 'bad key');
-        const item = gallery.find((it) => it.id === +g[1]);
-        return item ? send(res, 200, 'image/jpeg', item.jpeg) : send(res, 404, 'text/plain', 'gone');
-      }
+    default:
       return send(res, 404, 'text/plain', 'not found');
-    }
   }
 });
 
@@ -544,13 +513,6 @@ const STYLE = `
   .health { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 12px; margin-top: 12px; font-size: 12px; color: var(--muted); }
   .health b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
   .locked { color: var(--muted); font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-  .gallery { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-  .gallery a { position: relative; display: block; aspect-ratio: 4 / 3; border-radius: 10px; overflow: hidden;
-               background: #000; border: 1px solid var(--line); }
-  .gallery img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .gallery span { position: absolute; left: 4px; bottom: 4px; right: 4px; font-size: 10px; padding: 2px 5px; border-radius: 6px;
-                  background: rgba(7,9,12,.7); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .gallery .empty { grid-column: 1 / -1; color: var(--muted); font-size: 13px; }
   .log li.motion i { background: #fb923c; } .log li.privacy i { background: var(--violet); }
   .privacy-screen { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px;
                     background: repeating-linear-gradient(135deg, #0b0e13 0 14px, #0e1218 14px 28px); color: var(--muted); text-align: center; }
@@ -654,11 +616,6 @@ function viewerPage() {
     <section class="card" aria-label="Activity">
       <div class="card-head"><h2>Activity</h2></div>
       <ol class="log" id="log"><li class="empty">Nothing yet</li></ol>
-    </section>
-
-    <section class="card" aria-label="Snapshots">
-      <div class="card-head"><h2>Snapshots</h2><span class="badge" id="gal-count">0</span></div>
-      <div class="gallery" id="gallery"><div class="empty">Motion and arrivals are saved here.</div></div>
     </section>
 
     <section class="card" aria-label="Camera controls">
@@ -893,25 +850,6 @@ function viewerPage() {
   });
   $('restart').onclick = function () { if (confirm('Restart the camera? The stream drops for ~15 seconds.')) send('restart'); };
   renderCam();
-
-  // ── Snapshot gallery ──
-  var GAL_MAX = 12, KIND = { motion: 'Motion', arrive: 'Arrived', known: 'Known', stranger: 'Stranger' };
-  es.addEventListener('gallery', function (e) {
-    try {
-      var g = JSON.parse(e.data), box = $('gallery'), empty = box.querySelector('.empty');
-      if (empty) empty.remove();
-      var a = document.createElement('a');
-      a.href = '/gallery/' + g.id + '.jpg' + q; a.target = '_blank'; a.rel = 'noopener';
-      a.title = g.text + ' — ' + new Date(g.t).toLocaleString();
-      var im = document.createElement('img'); im.loading = 'lazy'; im.alt = g.text; im.src = a.href;
-      var cap = document.createElement('span');
-      cap.textContent = (KIND[g.kind] || g.kind) + ' · ' + new Date(g.t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-      a.append(im, cap);
-      box.prepend(a);
-      while (box.children.length > GAL_MAX) box.lastChild.remove();
-      $('gal-count').textContent = box.querySelectorAll('a').length;
-    } catch (x) {}
-  });
 
   // ── ARIA's live face (the OLED's 128×64 frame, 1 bit per pixel) ──
   var rc = $('robot'), rctx = rc.getContext('2d'), rimg = rctx.createImageData(128, 64), lastFrame = null;
