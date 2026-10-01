@@ -27,10 +27,6 @@
 //   GET  /health     camera health history (?key=): fps / WiFi / memory samples
 //                    every 30 s for 24 h, and restarts with their reasons. Kept
 //                    in memory, so it starts over when Render restarts the relay
-//   WS   /talk       page → relay: a call. First message = admin key, then
-//                    8-bit 16 kHz mono audio (binary) for ARIA's speaker
-//   WS   /speaker    display → relay (?key=view key): receives that audio
-//                    while /display says call: 1
 //   GET  /healthz    Render health check
 //
 // Zero dependencies — Node's http module only.
@@ -104,7 +100,7 @@ setInterval(() => {
 const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'shy', 'dizzy',
                   'roll', 'nod', 'yawn', 'purr', 'squint', 'sleep', 'wake'];
 const MSG_MAX = 120;
-const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, call: 0 };
+const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0 };
 
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
@@ -142,7 +138,7 @@ const COMMANDS = {                // name → argument validator
 function publicDisplay() {
   const m = displayState.msg;
   return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
-           emotion: displayState.emotion, restart: displayState.restart, call: displayState.call ? 1 : 0 };
+           emotion: displayState.emotion, restart: displayState.restart };
 }
 
 function handleCmd(req, res) {
@@ -417,13 +413,25 @@ function notifyCamera() {
 }
 setInterval(notifyCamera, 1000);
 
-// Reads WebSocket messages off a socket: onMessage(opcode, payload) per
-// complete message (masked or not); handles ping/close itself.
-function wsReader(socket, onMessage) {
+server.on('upgrade', (req, socket) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname !== '/ws' || String(req.headers.upgrade).toLowerCase() !== 'websocket' ||
+      !req.headers['sec-websocket-key'] || !keyMatches(req.headers['x-cam-key'], CAM_KEY)) {
+    socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    return;
+  }
+  const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + WS_GUID).digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+               `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
+  socket.setNoDelay(true);
+  if (camSocket) camSocket.destroy();   // newest camera connection wins
+  camSocket = socket;
+  console.log('camera connected');
+  notifyCamera();
+
   let buf = Buffer.alloc(0);
   let parts = [];
   let partsLen = 0;
-  let partsOp = 0;
   socket.on('data', (chunk) => {
     buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
     for (;;) {
@@ -442,126 +450,15 @@ function wsReader(socket, onMessage) {
 
       if (opcode === 0x8) { socket.end(wsFrame(0x8, Buffer.alloc(0))); return; }   // close
       if (opcode === 0x9) { socket.write(wsFrame(0xA, payload)); continue; }        // ping → pong
-      if (opcode === 0xA) continue;                                                 // pong
-      if (opcode !== 0x0) partsOp = opcode;                                         // start of a message
-      parts.push(payload);
-      partsLen += len;
-      if (fin) { const msg = parts.length === 1 ? parts[0] : Buffer.concat(parts); parts = []; partsLen = 0; onMessage(partsOp, msg); }
+      if (opcode === 0x1 && fin) { handleCamText(payload.toString('utf8')); continue; }   // state / motion
+      if (opcode === 0x2 || opcode === 0x0) {                                        // binary / continuation
+        parts.push(payload);
+        partsLen += len;
+        if (fin) { acceptFrame(Buffer.concat(parts)); parts = []; partsLen = 0; }
+      }
     }
   });
   socket.on('error', () => socket.destroy());
-}
-
-function wsAccept(req, socket) {
-  const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + WS_GUID).digest('base64');
-  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
-               `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
-  socket.setNoDelay(true);
-}
-
-function wsText(socket, obj) {
-  if (socket && !socket.destroyed) socket.write(wsFrame(0x1, Buffer.from(JSON.stringify(obj))));
-}
-
-// ── Calls: the admin's voice from the page to ARIA's speaker ─────────────
-// The page opens /talk and sends the admin key as its first message, then
-// 8-bit 16 kHz mono audio as binary messages. While a call is up, /display
-// says call: 1; the display then connects to /speaker (view key) and the
-// relay forwards the audio to it. The page is told when the speaker is
-// connected, so it only says "live" once ARIA can actually be heard.
-let talkSocket = null, speakerSocket = null;
-let talkAudioAt = 0, callStartAt = 0, callBytes = 0;
-
-// A caller whose connection died without a close frame can leave the call
-// "on" forever (the display would sit in it). So: no audio for 10 s while
-// ARIA is connected, or no pick-up within 30 s, ends it.
-setInterval(() => {
-  if (!displayState.call || !talkSocket) return;
-  const now = Date.now();
-  if (speakerSocket && now - talkAudioAt > 10000) { talkSocket.destroy(); return; }
-  if (!speakerSocket && now - callStartAt > 30000) {
-    wsText(talkSocket, { error: "ARIA didn't pick up. Is the display online?" });
-    talkSocket.destroy();
-  }
-}, 2000);
-
-function callState() {
-  wsText(talkSocket, { state: speakerSocket ? 'connected' : 'ringing' });
-}
-
-function endCall(reason) {
-  if (!displayState.call) return;
-  displayState.call = 0;
-  if (speakerSocket && !speakerSocket.destroyed) speakerSocket.end(wsFrame(0x8, Buffer.alloc(0)));
-  logEvent('call', reason || 'Call ended');
-  broadcast('display', publicDisplay());
-}
-
-function handleTalk(req, socket) {
-  wsAccept(req, socket);
-  let authed = false;
-  const authTimer = setTimeout(() => { if (!authed) socket.destroy(); }, 5000);
-  wsReader(socket, (op, msg) => {
-    if (!authed) {
-      if (op !== 0x1 || !keyMatches(msg.toString('utf8').trim(), ADMIN_KEY)) {
-        wsText(socket, { error: 'That admin key was not accepted.' });
-        socket.end(wsFrame(0x8, Buffer.alloc(0)));
-        return;
-      }
-      authed = true;
-      clearTimeout(authTimer);
-      if (talkSocket && talkSocket !== socket) talkSocket.destroy();   // one caller at a time
-      talkSocket = socket;
-      if (!displayState.call) logEvent('call', 'Admin started a call');
-      displayState.call = callStartAt = talkAudioAt = Date.now();
-      callBytes = 0;
-      broadcast('display', publicDisplay());
-      callState();
-      return;
-    }
-    if (op === 0x2) { talkAudioAt = Date.now(); callBytes += msg.length; }
-    if (op === 0x2 && speakerSocket && !speakerSocket.destroyed &&
-        speakerSocket.writableLength < 32 * 1024) {                     // the display is behind: drop, don't lag
-      speakerSocket.write(wsFrame(0x2, msg));
-    }
-  });
-  socket.on('close', () => {
-    clearTimeout(authTimer);
-    if (talkSocket === socket) {
-      talkSocket = null;
-      endCall(`Call ended (${Math.round(callBytes / 16000)} s of voice reached ARIA)`);   // 16 kHz, 1 byte/sample
-    }
-  });
-}
-
-function handleSpeaker(req, socket) {
-  wsAccept(req, socket);
-  if (speakerSocket) speakerSocket.destroy();
-  speakerSocket = socket;
-  wsReader(socket, () => {});
-  talkAudioAt = Date.now();                                            // the caller starts talking now
-  callState();
-  if (!displayState.call) socket.end(wsFrame(0x8, Buffer.alloc(0)));   // no call (any more)
-  socket.on('close', () => { if (speakerSocket === socket) { speakerSocket = null; callState(); } });
-}
-
-server.on('upgrade', (req, socket) => {
-  const url = new URL(req.url, 'http://x');
-  const ws = String(req.headers.upgrade).toLowerCase() === 'websocket' && req.headers['sec-websocket-key'];
-  const deny = () => socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-  if (!ws) return deny();
-  if (url.pathname === '/talk') return handleTalk(req, socket);
-  if (url.pathname === '/speaker') return keyMatches(url.searchParams.get('key'), VIEW_KEY) ? handleSpeaker(req, socket) : deny();
-  if (url.pathname !== '/ws' || !keyMatches(req.headers['x-cam-key'], CAM_KEY)) return deny();
-  wsAccept(req, socket);
-  if (camSocket) camSocket.destroy();   // newest camera connection wins
-  camSocket = socket;
-  console.log('camera connected');
-  notifyCamera();
-  wsReader(socket, (op, msg) => {
-    if (op === 0x1) handleCamText(msg.toString('utf8'));   // state / motion
-    else if (op === 0x2) acceptFrame(msg);                   // a JPEG frame
-  });
   socket.on('close', () => {
     if (camSocket === socket) { camSocket = null; camState = null; broadcast('cam', null); }
     console.log('camera disconnected');
@@ -731,16 +628,6 @@ const STYLE = `
   .showing { font-size: 12px; color: var(--accent); min-height: 16px; }
   .log li.message i { background: var(--accent); }
   .sub-h { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin: 14px 0 4px; }
-  .log li.call i { background: var(--good); }
-  .call { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: center; margin-top: 6px; }
-  .call-btn { display: inline-flex; align-items: center; gap: 8px; border: 0; border-radius: 999px; padding: 10px 16px;
-              font-weight: 700; cursor: pointer; background: var(--good); color: #04110f; }
-  .call-btn.on { background: var(--bad); color: #fff; }
-  .call-btn svg { width: 18px; height: 18px; }
-  .call-info { min-width: 0; font-size: 13px; color: var(--muted); }
-  .call-info b { color: var(--text); font-weight: 600; }
-  .vu { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-top: 6px; }
-  .vu span { display: block; height: 100%; width: 0; background: var(--good); transition: width .08s linear; }
   .log li.restart i { background: var(--bad); } .log li.gesture i { background: #f472b6; }
 
   /* A hand sign seen by the tracker: big emoji pops over the video */
@@ -937,14 +824,6 @@ function viewerPage() {
           <button data-e="squint"><b>🤨</b>Suspicious</button><button data-e="purr"><b>😌</b>Purr</button>
           <button data-e="yawn"><b>🥱</b>Yawn</button><button data-e="sleep"><b>😴</b>Sleep</button>
           <button data-e="wake"><b>☀️</b>Wake up</button>
-        </div>
-        <div class="sub-h">Speak through ARIA</div>
-        <div class="call">
-          <button class="call-btn" id="call-btn" aria-pressed="false">
-            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25 11.4 11.4 0 0 0 3.6.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.6a1 1 0 0 1-.25 1z"/></svg>
-            <span id="call-label">Call</span></button>
-          <div class="call-info"><span id="call-state">Your voice plays from ARIA's speaker</span>
-            <div class="vu" aria-hidden="true"><span id="call-vu"></span></div></div>
         </div>
       </div>
     </section>
@@ -1271,78 +1150,6 @@ function viewerPage() {
     b.classList.add('sent'); setTimeout(function () { b.classList.remove('sent'); }, 900);
   });
   renderCam();
-
-  // ── Call: microphone → 16 kHz 8-bit → /talk → ARIA's speaker ──
-  // The browser's echo cancellation, noise suppression and auto-gain clean
-  // the voice up first. Audio only goes out once the relay says the
-  // display's speaker is connected, so the first words aren't lost.
-  var call = null;
-  function setCall(text, on) {
-    $('call-state').innerHTML = text;
-    $('call-btn').classList.toggle('on', !!on);
-    $('call-btn').setAttribute('aria-pressed', String(!!on));
-    $('call-label').textContent = on ? 'Hang up' : 'Call';
-  }
-  function endCallUI(msg) {
-    if (!call) return;
-    var c = call; call = null;
-    try { c.proc.disconnect(); c.src.disconnect(); } catch (e) {}
-    c.stream.getTracks().forEach(function (t) { t.stop(); });
-    try { c.ctx.close(); } catch (e) {}
-    try { c.ws.close(); } catch (e) {}
-    $('call-vu').style.width = '0';
-    setCall(msg || 'Call ended', false);
-  }
-  async function startCall() {
-    if (!adminKey) { $('unlock').onclick(); if (!adminKey) return; }
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { alert('This browser cannot use the microphone here.'); return; }
-    // The audio engine must be created right in the tap, before any await:
-    // browsers (phones especially) otherwise start it suspended, it never
-    // processes the microphone, and the speaker only plays silence (static).
-    var ctx = new (window.AudioContext || window.webkitAudioContext)();
-    var stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true,
-                                                                    autoGainControl: true, channelCount: 1 } });
-    } catch (e) { ctx.close(); alert('Microphone access was blocked. Allow it for this page and try again.'); return; }
-    try { await ctx.resume(); } catch (e) {}
-    var src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(2048, 1, 1);
-    var ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/talk');
-    ws.binaryType = 'arraybuffer';
-    call = { ws: ws, ctx: ctx, src: src, proc: proc, stream: stream, live: false };
-    setCall('Connecting to ARIA&hellip;', true);
-    var step = ctx.sampleRate / 16000, pos = 0, acc = 0, accN = 0, level = 0;
-    proc.onaudioprocess = function (e) {
-      if (!call) return;
-      var x = e.inputBuffer.getChannelData(0), out = new Uint8Array(Math.ceil(x.length / step) + 2), n = 0, peak = 0;
-      for (var i = 0; i < x.length; i++) {
-        acc += x[i]; accN++;
-        if (++pos >= step) {                       // average over each output sample = a simple low-pass
-          pos -= step;
-          var v = Math.tanh((acc / accN) * 2.2);   // gentle gain + soft clip
-          acc = 0; accN = 0;
-          if (Math.abs(v) > peak) peak = Math.abs(v);
-          var q = Math.round(128 + v * 70 + (Math.random() - Math.random()));   // ±70 of 127: not too loud
-          out[n++] = q < 0 ? 0 : q > 255 ? 255 : q;
-        }
-      }
-      level = Math.max(peak, level * 0.85);
-      $('call-vu').style.width = Math.min(100, level * 140) + '%';
-      if (call.live && ws.readyState === 1 && ws.bufferedAmount < 16000) ws.send(out.subarray(0, n));
-    };
-    src.connect(proc); proc.connect(ctx.destination);    // (outputs silence; it only has to run)
-    ws.onopen = function () { ws.send(adminKey); };
-    ws.onmessage = function (e) {
-      var m; try { m = JSON.parse(e.data); } catch (x) { return; }
-      if (!call) return;
-      if (m.error) { endCallUI(m.error); lock(); return; }
-      call.live = m.state === 'connected';
-      setCall(call.live ? '<b>Live</b> &middot; speak now, ARIA is playing your voice'
-                        : 'Calling ARIA&hellip; (the display picks up within a few seconds)', true);
-    };
-    ws.onclose = function () { endCallUI(call && call.live ? 'Call ended' : 'Could not reach ARIA'); };
-  }
-  $('call-btn').onclick = function () { if (call) endCallUI('Call ended'); else startCall(); };
 
   // ── Detection zones: 8x6 grid, bit = row*8 + col, 1 = watched ──
   var ZC = 8, ZR = 6, zoneEdit = null, zonePaint = null;
