@@ -470,6 +470,20 @@ function wsText(socket, obj) {
 // relay forwards the audio to it. The page is told when the speaker is
 // connected, so it only says "live" once ARIA can actually be heard.
 let talkSocket = null, speakerSocket = null;
+let talkAudioAt = 0, callStartAt = 0, callBytes = 0;
+
+// A caller whose connection died without a close frame can leave the call
+// "on" forever (the display would sit in it). So: no audio for 10 s while
+// ARIA is connected, or no pick-up within 30 s, ends it.
+setInterval(() => {
+  if (!displayState.call || !talkSocket) return;
+  const now = Date.now();
+  if (speakerSocket && now - talkAudioAt > 10000) { talkSocket.destroy(); return; }
+  if (!speakerSocket && now - callStartAt > 30000) {
+    wsText(talkSocket, { error: "ARIA didn't pick up. Is the display online?" });
+    talkSocket.destroy();
+  }
+}, 2000);
 
 function callState() {
   wsText(talkSocket, { state: speakerSocket ? 'connected' : 'ringing' });
@@ -499,11 +513,13 @@ function handleTalk(req, socket) {
       if (talkSocket && talkSocket !== socket) talkSocket.destroy();   // one caller at a time
       talkSocket = socket;
       if (!displayState.call) logEvent('call', 'Admin started a call');
-      displayState.call = Date.now();
+      displayState.call = callStartAt = talkAudioAt = Date.now();
+      callBytes = 0;
       broadcast('display', publicDisplay());
       callState();
       return;
     }
+    if (op === 0x2) { talkAudioAt = Date.now(); callBytes += msg.length; }
     if (op === 0x2 && speakerSocket && !speakerSocket.destroyed &&
         speakerSocket.writableLength < 32 * 1024) {                     // the display is behind: drop, don't lag
       speakerSocket.write(wsFrame(0x2, msg));
@@ -511,7 +527,10 @@ function handleTalk(req, socket) {
   });
   socket.on('close', () => {
     clearTimeout(authTimer);
-    if (talkSocket === socket) { talkSocket = null; endCall(); }
+    if (talkSocket === socket) {
+      talkSocket = null;
+      endCall(`Call ended (${Math.round(callBytes / 16000)} s of voice reached ARIA)`);   // 16 kHz, 1 byte/sample
+    }
   });
 }
 
@@ -520,6 +539,7 @@ function handleSpeaker(req, socket) {
   if (speakerSocket) speakerSocket.destroy();
   speakerSocket = socket;
   wsReader(socket, () => {});
+  talkAudioAt = Date.now();                                            // the caller starts talking now
   callState();
   if (!displayState.call) socket.end(wsFrame(0x8, Buffer.alloc(0)));   // no call (any more)
   socket.on('close', () => { if (speakerSocket === socket) { speakerSocket = null; callState(); } });
@@ -1276,12 +1296,16 @@ function viewerPage() {
   async function startCall() {
     if (!adminKey) { $('unlock').onclick(); if (!adminKey) return; }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { alert('This browser cannot use the microphone here.'); return; }
+    // The audio engine must be created right in the tap, before any await:
+    // browsers (phones especially) otherwise start it suspended, it never
+    // processes the microphone, and the speaker only plays silence (static).
+    var ctx = new (window.AudioContext || window.webkitAudioContext)();
     var stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true,
                                                                     autoGainControl: true, channelCount: 1 } });
-    } catch (e) { alert('Microphone access was blocked. Allow it for this page and try again.'); return; }
-    var ctx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) { ctx.close(); alert('Microphone access was blocked. Allow it for this page and try again.'); return; }
+    try { await ctx.resume(); } catch (e) {}
     var src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(2048, 1, 1);
     var ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/talk');
     ws.binaryType = 'arraybuffer';
