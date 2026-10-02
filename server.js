@@ -945,6 +945,7 @@ function viewerPage() {
       pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   }, 1000);
 
+  var backupLive = false;                      // the display's OV7670 is standing in for the main camera
   async function refresh() {
     var live = $('live'), off = $('offline');
     try {
@@ -956,6 +957,7 @@ function viewerPage() {
         $('hud-fps').textContent = (s.fps || 0).toFixed(1) + ' fps';
         if (s.width) $('hud-res').textContent = s.width + '×' + s.height;
         $('hud-src').hidden = s.source !== 'eye2';
+        if (backupLive !== (s.source === 'eye2')) { backupLive = s.source === 'eye2'; renderCam(); }
       } else {
         live.className = 'live off'; $('live-text').textContent = 'Offline';
         off.hidden = false;
@@ -1071,7 +1073,7 @@ function viewerPage() {
   try { adminKey = localStorage.getItem('aria-admin'); } catch (e) {}
   function fmtUp(s) { var h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60; return h ? h + 'h ' + m + 'm' : m + 'm'; }
   function renderCam() {
-    $('cam-conn').textContent = cam ? 'Connected' : 'Not connected';
+    $('cam-conn').textContent = cam ? 'Connected' : backupLive ? 'Main offline · backup eye 2 live' : 'Not connected';
     $('locked').hidden = !!adminKey; $('controls').hidden = !adminKey;
     $('aria-locked').hidden = !!adminKey; $('aria-controls').hidden = !adminKey;
     var ps = $('privacy-screen');
