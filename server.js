@@ -8,7 +8,9 @@
 //                    camera can slow down when nobody is watching
 //   POST /push       older one-request-per-frame uplink (same key, body: JPEG,
 //                    replies with the viewer count). Much slower over long
-//                    distances: every frame waits a full round trip
+//                    distances: every frame waits a full round trip.
+//                    ?src=eye2 = the display's backup camera (OV7670) while
+//                    the main one is down; ignored while the main one sends
 //   POST /meta       tracker → relay  (header X-Cam-Key, JSON body): face boxes,
 //                    names, emotions and the robot's mood, drawn over the video
 //   GET  /events     Server-Sent Events: /meta updates as messages, plus named
@@ -58,6 +60,11 @@ let latestMeta = null;            // JSON string of the last /meta
 const metaSubscribers = new Set();
 const frameTimes = [];            // arrival times of recent frames, for the fps readout
 let frameSize = null;             // {w, h} from the latest JPEG's header
+// Which camera the frames come from: 'main' (the ESP32-CAM over /ws) or
+// 'eye2' (the display's OV7670, POSTed to /push?src=eye2 while the main
+// camera is down). The main camera wins whenever it's sending.
+let frameSource = 'main';
+let mainFrameAt = 0;
 
 // Activity timeline, derived from /meta. Presence is debounced — a face that
 // drops out for a frame or two doesn't log "left" and "arrived" again.
@@ -276,7 +283,9 @@ function handlePush(req, res) {
   });
   req.on('end', () => {
     if (res.writableEnded) return;
-    if (!acceptFrame(Buffer.concat(chunks))) return send(res, 400, 'text/plain', 'not a JPEG');
+    const src = new URL(req.url, 'http://x').searchParams.get('src') === 'eye2' ? 'eye2' : 'main';
+    if (src === 'eye2' && Date.now() - mainFrameAt < 5000) return send(res, 200, 'text/plain', String(viewerCount()));
+    if (!acceptFrame(Buffer.concat(chunks), src)) return send(res, 400, 'text/plain', 'not a JPEG');
     send(res, 200, 'text/plain', String(viewerCount()));
   });
 }
@@ -318,8 +327,13 @@ function handleEvents(req, res) {
   res.on('close', () => { clearInterval(ping); metaSubscribers.delete(res); });
 }
 
-function acceptFrame(frame) {
+function acceptFrame(frame, src = 'main') {
   if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) return false;
+  if (src === 'main') mainFrameAt = Date.now();
+  if (src !== frameSource) {
+    frameSource = src;
+    logEvent('backup', src === 'eye2' ? 'Main camera down — showing the backup eye' : 'Main camera back');
+  }
   latestFrame = frame;
   latestAt = Date.now();
   frameTimes.push(latestAt);
@@ -350,7 +364,8 @@ function handleStream(req, res) {
 function status() {
   const age = latestAt ? Date.now() - latestAt : null;
   return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
-           fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h };
+           fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
+           source: frameSource };
 }
 
 const server = http.createServer((req, res) => {
@@ -612,6 +627,8 @@ const STYLE = `
   .privacy-screen svg { width: 44px; height: 44px; color: var(--violet); }
   .privacy-screen b { color: var(--text); font-size: 17px; }
   .chip.night { color: #c4b5fd; }
+  .chip.backup { color: #fbbf24; border-color: rgba(251,191,36,.4); }
+  .log li.backup i { background: var(--warn); }
 
   .emo-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 8px; }
   .emo-grid button { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 2px;
@@ -739,7 +756,7 @@ function viewerPage() {
       <img id="feed" alt="Live camera feed">
       <canvas id="overlay" aria-hidden="true"></canvas>
       <div class="hud tl"><span class="rec"><i></i>LIVE</span><span class="chip" id="hud-time"></span></div>
-      <div class="hud tr"><span class="chip night" id="hud-night" hidden>☾ Night</span><span class="chip" id="hud-res">—</span><span class="chip" id="hud-fps">— fps</span></div>
+      <div class="hud tr"><span class="chip backup" id="hud-src" hidden>BACKUP · EYE 2</span><span class="chip night" id="hud-night" hidden>☾ Night</span><span class="chip" id="hud-res">—</span><span class="chip" id="hud-fps">— fps</span></div>
       <div class="privacy-screen" id="privacy-screen" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
         <b>Privacy mode on</b><span id="privacy-text">The camera isn&rsquo;t streaming or detecting.</span>
@@ -918,6 +935,7 @@ function viewerPage() {
         off.hidden = true;
         $('hud-fps').textContent = (s.fps || 0).toFixed(1) + ' fps';
         if (s.width) $('hud-res').textContent = s.width + '×' + s.height;
+        $('hud-src').hidden = s.source !== 'eye2';
       } else {
         live.className = 'live off'; $('live-text').textContent = 'Offline';
         off.hidden = false;
