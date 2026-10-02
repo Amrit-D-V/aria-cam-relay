@@ -480,6 +480,11 @@ server.on('upgrade', (req, socket) => {
   });
 });
 
+// Keep idle HTTP connections longer than Node's 5 s default: the display
+// can't reopen its TLS session while its OV7670 runs (no memory), so a
+// dropped keep-alive costs it a camera pause.
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
 server.listen(PORT, () => console.log(`cam relay listening on :${PORT}`));
 
 // ── Pages ───────────────────────────────────────────────────────────────
