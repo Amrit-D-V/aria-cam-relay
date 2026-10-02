@@ -108,7 +108,7 @@ const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'sh
                   'roll', 'nod', 'yawn', 'purr', 'squint', 'sleep', 'wake'];
 const MSG_MAX = 120;
 const VIEWS = ['auto', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
-const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, view: 'auto' };
+const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, view: 'auto', zoom2: 10 };
 
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
@@ -140,13 +140,14 @@ const COMMANDS = {                // name → argument validator
   profile: (a) => ['auto', '0', '1', '2', '3', '4'].includes(a[0]),
   sensitivity: (a) => ['low', 'medium', 'high'].includes(a[0]),
   zones: (a) => /^[0-9a-f]{12}$/.test(a[0]) && a[0] !== '000000000000',
+  zoom: (a) => /^\d{2}$/.test(a[0]) && +a[0] >= 10 && +a[0] <= 40,     // ×10: 10 = 1×, 40 = 4×
   restart: (a) => a.length === 0,
 };
 
 function publicDisplay() {
   const m = displayState.msg;
   return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
-           emotion: displayState.emotion, restart: displayState.restart, view: displayState.view };
+           emotion: displayState.emotion, restart: displayState.restart, view: displayState.view, zoom2: displayState.zoom2 };
 }
 
 function handleCmd(req, res) {
@@ -182,6 +183,13 @@ function handleCmd(req, res) {
     if (cmd === 'view') {              // what the OLED shows: auto rotation, one screen, or camera 2 live
       if (!VIEWS.includes(args[0])) return send(res, 400, 'text/plain', 'view ' + VIEWS.join('|'));
       displayState.view = args[0];
+      broadcast('display', publicDisplay());
+      return send(res, 202, 'text/plain', 'queued');
+    }
+    if (cmd === 'zoom2') {             // camera 2 (the display's OV7670): digital zoom ×10
+      const z = parseInt(args[0], 10);
+      if (!(z >= 10 && z <= 30)) return send(res, 400, 'text/plain', 'zoom2 10..30');
+      displayState.zoom2 = z;
       broadcast('display', publicDisplay());
       return send(res, 202, 'text/plain', 'queued');
     }
@@ -840,6 +848,10 @@ function viewerPage() {
           <button data-v="weather">Weather</button><button data-v="stats">Stats</button><button data-v="detect">Detection</button>
           <button data-v="cam2">Camera 2</button>
         </div>
+        <div class="sub-h">Camera 2 zoom</div>
+        <div class="seg view-seg" id="zoom2-seg">
+          <button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button>
+        </div>
         <div class="sub-h">Message on the display</div>
         <div class="msg-box">
           <textarea id="msg" maxlength="120" placeholder="Type a message… (e.g. Dinner is ready!)"></textarea>
@@ -882,6 +894,8 @@ function viewerPage() {
           <div class="seg" data-cmd="sensitivity"><button data-v="low">Low</button><button data-v="medium">Med</button><button data-v="high">High</button></div></div>
         <div class="ctl"><div>Detection zones<small id="zone-sub">Watching the whole picture</small></div>
           <button class="btn" id="zone-edit">Edit</button></div>
+        <div class="ctl wide"><div>Zoom<small id="zoom-sub">Sensor zoom: more detail, not bigger pixels</small></div>
+          <div class="seg" data-cmd="zoom"><button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button><button data-v="40">4×</button></div></div>
         <div class="ctl wide"><div>Resolution<small>Higher = sharper but fewer fps</small></div>
           <div class="seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400</button><button data-v="1">640</button><button data-v="2">800</button><button data-v="3">720p</button><button data-v="4">1600</button></div></div>
         <div class="ctl"><div>Restart system<small>Camera + display, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
@@ -1090,6 +1104,12 @@ function viewerPage() {
     setSeg('light', cam.ledauto ? 'auto' : cam.led === 0 ? 'off' : cam.led <= 40 ? '30' : '100');
     setSeg('profile', cam.adaptive ? 'auto' : String(cam.profile_i !== undefined ? cam.profile_i : cam.profile === 'VGA' ? 1 : 0));
     if (cam.sensitivity) setSeg('sensitivity', cam.sensitivity);
+    if (cam.zoom) {
+      setSeg('zoom', String(cam.zoom));
+      var zmax = cam.zoom_max || 40;
+      document.querySelectorAll('.seg[data-cmd="zoom"] button').forEach(function (b) { b.disabled = +b.dataset.v > zmax; });
+      $('zoom-sub').textContent = zmax <= 10 ? 'Lower the resolution to zoom' : 'Up to ' + (zmax / 10) + '× at this resolution';
+    }
     if (cam.zones) {
       var ignored = zonesFromHex(cam.zones).filter(function (w) { return !w; }).length;
       $('zone-sub').textContent = ignored ? 'Ignoring ' + ignored + ' of 48 areas' : 'Watching the whole picture';
@@ -1161,6 +1181,9 @@ function viewerPage() {
   function renderDisp() {
     if (!disp) return;
     $('screen').setAttribute('aria-checked', String(!!disp.screen));
+    document.querySelectorAll('#zoom2-seg button').forEach(function (b) {
+      b.setAttribute('aria-pressed', String(+b.dataset.v === (disp.zoom2 || 10)));
+    });
     document.querySelectorAll('#view-seg button').forEach(function (b) {
       b.setAttribute('aria-pressed', String(b.dataset.v === (disp.view || 'auto')));
     });
@@ -1172,6 +1195,12 @@ function viewerPage() {
     } else $('msg-showing').textContent = '';
   }
   setInterval(renderDisp, 1000);
+  $('zoom2-seg').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    if (disp) disp.zoom2 = +b.dataset.v;
+    renderDisp();
+    send('zoom2', [b.dataset.v]);
+  });
   $('view-seg').addEventListener('click', function (e) {
     var b = e.target.closest('button'); if (!b) return;
     if (disp) disp.view = b.dataset.v;                 // optimistic; the next display event confirms
