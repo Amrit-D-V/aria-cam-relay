@@ -107,7 +107,8 @@ setInterval(() => {
 const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'shy', 'dizzy',
                   'roll', 'nod', 'yawn', 'purr', 'squint', 'sleep', 'wake'];
 const MSG_MAX = 120;
-const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0 };
+const VIEWS = ['auto', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
+const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, view: 'auto' };
 
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
@@ -145,7 +146,7 @@ const COMMANDS = {                // name → argument validator
 function publicDisplay() {
   const m = displayState.msg;
   return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
-           emotion: displayState.emotion, restart: displayState.restart };
+           emotion: displayState.emotion, restart: displayState.restart, view: displayState.view };
 }
 
 function handleCmd(req, res) {
@@ -177,6 +178,12 @@ function handleCmd(req, res) {
       displayState.restart = Date.now();
       logEvent('privacy', 'System restart (camera + display)');
       return send(res, 202, 'text/plain', 'restarting');
+    }
+    if (cmd === 'view') {              // what the OLED shows: auto rotation, one screen, or camera 2 live
+      if (!VIEWS.includes(args[0])) return send(res, 400, 'text/plain', 'view ' + VIEWS.join('|'));
+      displayState.view = args[0];
+      broadcast('display', publicDisplay());
+      return send(res, 202, 'text/plain', 'queued');
     }
     if (cmd === 'emotion') {
       if (!EMOTIONS.includes(args[0])) return send(res, 400, 'text/plain', 'unknown emotion');
@@ -635,6 +642,8 @@ const STYLE = `
   .chip.backup { color: #fbbf24; border-color: rgba(251,191,36,.4); }
   .log li.backup i { background: var(--warn); }
 
+  .view-seg { display: flex; flex-wrap: wrap; width: 100%; margin-top: 2px; }
+  .view-seg button { flex: 1 1 auto; }
   .emo-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 8px; }
   .emo-grid button { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 2px;
                      cursor: pointer; font-size: 12px; color: var(--muted); display: grid; gap: 2px; justify-items: center; }
@@ -825,6 +834,12 @@ function viewerPage() {
       <div id="aria-controls" hidden>
         <div class="ctl"><div>Display<small>Turn the OLED screen on or off</small></div>
           <button class="switch" id="screen" role="switch" aria-checked="true" aria-label="Display on"></button></div>
+        <div class="sub-h">Display shows</div>
+        <div class="seg view-seg" id="view-seg">
+          <button data-v="auto">Auto</button><button data-v="eyes">Eyes</button><button data-v="clock">Clock</button>
+          <button data-v="weather">Weather</button><button data-v="stats">Stats</button><button data-v="detect">Detection</button>
+          <button data-v="cam2">Camera 2</button>
+        </div>
         <div class="sub-h">Message on the display</div>
         <div class="msg-box">
           <textarea id="msg" maxlength="120" placeholder="Type a message… (e.g. Dinner is ready!)"></textarea>
@@ -1125,7 +1140,7 @@ function viewerPage() {
     send('privacy', [cameraOn ? '0' : '1']);
   };
   $('ph-save').onclick = function () { send('privhours', [$('ph-s').value, $('ph-e').value]); };
-  document.querySelectorAll('.seg').forEach(function (seg) {
+  document.querySelectorAll('.seg[data-cmd]').forEach(function (seg) {
     seg.addEventListener('click', function (e) {
       var b = e.target.closest('button'); if (!b) return;
       var v = b.dataset.v, cmd = seg.dataset.cmd;
@@ -1144,6 +1159,9 @@ function viewerPage() {
   function renderDisp() {
     if (!disp) return;
     $('screen').setAttribute('aria-checked', String(!!disp.screen));
+    document.querySelectorAll('#view-seg button').forEach(function (b) {
+      b.setAttribute('aria-pressed', String(b.dataset.v === (disp.view || 'auto')));
+    });
     $('disp-state').textContent = disp.screen ? 'Display on' : 'Display off';
     var m = disp.msg;
     if (m) {
@@ -1152,6 +1170,12 @@ function viewerPage() {
     } else $('msg-showing').textContent = '';
   }
   setInterval(renderDisp, 1000);
+  $('view-seg').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    if (disp) disp.view = b.dataset.v;                 // optimistic; the next display event confirms
+    renderDisp();
+    send('view', [b.dataset.v]);
+  });
   $('screen').onclick = function () {
     var on = $('screen').getAttribute('aria-checked') !== 'true';
     $('screen').setAttribute('aria-checked', String(on));
