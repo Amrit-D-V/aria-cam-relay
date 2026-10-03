@@ -378,7 +378,8 @@ function handleStream(req, res) {
 
 function status() {
   const age = latestAt ? Date.now() - latestAt : null;
-  return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
+  const limit = frameSource === 'eye2' ? 30000 : OFFLINE_AFTER_MS;   // the backup eye sends a frame every few seconds
+  return { online: age !== null && age < limit, lastFrameAgeMs: age, viewers: viewerCount(),
            fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
            source: frameSource };
 }
@@ -603,7 +604,7 @@ const STYLE = `
   .p-sub { font-size: 13px; color: var(--muted); }
   .emo { margin-left: auto; font-size: 28px; line-height: 1; }
 
-  .log { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-height: 260px; overflow-y: auto; }
+  .log { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-height: 340px; overflow-y: auto; }
   .log li { display: grid; grid-template-columns: 10px 1fr auto; align-items: center; gap: 10px;
             padding: 8px 4px; border-bottom: 1px solid var(--line); font-size: 14px; }
   .log li:last-child { border-bottom: 0; }
@@ -653,14 +654,14 @@ const STYLE = `
   .view-seg { display: flex; flex-wrap: wrap; width: 100%; margin-top: 2px; }
   .view-seg button { flex: 1 1 auto; }
   .emo-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 8px; }
-  .emo-grid button { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 2px;
-                     cursor: pointer; font-size: 12px; color: var(--muted); display: grid; gap: 2px; justify-items: center; }
-  .emo-grid button b { font-size: 20px; line-height: 1; }
+  .emo-grid button { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 6px 2px;
+                     cursor: pointer; font-size: 11px; color: var(--muted); display: grid; gap: 2px; justify-items: center; }
+  .emo-grid button b { font-size: 18px; line-height: 1; }
   .emo-grid button:hover { border-color: rgba(94,234,212,.4); color: var(--text); }
   .emo-grid button.sent { border-color: var(--accent); color: var(--accent); }
   .msg-box { display: grid; gap: 8px; margin-top: 4px; }
   .msg-box textarea { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); border-radius: 10px;
-                      padding: 10px; font: inherit; resize: vertical; min-height: 64px; }
+                      padding: 10px; font: inherit; resize: vertical; min-height: 48px; }
   .msg-box textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
   .msg-row { display: flex; gap: 8px; align-items: center; justify-content: space-between; font-size: 12px; color: var(--muted); }
   .msg-row select { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 5px; font: inherit; }
@@ -730,6 +731,29 @@ const STYLE = `
   .rs-list .why.ok::before { content: "↻"; color: var(--muted); }
   .note { font-size: 11px; color: var(--muted); margin-top: 8px; }
 
+  /* Tabs: the side panel shows one group at a time instead of one long column */
+  .tabs { display: flex; gap: 2px; padding: 4px; background: var(--surface); border: 1px solid var(--line);
+          border-radius: 12px; position: sticky; top: 0; z-index: 4; }
+  .tabs button { flex: 1; border: 0; background: transparent; color: var(--muted); padding: 9px 4px; border-radius: 9px;
+                 cursor: pointer; font-size: 13px; font-weight: 600; display: grid; justify-items: center; gap: 1px; }
+  .tabs button span { font-size: 16px; line-height: 1; }
+  .tabs button[aria-selected="true"] { background: var(--accent-dim); color: var(--accent); }
+  .pane { display: flex; flex-direction: column; gap: 12px; }
+  .side .card { padding: 14px; }
+  @media (min-width: 901px) {          /* desktop: the video stays put, only the panel scrolls (if at all) */
+    .grid { align-items: start; }
+    .video-col { position: sticky; top: 12px; }
+    .stage { max-height: calc(100vh - 128px); }
+    .side { position: sticky; top: 12px; max-height: calc(100vh - 128px); overflow-y: auto; scrollbar-width: thin; }
+  }
+  @media (max-width: 900px) { .tabs { top: 0; margin: 0 -16px; border-radius: 0; border-left: 0; border-right: 0; } }
+  .off-note { font-size: 12px; color: var(--warn); background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.25);
+              border-radius: 10px; padding: 8px 10px; margin-bottom: 6px; }
+  #controls.dim .ctl:not(.keep) { opacity: .45; }
+  button:disabled { cursor: not-allowed; }
+  .slim { font-size: 13px; color: var(--muted); padding: 6px 0 2px; }
+  .hc-empty { font-size: 12px; color: var(--muted); padding: 6px 0 12px; }
+
   .foot { max-width: 1280px; margin: 0 auto; padding: 4px 16px 24px; color: var(--muted); font-size: 12px; }
 
   .login { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
@@ -773,7 +797,7 @@ function viewerPage() {
 </header>
 
 <main class="grid">
-  <section aria-label="Live video">
+  <section class="video-col" aria-label="Live video">
     <div class="stage" id="stage">
       <img id="feed" alt="Live camera feed">
       <canvas id="overlay" aria-hidden="true"></canvas>
@@ -812,107 +836,128 @@ function viewerPage() {
   </section>
 
   <aside class="side">
-    <section class="card" aria-label="ARIA">
-      <div class="card-head"><h2>ARIA</h2><span class="mood" id="mood">—</span></div>
-      <div class="robot-wrap"><canvas id="robot" width="128" height="64" aria-label="ARIA's face, live"></canvas>
-        <div class="robot-off" id="robot-off">ARIA's face appears when the tracker is running</div></div>
-      <div class="meters">
-        <div class="meter"><span>Energy</span><div class="bar"><span id="m-energy"></span></div><span class="val" id="v-energy">–</span></div>
-        <div class="meter"><span>Affection</span><div class="bar"><span id="m-affection"></span></div><span class="val" id="v-affection">–</span></div>
-        <div class="meter"><span>Boredom</span><div class="bar"><span id="m-boredom"></span></div><span class="val" id="v-boredom">–</span></div>
-      </div>
-    </section>
+    <nav class="tabs" role="tablist" aria-label="Panels">
+      <button role="tab" data-tab="home" aria-selected="true"><span>👁</span>Home</button>
+      <button role="tab" data-tab="display" aria-selected="false"><span>💬</span>Display</button>
+      <button role="tab" data-tab="camera" aria-selected="false"><span>📷</span>Camera</button>
+      <button role="tab" data-tab="health" aria-selected="false"><span>📈</span>Health</button>
+    </nav>
 
-    <section class="card" aria-label="In view">
-      <div class="card-head"><h2>In view</h2><span class="badge" id="count">0</span></div>
-      <div class="person"><div class="avatar" id="avatar">–</div>
-        <div><div class="p-name" id="who">—</div><div class="p-sub" id="who-sub">Face tracker offline</div></div>
-        <div class="emo" id="emo" aria-hidden="true"></div></div>
-      <div class="health" id="detect"></div>
-    </section>
-
-    <section class="card" aria-label="Activity">
-      <div class="card-head"><h2>Activity</h2></div>
-      <ol class="log" id="log"><li class="empty">Nothing yet</li></ol>
-    </section>
-
-    <section class="card" aria-label="ARIA controls">
-      <div class="card-head"><h2>Talk to ARIA</h2><span class="mood" id="disp-state">—</span></div>
-      <div class="locked" id="aria-locked"><span>Controls are locked.</span><button class="btn primary" id="unlock2">Unlock</button></div>
-      <div id="aria-controls" hidden>
-        <div class="ctl"><div>Display<small>Turn the OLED screen on or off</small></div>
-          <button class="switch" id="screen" role="switch" aria-checked="true" aria-label="Display on"></button></div>
-        <div class="sub-h">Display shows</div>
-        <div class="seg view-seg" id="view-seg">
-          <button data-v="auto">Auto</button><button data-v="sage">Sage</button><button data-v="eyes">Eyes</button><button data-v="clock">Clock</button>
-          <button data-v="weather">Weather</button><button data-v="stats">Stats</button><button data-v="detect">Detection</button>
-          <button data-v="cam2">Camera 2</button>
+    <div class="pane" data-pane="home" role="tabpanel">
+      <section class="card" aria-label="ARIA">
+        <div class="card-head"><h2>ARIA</h2><span class="mood" id="mood">—</span></div>
+        <div class="robot-wrap" id="robot-wrap" hidden><canvas id="robot" width="128" height="64" aria-label="ARIA's face, live"></canvas></div>
+        <div class="slim" id="robot-off">Face, mood and people show up when the laptop face tracker is running.</div>
+        <div class="meters" id="meters" hidden>
+          <div class="meter"><span>Energy</span><div class="bar"><span id="m-energy"></span></div><span class="val" id="v-energy">–</span></div>
+          <div class="meter"><span>Affection</span><div class="bar"><span id="m-affection"></span></div><span class="val" id="v-affection">–</span></div>
+          <div class="meter"><span>Boredom</span><div class="bar"><span id="m-boredom"></span></div><span class="val" id="v-boredom">–</span></div>
         </div>
-        <div class="sub-h">Camera 2 zoom</div>
+      </section>
+
+      <section class="card" aria-label="In view">
+        <div class="card-head"><h2>In view</h2><span class="badge" id="count">0</span></div>
+        <div class="person"><div class="avatar" id="avatar">–</div>
+          <div><div class="p-name" id="who">—</div><div class="p-sub" id="who-sub">Face tracker offline</div></div>
+          <div class="emo" id="emo" aria-hidden="true"></div></div>
+        <div class="health" id="detect"></div>
+      </section>
+
+      <section class="card" aria-label="Activity">
+        <div class="card-head"><h2>Activity</h2></div>
+        <ol class="log" id="log"><li class="empty">Nothing yet</li></ol>
+      </section>
+    </div>
+
+    <div class="pane" data-pane="display" role="tabpanel" hidden>
+      <section class="card" aria-label="ARIA controls">
+        <div class="card-head"><h2>Talk to ARIA</h2><span class="mood" id="disp-state">—</span></div>
+        <div class="locked" id="aria-locked"><span>Controls are locked.</span><button class="btn primary" id="unlock2">Unlock</button></div>
+        <div id="aria-controls" hidden>
+          <div class="ctl"><div>Display<small>Turn the OLED screen on or off</small></div>
+            <button class="switch" id="screen" role="switch" aria-checked="true" aria-label="Display on"></button></div>
+          <div class="sub-h">Display shows</div>
+          <div class="seg view-seg" id="view-seg">
+            <button data-v="auto">Auto</button><button data-v="sage">Sage</button><button data-v="eyes">Eyes</button><button data-v="clock">Clock</button>
+            <button data-v="weather">Weather</button><button data-v="stats">Stats</button><button data-v="detect">Detection</button>
+            <button data-v="cam2">Camera 2</button>
+          </div>
+          <div class="sub-h">Message on the display</div>
+          <div class="msg-box">
+            <textarea id="msg" maxlength="120" rows="2" placeholder="Type a message… (e.g. Dinner is ready!)"></textarea>
+            <div class="msg-row">
+              <span><span id="msg-count">0</span>/120 · show for
+                <select id="msg-secs" aria-label="Show for"><option value="10">10 s</option><option value="30" selected>30 s</option>
+                  <option value="60">1 min</option><option value="300">5 min</option><option value="600">10 min</option></select></span>
+              <span><button class="btn" id="msg-clear">Clear</button> <button class="btn primary" id="msg-send">Send</button></span>
+            </div>
+            <div class="showing" id="msg-showing"></div>
+          </div>
+          <div class="sub-h">Emotion</div>
+          <div class="emo-grid" id="emo-grid">
+            <button data-e="giggle"><b>😆</b>Giggle</button><button data-e="wink"><b>😉</b>Wink</button>
+            <button data-e="heart"><b>😍</b>Love</button><button data-e="surprise"><b>😲</b>Surprise</button>
+            <button data-e="curious"><b>🧐</b>Curious</button><button data-e="think"><b>🤔</b>Think</button>
+            <button data-e="shy"><b>☺️</b>Shy</button><button data-e="dizzy"><b>😵</b>Dizzy</button>
+            <button data-e="roll"><b>🙄</b>Eye-roll</button><button data-e="nod"><b>🙂</b>Nod</button>
+            <button data-e="squint"><b>🤨</b>Suspicious</button><button data-e="purr"><b>😌</b>Purr</button>
+            <button data-e="yawn"><b>🥱</b>Yawn</button><button data-e="sleep"><b>😴</b>Sleep</button>
+            <button data-e="wake"><b>☀️</b>Wake up</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="pane" data-pane="camera" role="tabpanel" hidden>
+      <section class="card" aria-label="Camera controls">
+        <div class="card-head"><h2>Main camera</h2><span class="mood" id="cam-conn">—</span></div>
+        <div class="locked" id="locked"><span>Controls are locked.</span><button class="btn primary" id="unlock">Unlock</button></div>
+        <div id="controls" hidden>
+          <div class="off-note" id="cam-off-note" hidden>The main camera is offline, so these settings can't be changed until it reconnects.</div>
+          <div class="ctl"><div>Camera<small id="priv-sub">On — streaming and detecting</small></div>
+            <button class="switch" id="priv" role="switch" aria-checked="true" aria-label="Camera on"></button></div>
+          <div class="ctl"><div>Private hours<small>Daily</small></div>
+            <div class="hours"><select id="ph-s" aria-label="From"></select>–<select id="ph-e" aria-label="To"></select>
+              <button class="btn" id="ph-save">Set</button></div></div>
+          <div class="ctl"><div>Night mode<small id="night-sub">Black &amp; white in the dark</small></div>
+            <div class="seg" data-cmd="night"><button data-v="auto">Auto</button><button data-v="on">On</button><button data-v="off">Off</button></div></div>
+          <div class="ctl"><div>Light<small>Flash LED</small></div>
+            <div class="seg" data-cmd="light"><button data-v="off">Off</button><button data-v="auto">Auto</button><button data-v="30">Low</button><button data-v="100">High</button></div></div>
+          <div class="ctl"><div>Motion alerts<small>Low ignores curtains &amp; plants moving</small></div>
+            <div class="seg" data-cmd="sensitivity"><button data-v="low">Low</button><button data-v="medium">Med</button><button data-v="high">High</button></div></div>
+          <div class="ctl"><div>Detection zones<small id="zone-sub">Watching the whole picture</small></div>
+            <button class="btn" id="zone-edit">Edit</button></div>
+          <div class="ctl wide"><div>Zoom<small id="zoom-sub">Sensor zoom: more detail, not bigger pixels</small></div>
+            <div class="seg view-seg" data-cmd="zoom"><button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button><button data-v="40">4×</button></div></div>
+          <div class="ctl wide"><div>Resolution<small>Higher = sharper but fewer fps</small></div>
+            <div class="seg view-seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400</button><button data-v="1">640</button><button data-v="2">800</button><button data-v="3">720p</button><button data-v="4">1600</button></div></div>
+          <div class="ctl keep"><div>Restart system<small>Camera + display, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
+        </div>
+        <div class="health" id="health"></div>
+      </section>
+
+      <section class="card" aria-label="Backup camera">
+        <div class="card-head"><h2>Camera 2 · backup eye</h2><span class="mood" id="cam2-state">—</span></div>
+        <div class="slim">Takes over on the display and this page when the main camera is down.</div>
+        <div class="sub-h">Zoom</div>
         <div class="seg view-seg" id="zoom2-seg">
           <button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button>
         </div>
-        <div class="sub-h">Message on the display</div>
-        <div class="msg-box">
-          <textarea id="msg" maxlength="120" placeholder="Type a message… (e.g. Dinner is ready!)"></textarea>
-          <div class="msg-row">
-            <span><span id="msg-count">0</span>/120 · show for
-              <select id="msg-secs" aria-label="Show for"><option value="10">10 s</option><option value="30" selected>30 s</option>
-                <option value="60">1 min</option><option value="300">5 min</option><option value="600">10 min</option></select></span>
-            <span><button class="btn" id="msg-clear">Clear</button> <button class="btn primary" id="msg-send">Send</button></span>
-          </div>
-          <div class="showing" id="msg-showing"></div>
-        </div>
-        <div class="sub-h">Emotion</div>
-        <div class="emo-grid" id="emo-grid">
-          <button data-e="giggle"><b>😆</b>Giggle</button><button data-e="wink"><b>😉</b>Wink</button>
-          <button data-e="heart"><b>😍</b>Love</button><button data-e="surprise"><b>😲</b>Surprise</button>
-          <button data-e="curious"><b>🧐</b>Curious</button><button data-e="think"><b>🤔</b>Think</button>
-          <button data-e="shy"><b>☺️</b>Shy</button><button data-e="dizzy"><b>😵</b>Dizzy</button>
-          <button data-e="roll"><b>🙄</b>Eye-roll</button><button data-e="nod"><b>🙂</b>Nod</button>
-          <button data-e="squint"><b>🤨</b>Suspicious</button><button data-e="purr"><b>😌</b>Purr</button>
-          <button data-e="yawn"><b>🥱</b>Yawn</button><button data-e="sleep"><b>😴</b>Sleep</button>
-          <button data-e="wake"><b>☀️</b>Wake up</button>
-        </div>
-      </div>
-    </section>
+      </section>
+    </div>
 
-    <section class="card" aria-label="Camera controls">
-      <div class="card-head"><h2>Camera</h2><span class="mood" id="cam-conn">—</span></div>
-      <div class="locked" id="locked"><span>Controls are locked.</span><button class="btn primary" id="unlock">Unlock</button></div>
-      <div id="controls" hidden>
-        <div class="ctl"><div>Camera<small id="priv-sub">On — streaming and detecting</small></div>
-          <button class="switch" id="priv" role="switch" aria-checked="true" aria-label="Camera on"></button></div>
-        <div class="ctl"><div>Private hours<small>Daily</small></div>
-          <div class="hours"><select id="ph-s" aria-label="From"></select>–<select id="ph-e" aria-label="To"></select>
-            <button class="btn" id="ph-save">Set</button></div></div>
-        <div class="ctl"><div>Night mode<small id="night-sub">Black &amp; white in the dark</small></div>
-          <div class="seg" data-cmd="night"><button data-v="auto">Auto</button><button data-v="on">On</button><button data-v="off">Off</button></div></div>
-        <div class="ctl"><div>Light<small>Flash LED</small></div>
-          <div class="seg" data-cmd="light"><button data-v="off">Off</button><button data-v="auto">Auto</button><button data-v="30">Low</button><button data-v="100">High</button></div></div>
-        <div class="ctl"><div>Motion alerts<small>Low ignores curtains &amp; plants moving</small></div>
-          <div class="seg" data-cmd="sensitivity"><button data-v="low">Low</button><button data-v="medium">Med</button><button data-v="high">High</button></div></div>
-        <div class="ctl"><div>Detection zones<small id="zone-sub">Watching the whole picture</small></div>
-          <button class="btn" id="zone-edit">Edit</button></div>
-        <div class="ctl wide"><div>Zoom<small id="zoom-sub">Sensor zoom: more detail, not bigger pixels</small></div>
-          <div class="seg" data-cmd="zoom"><button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button><button data-v="40">4×</button></div></div>
-        <div class="ctl wide"><div>Resolution<small>Higher = sharper but fewer fps</small></div>
-          <div class="seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400</button><button data-v="1">640</button><button data-v="2">800</button><button data-v="3">720p</button><button data-v="4">1600</button></div></div>
-        <div class="ctl"><div>Restart system<small>Camera + display, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
-      </div>
-      <div class="health" id="health"></div>
-    </section>
-
-    <section class="card" aria-label="Camera health">
-      <div class="card-head"><h2>Health</h2>
-        <div class="seg" id="h-range"><button data-h="1">1h</button><button data-h="6" aria-pressed="true">6h</button><button data-h="24">24h</button></div></div>
-      <div class="h-sum">
-        <div>Online<b id="h-online">–</b></div><div>Restarts<b id="h-rcount">–</b></div><div>Avg fps<b id="h-fps">–</b></div>
-      </div>
-      <div id="h-charts"></div>
-      <ol class="rs-list" id="h-restarts"></ol>
-      <div class="note" id="h-note"></div>
-    </section>
+    <div class="pane" data-pane="health" role="tabpanel" hidden>
+      <section class="card" aria-label="Camera health">
+        <div class="card-head"><h2>Health</h2>
+          <div class="seg" id="h-range"><button data-h="1">1h</button><button data-h="6" aria-pressed="true">6h</button><button data-h="24">24h</button></div></div>
+        <div class="h-sum">
+          <div>Online<b id="h-online">–</b></div><div>Restarts<b id="h-rcount">–</b></div><div>Avg fps<b id="h-fps">–</b></div>
+        </div>
+        <div id="h-charts"></div>
+        <ol class="rs-list" id="h-restarts"></ol>
+        <div class="note" id="h-note"></div>
+      </section>
+    </div>
   </aside>
   <div class="h-tip" id="h-tip" hidden></div>
 </main>
@@ -950,6 +995,18 @@ function viewerPage() {
     try { localStorage.setItem('aria-boxes', showBoxes ? '1' : '0'); } catch (e) {}
   };
 
+  // ── Tabs (remembered per browser) ──
+  function showTab(name) {
+    document.querySelectorAll('.tabs button').forEach(function (b) { b.setAttribute('aria-selected', String(b.dataset.tab === name)); });
+    document.querySelectorAll('.pane').forEach(function (p) { p.hidden = p.dataset.pane !== name; });
+    try { localStorage.setItem('aria-tab', name); } catch (e) {}
+    if (name === 'health' && typeof renderHealth === 'function') renderHealth();   // charts need a visible width
+  }
+  document.querySelector('.tabs').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (b) showTab(b.dataset.tab);
+  });
+  try { var savedTab = localStorage.getItem('aria-tab'); if (savedTab && document.querySelector('[data-pane="' + savedTab + '"]')) showTab(savedTab); } catch (e) {}
+
   // ── Clock + camera status ──
   function pad(n) { return (n < 10 ? '0' : '') + n; }
   setInterval(function () {
@@ -971,9 +1028,11 @@ function viewerPage() {
         $('hud-fps').textContent = (s.fps || 0).toFixed(1) + ' fps';
         if (s.width) $('hud-res').textContent = s.width + '×' + s.height;
         $('hud-src').hidden = s.source !== 'eye2';
+        $('cam2-state').textContent = s.source === 'eye2' ? 'Live on the page' : 'Standing by';
         if (backupLive !== (s.source === 'eye2')) { backupLive = s.source === 'eye2'; renderCam(); }
       } else {
         live.className = 'live off'; $('live-text').textContent = 'Offline';
+        $('cam2-state').textContent = 'Standing by';
         off.hidden = false;
         $('offline-text').textContent = s.lastFrameAgeMs === null ? 'Waiting for the camera…'
           : 'Last frame ' + ago(s.lastFrameAgeMs) + ' ago';
@@ -1047,6 +1106,7 @@ function viewerPage() {
       if (admin) { av.className = 'avatar known admin'; }
     }
     var r = fresh() && meta.robot;
+    $('meters').hidden = !r;
     if (r) {
       $('mood').textContent = r.sleeping ? '😴 Asleep' : EXPR_MOOD[r.expr] ||
         (r.energy < 0.3 ? '😩 Tired' : r.boredom > 0.5 ? '😐 Bored' : r.affection > 0.7 ? '🥰 Affectionate' : '🙂 Calm');
@@ -1090,6 +1150,10 @@ function viewerPage() {
     $('cam-conn').textContent = cam ? 'Connected' : backupLive ? 'Main offline · backup eye 2 live' : 'Not connected';
     $('locked').hidden = !!adminKey; $('controls').hidden = !adminKey;
     $('aria-locked').hidden = !!adminKey; $('aria-controls').hidden = !adminKey;
+    var camOff = !cam;
+    $('cam-off-note').hidden = !camOff;
+    $('controls').classList.toggle('dim', camOff);
+    $('controls').querySelectorAll('button, select').forEach(function (el) { if (el.id !== 'restart') el.disabled = camOff; });
     var ps = $('privacy-screen');
     ps.hidden = !(cam && cam.privacy);
     $('hud-night').hidden = !(cam && cam.night && !cam.privacy);
@@ -1360,6 +1424,10 @@ function viewerPage() {
       var wrap = document.createElement('div'); wrap.className = 'hc';
       var last = hData.samples[hData.samples.length - 1][m.key];
       wrap.innerHTML = '<div class="hc-head"><span>' + m.title + '</span><b>' + (last === null ? 'offline' : m.fmt(last)) + '</b></div>';
+      if (!vals.length) {                          // nothing to plot: the camera was offline the whole time
+        var em = document.createElement('div'); em.className = 'hc-empty'; em.textContent = 'No data — the main camera was offline';
+        wrap.append(em); box.append(wrap); return;
+      }
       var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img',
         'aria-label': m.title + ', last ' + hHours + ' hours, ' + m.fmt(lo) + ' to ' + m.fmt(hi) });
       svg.append(svgEl('line', { class: 'grid-l', x1: 0, x2: W, y1: H - pad, y2: H - pad }));
@@ -1424,7 +1492,7 @@ function viewerPage() {
   var rc = $('robot'), rctx = rc.getContext('2d'), rimg = rctx.createImageData(128, 64), lastFrame = null;
   function drawRobot() {
     var b64 = fresh() && meta.face_frame;
-    $('robot-off').hidden = !!b64;
+    $('robot-off').hidden = !!b64; $('robot-wrap').hidden = !b64;
     if (!b64) { rctx.clearRect(0, 0, 128, 64); lastFrame = null; return; }
     if (b64 === lastFrame) return;
     lastFrame = b64;
