@@ -67,6 +67,9 @@ let frameSource = 'main';
 let mainFrameAt = 0;
 // When each part of the system was last heard from, for the page's status strip
 const seen = { eye2: 0, display: 0, tracker: 0 };
+// What the OLED shows, sent with each display poll (POST /display): 128x64,
+// 1 bit per pixel, row-major MSB-first (the page's format), base64
+let oledFrame = null;
 
 // Activity timeline, derived from /meta. Presence is debounced — a face that
 // drops out for a frame or two doesn't log "left" and "arrived" again.
@@ -329,6 +332,28 @@ function handleMeta(req, res) {
   });
 }
 
+// The display's poll: GET /display, or POST /display with its 1 KB screen
+// buffer (u8g2 page layout: byte = 8 vertical pixels) in the body.
+function handleDisplayPost(req, res) {
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => { size += c.length; if (size > 4096) { req.destroy(); return; } chunks.push(c); });
+  req.on('end', () => {
+    const buf = Buffer.concat(chunks);
+    seen.display = Date.now();
+    if (buf.length === 1024) {
+      const out = Buffer.alloc(1024);
+      for (let y = 0; y < 64; y++)
+        for (let x = 0; x < 128; x++)
+          if (buf[(y >> 3) * 128 + x] & (1 << (y & 7))) out[y * 16 + (x >> 3)] |= 0x80 >> (x & 7);
+      const b64 = out.toString('base64');
+      oledFrame = b64;
+      broadcast('oled', { f: b64 });               // every poll (~2 s), so the page knows it's live
+    }
+    send(res, 200, 'application/json', JSON.stringify(publicDisplay()));
+  });
+}
+
 function handleEvents(req, res) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -341,6 +366,7 @@ function handleEvents(req, res) {
   for (const e of [...activity].reverse()) res.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
   if (camState) res.write(`event: cam\ndata: ${JSON.stringify(camState)}\n\n`);
   res.write(`event: display\ndata: ${JSON.stringify(publicDisplay())}\n\n`);
+  if (oledFrame && Date.now() - seen.display < 10000) res.write(`event: oled\ndata: ${JSON.stringify({ f: oledFrame })}\n\n`);
   metaSubscribers.add(res);
   const ping = setInterval(() => res.write(': ping\n\n'), 15000);   // keep proxies from idling it out
   res.on('close', () => { clearInterval(ping); metaSubscribers.delete(res); });
@@ -403,6 +429,10 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && url.pathname === '/push') return handlePush(req, res);
   if (req.method === 'POST' && url.pathname === '/meta') return handleMeta(req, res);
   if (req.method === 'POST' && url.pathname === '/cmd') return handleCmd(req, res);
+  if (req.method === 'POST' && url.pathname === '/display') {
+    if (!authed) return send(res, 401, 'text/plain', 'bad key');
+    return handleDisplayPost(req, res);
+  }
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'text/plain', 'method not allowed');
 
   switch (url.pathname) {
@@ -907,8 +937,8 @@ function viewerPage() {
       </section>
       <section class="card" aria-label="ARIA">
         <div class="card-head"><h2>ARIA</h2><span class="mood" id="mood">—</span></div>
-        <div class="robot-wrap" id="robot-wrap" hidden><canvas id="robot" width="128" height="64" aria-label="ARIA's face, live"></canvas></div>
-        <div class="slim" id="robot-off">Face, mood and people show up when the laptop face tracker is running.</div>
+        <div class="robot-wrap" id="robot-wrap" hidden><canvas id="robot" width="128" height="64" aria-label="ARIA's display, live"></canvas></div>
+        <div class="slim" id="robot-off">The display's screen shows here while it's online.</div>
         <div class="meters" id="meters" hidden>
           <div class="meter"><span>Energy</span><div class="bar"><span id="m-energy"></span></div><span class="val" id="v-energy">–</span></div>
           <div class="meter"><span>Affection</span><div class="bar"><span id="m-affection"></span></div><span class="val" id="v-affection">–</span></div>
@@ -1607,8 +1637,10 @@ function viewerPage() {
 
   // ── ARIA's live face (the OLED's 128×64 frame, 1 bit per pixel) ──
   var rc = $('robot'), rctx = rc.getContext('2d'), rimg = rctx.createImageData(128, 64), lastFrame = null;
+  var oled = null, oledAt = 0;                 // the display's own screen, sent with its polls
+  es.addEventListener('oled', function (e) { try { oled = JSON.parse(e.data).f; oledAt = Date.now(); } catch (x) {} });
   function drawRobot() {
-    var b64 = fresh() && meta.face_frame;
+    var b64 = (oled && Date.now() - oledAt < 8000 ? oled : null) || (fresh() && meta.face_frame);
     $('robot-off').hidden = !!b64; $('robot-wrap').hidden = !b64;
     if (!b64) { rctx.clearRect(0, 0, 128, 64); lastFrame = null; return; }
     if (b64 === lastFrame) return;
