@@ -2,6 +2,11 @@
 // home router, so nothing on the internet can reach it directly); viewers
 // on any phone/browser watch the latest frames as an MJPEG stream.
 //
+//   GET  /ws         display board ⇄ relay WebSocket (header X-Cam-Key). Binary
+//                    messages from the board: first byte 1 = a JPEG camera
+//                    frame, 2 = the OLED's 1 KB screen buffer. The relay sends
+//                    JSON text: {"t":"state", …/display fields, viewers} on
+//                    connect, on every change, and every 2 s.
 //   POST /push       the camera (the OV7670 on the display board) → relay
 //                    (header X-Cam-Key: $CAM_KEY, body: JPEG); replies with
 //                    the viewer count. ?src=eye2 is accepted and ignored.
@@ -91,6 +96,7 @@ const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, 
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
   for (const s of metaSubscribers) s.write(line);
+  if (event === 'display') sendBoardState();      // the board hears about changes at once
 }
 
 function publicDisplay() {
@@ -272,22 +278,23 @@ function handleMeta(req, res) {
 
 // The display's poll: GET /display, or POST /display with its 1 KB screen
 // buffer (u8g2 page layout: byte = 8 vertical pixels) in the body.
+function acceptOled(buf) {
+  if (buf.length !== 1024) return;
+  const out = Buffer.alloc(1024);
+  for (let y = 0; y < 64; y++)
+    for (let x = 0; x < 128; x++)
+      if (buf[(y >> 3) * 128 + x] & (1 << (y & 7))) out[y * 16 + (x >> 3)] |= 0x80 >> (x & 7);
+  oledFrame = out.toString('base64');
+  broadcast('oled', { f: oledFrame });             // every ~2 s, so the page knows it's live
+}
+
 function handleDisplayPost(req, res) {
   const chunks = [];
   let size = 0;
   req.on('data', (c) => { size += c.length; if (size > 4096) { req.destroy(); return; } chunks.push(c); });
   req.on('end', () => {
-    const buf = Buffer.concat(chunks);
     seen.display = Date.now();
-    if (buf.length === 1024) {
-      const out = Buffer.alloc(1024);
-      for (let y = 0; y < 64; y++)
-        for (let x = 0; x < 128; x++)
-          if (buf[(y >> 3) * 128 + x] & (1 << (y & 7))) out[y * 16 + (x >> 3)] |= 0x80 >> (x & 7);
-      const b64 = out.toString('base64');
-      oledFrame = b64;
-      broadcast('oled', { f: b64 });               // every poll (~2 s), so the page knows it's live
-    }
+    acceptOled(Buffer.concat(chunks));
     send(res, 200, 'application/json', JSON.stringify(publicDisplay()));
   });
 }
@@ -402,6 +409,76 @@ const server = http.createServer((req, res) => {
     default:
       return send(res, 404, 'text/plain', 'not found');
   }
+});
+
+// ── Display board WebSocket ─────────────────────────────────────────────
+// Minimal RFC 6455 server for the one board connection (dependency-free).
+// Frames stream back to back instead of one HTTP round trip each, which
+// capped the camera near 1.5 fps.
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+let board = null, boardHeard = 0;
+
+function wsFrame(opcode, payload) {
+  const n = payload.length;
+  const head = n < 126 ? Buffer.from([0x80 | opcode, n])
+    : n < 65536 ? Buffer.from([0x80 | opcode, 126, n >> 8, n & 0xff])
+    : (() => { const h = Buffer.alloc(10); h[0] = 0x80 | opcode; h[1] = 127; h.writeBigUInt64BE(BigInt(n), 2); return h; })();
+  return Buffer.concat([head, payload]);
+}
+function sendBoardState() {
+  if (!board || board.destroyed) return;
+  board.write(wsFrame(0x1, Buffer.from(JSON.stringify({ t: 'state', ...publicDisplay(), viewers: viewerCount() }))));
+}
+setInterval(sendBoardState, 2000);
+setInterval(() => {                               // silent for 30 s = gone (power cut, WiFi drop)
+  if (board && !board.destroyed && Date.now() - boardHeard > 30000) board.destroy();
+}, 5000);
+
+server.on('upgrade', (req, socket) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname !== '/ws' || String(req.headers.upgrade).toLowerCase() !== 'websocket' ||
+      !req.headers['sec-websocket-key'] || !keyMatches(req.headers['x-cam-key'], CAM_KEY)) {
+    socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    return;
+  }
+  const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + WS_GUID).digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+               `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
+  socket.setNoDelay(true);
+  if (board) board.destroy();                     // newest connection wins
+  board = socket; boardHeard = Date.now();
+  console.log('display board connected');
+  sendBoardState();
+  let buf = Buffer.alloc(0), parts = [], partsLen = 0;
+  socket.on('data', (chunk) => {
+    boardHeard = seen.display = Date.now();
+    buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+    for (;;) {
+      if (buf.length < 2) return;
+      const fin = buf[0] & 0x80, opcode = buf[0] & 0x0f, masked = buf[1] & 0x80;
+      let len = buf[1] & 0x7f, off = 2;
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+      if (partsLen + len > MAX_FRAME_BYTES) { socket.destroy(); return; }
+      const maskAt = off;
+      if (masked) off += 4;
+      if (buf.length < off + len) return;
+      const payload = Buffer.from(buf.subarray(off, off + len));
+      if (masked) for (let i = 0; i < len; i++) payload[i] ^= buf[maskAt + (i & 3)];
+      buf = buf.subarray(off + len);
+      if (opcode === 0x8) { socket.end(wsFrame(0x8, Buffer.alloc(0))); return; }
+      if (opcode === 0x9) { socket.write(wsFrame(0xA, payload)); continue; }
+      if (opcode === 0x2 || opcode === 0x0) {
+        parts.push(payload); partsLen += len;
+        if (!fin) continue;
+        const msg = Buffer.concat(parts); parts = []; partsLen = 0;
+        if (msg[0] === 1) { seen.eye2 = Date.now(); acceptFrame(msg.subarray(1)); }
+        else if (msg[0] === 2) acceptOled(msg.subarray(1));
+      }
+    }
+  });
+  socket.on('error', () => socket.destroy());
+  socket.on('close', () => { if (board === socket) board = null; console.log('display board disconnected'); });
 });
 
 // Keep idle HTTP connections longer than Node's 5 s default: the display
