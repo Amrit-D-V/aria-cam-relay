@@ -65,6 +65,8 @@ let frameSize = null;             // {w, h} from the latest JPEG's header
 // camera is down). The main camera wins whenever it's sending.
 let frameSource = 'main';
 let mainFrameAt = 0;
+// When each part of the system was last heard from, for the page's status strip
+const seen = { eye2: 0, display: 0, tracker: 0 };
 
 // Activity timeline, derived from /meta. Presence is debounced — a face that
 // drops out for a frame or two doesn't log "left" and "arrived" again.
@@ -299,6 +301,7 @@ function handlePush(req, res) {
   req.on('end', () => {
     if (res.writableEnded) return;
     const src = new URL(req.url, 'http://x').searchParams.get('src') === 'eye2' ? 'eye2' : 'main';
+    if (src === 'eye2') seen.eye2 = Date.now();
     if (src === 'eye2' && Date.now() - mainFrameAt < 5000) return send(res, 200, 'text/plain', String(viewerCount()));
     if (!acceptFrame(Buffer.concat(chunks), src)) return send(res, 400, 'text/plain', 'not a JPEG');
     send(res, 200, 'text/plain', String(viewerCount()));
@@ -319,6 +322,7 @@ function handleMeta(req, res) {
     let meta;
     try { meta = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
     latestMeta = JSON.stringify(meta);            // re-serialised: only valid JSON reaches viewers
+    seen.tracker = Date.now();
     trackActivity(meta);
     for (const s of metaSubscribers) s.write(`data: ${latestMeta}\n\n`);
     send(res, 204, 'text/plain', '');
@@ -376,12 +380,19 @@ function handleStream(req, res) {
   res.on('error', drop);
 }
 
+function ages() {
+  const a = {};
+  for (const k in seen) a[k + '_age'] = seen[k] ? Date.now() - seen[k] : null;
+  return a;
+}
+
 function status() {
   const age = latestAt ? Date.now() - latestAt : null;
   const limit = frameSource === 'eye2' ? 30000 : OFFLINE_AFTER_MS;   // the backup eye sends a frame every few seconds
   return { online: age !== null && age < limit, lastFrameAgeMs: age, viewers: viewerCount(),
            fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
-           source: frameSource };
+           source: frameSource, main_connected: !!(camSocket && !camSocket.destroyed),
+           main_age: mainFrameAt ? Date.now() - mainFrameAt : null, ...ages() };
 }
 
 const server = http.createServer((req, res) => {
@@ -397,6 +408,14 @@ const server = http.createServer((req, res) => {
   switch (url.pathname) {
     case '/healthz':
       return send(res, 200, 'text/plain', 'ok');
+    case '/manifest.webmanifest':                  // "Add to home screen": opens straight into the viewer
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return send(res, 200, 'application/manifest+json', JSON.stringify({
+        name: 'ARIA Cam', short_name: 'ARIA', display: 'standalone', background_color: '#07090c', theme_color: '#07090c',
+        start_url: '/?key=' + encodeURIComponent(key), scope: '/',
+        icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }] }));
+    case '/icon.svg':
+      return send(res, 200, 'image/svg+xml', ICON_SVG, { 'Cache-Control': 'public, max-age=86400' });
     case '/':
       return send(res, authed ? 200 : 401, 'text/html; charset=utf-8', authed ? viewerPage() : keyPage(key !== null),
         { 'Referrer-Policy': 'no-referrer' });
@@ -413,6 +432,7 @@ const server = http.createServer((req, res) => {
       return handleEvents(req, res);
     case '/display':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      seen.display = Date.now();                   // only the display board polls this
       return send(res, 200, 'application/json', JSON.stringify(publicDisplay()));
     case '/status':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
@@ -754,7 +774,33 @@ const STYLE = `
   .slim { font-size: 13px; color: var(--muted); padding: 6px 0 2px; }
   .hc-empty { font-size: 12px; color: var(--muted); padding: 6px 0 12px; }
 
-  .foot { max-width: 1280px; margin: 0 auto; padding: 4px 16px 24px; color: var(--muted); font-size: 12px; }
+  /* System status strip */
+  .sys { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .sys div { background: var(--surface-2); border: 1px solid var(--line); border-radius: 12px; padding: 9px 10px;
+             display: grid; grid-template-columns: 10px 1fr; column-gap: 8px; align-items: center; font-size: 13px; }
+  .sys i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); grid-row: span 2; }
+  .sys .ok i { background: var(--good); box-shadow: 0 0 6px rgba(74,222,128,.7); }
+  .sys .warn i { background: var(--warn); } .sys .bad i { background: var(--bad); }
+  .sys small { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Toasts instead of alert() boxes */
+  .toasts { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); display: grid; gap: 8px; z-index: 10;
+            pointer-events: none; width: max-content; max-width: calc(100vw - 32px); }
+  .toast { padding: 10px 16px; border-radius: 12px; background: var(--surface-2); border: 1px solid var(--line); font-size: 14px;
+           box-shadow: 0 8px 24px rgba(0,0,0,.45); animation: tin .25s ease; text-align: center; }
+  .toast.ok { border-color: rgba(74,222,128,.45); } .toast.err { border-color: rgba(248,113,113,.55); color: #fecaca; }
+  .toast.out { opacity: 0; transform: translateY(6px); transition: opacity .3s, transform .3s; }
+  @keyframes tin { from { opacity: 0; transform: translateY(8px); } }
+  .unlock-form { display: flex; gap: 8px; width: 100%; }
+  .unlock-form input { flex: 1; min-width: 0; background: var(--surface-2); color: var(--text); border: 1px solid var(--line);
+                       border-radius: 10px; padding: 8px 10px; font: inherit; }
+  .locked { flex-wrap: wrap; }
+  .lock-link { background: none; border: 0; color: var(--muted); font-size: 12px; cursor: pointer; text-decoration: underline; padding: 0; }
+  .kbd { font-size: 11px; color: var(--muted); }
+  .kbd b { font-weight: 600; border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; margin: 0 2px; }
+  @media (hover: none) { .kbd { display: none; } }
+
+  .foot { max-width: 1280px; margin: 0 auto; padding: 4px 16px 24px; color: var(--muted); font-size: 12px;
+          display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 
   .login { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
   .login form { width: 100%; max-width: 360px; background: var(--surface); border: 1px solid var(--line);
@@ -767,6 +813,10 @@ const STYLE = `
   .login button { background: var(--accent); color: #04110f; border: 0; border-radius: 10px; padding: 12px; font-weight: 700; cursor: pointer; }
   .err { color: var(--bad); }
 `;
+
+const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#07090c"/>
+  <rect x="9" y="18" width="20" height="26" rx="8" fill="#5eead4"/><rect x="35" y="18" width="20" height="26" rx="8" fill="#5eead4"/>
+  <rect x="14" y="23" width="6" height="5" rx="2" fill="#07090c"/><rect x="40" y="23" width="6" height="5" rx="2" fill="#07090c"/></svg>`;
 
 const LOGO = `<svg viewBox="0 0 26 26" fill="#5eead4" aria-hidden="true">
   <rect x="3" y="7" width="8" height="10" rx="3"/><rect x="15" y="7" width="8" height="10" rx="3"/>
@@ -790,6 +840,8 @@ function viewerPage() {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#07090c"><title>ARIA Cam</title>
+<link rel="manifest" id="manifest-link"><link rel="icon" href="/icon.svg"><link rel="apple-touch-icon" href="/icon.svg">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">
 <style>${STYLE}</style></head><body>
 <header class="top">
   <div class="brand"><div class="logo">${LOGO}</div><div><div class="name">ARIA</div><div class="tag">Home camera</div></div></div>
@@ -844,6 +896,15 @@ function viewerPage() {
     </nav>
 
     <div class="pane" data-pane="home" role="tabpanel">
+      <section class="card" aria-label="System">
+        <div class="card-head"><h2>System</h2><span class="mood" id="sys-sum">—</span></div>
+        <div class="sys">
+          <div id="sys-main"><i></i><span>Main camera</span><small>–</small></div>
+          <div id="sys-eye2"><i></i><span>Camera 2</span><small>–</small></div>
+          <div id="sys-display"><i></i><span>Display</span><small>–</small></div>
+          <div id="sys-tracker"><i></i><span>Face tracker</span><small>–</small></div>
+        </div>
+      </section>
       <section class="card" aria-label="ARIA">
         <div class="card-head"><h2>ARIA</h2><span class="mood" id="mood">—</span></div>
         <div class="robot-wrap" id="robot-wrap" hidden><canvas id="robot" width="128" height="64" aria-label="ARIA's face, live"></canvas></div>
@@ -872,7 +933,8 @@ function viewerPage() {
     <div class="pane" data-pane="display" role="tabpanel" hidden>
       <section class="card" aria-label="ARIA controls">
         <div class="card-head"><h2>Talk to ARIA</h2><span class="mood" id="disp-state">—</span></div>
-        <div class="locked" id="aria-locked"><span>Controls are locked.</span><button class="btn primary" id="unlock2">Unlock</button></div>
+        <div class="locked" id="aria-locked"><span>Controls are locked — enter the admin key.</span>
+          <form class="unlock-form"><input type="password" placeholder="Admin key" autocomplete="current-password" aria-label="Admin key"><button class="btn primary">Unlock</button></form></div>
         <div id="aria-controls" hidden>
           <div class="ctl"><div>Display<small>Turn the OLED screen on or off</small></div>
             <button class="switch" id="screen" role="switch" aria-checked="true" aria-label="Display on"></button></div>
@@ -911,7 +973,8 @@ function viewerPage() {
     <div class="pane" data-pane="camera" role="tabpanel" hidden>
       <section class="card" aria-label="Camera controls">
         <div class="card-head"><h2>Main camera</h2><span class="mood" id="cam-conn">—</span></div>
-        <div class="locked" id="locked"><span>Controls are locked.</span><button class="btn primary" id="unlock">Unlock</button></div>
+        <div class="locked" id="locked"><span>Controls are locked — enter the admin key.</span>
+          <form class="unlock-form"><input type="password" placeholder="Admin key" autocomplete="current-password" aria-label="Admin key"><button class="btn primary">Unlock</button></form></div>
         <div id="controls" hidden>
           <div class="off-note" id="cam-off-note" hidden>The main camera is offline, so these settings can't be changed until it reconnects.</div>
           <div class="ctl"><div>Camera<small id="priv-sub">On — streaming and detecting</small></div>
@@ -932,6 +995,7 @@ function viewerPage() {
           <div class="ctl wide"><div>Resolution<small>Higher = sharper but fewer fps</small></div>
             <div class="seg view-seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400</button><button data-v="1">640</button><button data-v="2">800</button><button data-v="3">720p</button><button data-v="4">1600</button></div></div>
           <div class="ctl keep"><div>Restart system<small>Camera + display, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
+          <div class="ctl keep"><div>Admin<small>This browser remembers the key</small></div><button class="lock-link" id="lock">Lock controls</button></div>
         </div>
         <div class="health" id="health"></div>
       </section>
@@ -961,12 +1025,23 @@ function viewerPage() {
   </aside>
   <div class="h-tip" id="h-tip" hidden></div>
 </main>
-<footer class="foot">ESP32-CAM · streamed via Render · <span id="viewers">0</span> watching</footer>
+<footer class="foot"><span>ESP32-CAM · streamed via Render · <span id="viewers">0</span> watching</span>
+  <span class="kbd">Keys: <b>1</b>–<b>4</b> tabs · <b>F</b> fullscreen · <b>S</b> snapshot</span></footer>
+<div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script>
   var key = new URLSearchParams(location.search).get('key');
   var q = '?key=' + encodeURIComponent(key);
   var $ = function (id) { return document.getElementById(id); };
+  $('manifest-link').href = '/manifest.webmanifest' + q;
+
+  // ── Toasts (instead of alert boxes) ──
+  function toast(text, kind) {
+    var t = document.createElement('div'); t.className = 'toast ' + (kind || ''); t.textContent = text;
+    $('toasts').append(t);
+    while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
+    setTimeout(function () { t.classList.add('out'); setTimeout(function () { t.remove(); }, 350); }, kind === 'err' ? 4000 : 1800);
+  }
   var img = $('feed'), stage = $('stage');
 
   // ── Video (MJPEG; falls back to polling snapshots) ──
@@ -1007,6 +1082,14 @@ function viewerPage() {
   });
   try { var savedTab = localStorage.getItem('aria-tab'); if (savedTab && document.querySelector('[data-pane="' + savedTab + '"]')) showTab(savedTab); } catch (e) {}
 
+  document.addEventListener('keydown', function (e) {
+    if (e.ctrlKey || e.metaKey || e.altKey || /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
+    var tabs = ['home', 'display', 'camera', 'health'];
+    if (e.key >= '1' && e.key <= '4') showTab(tabs[+e.key - 1]);
+    else if (e.key === 'f' || e.key === 'F') $('btn-fs').click();
+    else if (e.key === 's' || e.key === 'S') { $('btn-snap').click(); toast('Snapshot saved', 'ok'); }
+  });
+
   // ── Clock + camera status ──
   function pad(n) { return (n < 10 ? '0' : '') + n; }
   setInterval(function () {
@@ -1022,6 +1105,7 @@ function viewerPage() {
     try {
       var s = await (await fetch('/status' + q, { cache: 'no-store' })).json();
       $('viewers').textContent = s.viewers;
+      renderSys(s);
       if (s.online) {
         live.className = 'live on'; $('live-text').textContent = 'Live';
         off.hidden = true;
@@ -1039,6 +1123,22 @@ function viewerPage() {
       }
     } catch (e) { live.className = 'live off'; $('live-text').textContent = 'Unreachable'; }
   }
+  function sysCell(id, cls, text) { var el = $(id); el.className = cls; el.querySelector('small').textContent = text; }
+  function renderSys(s) {
+    var mainOk = s.main_connected && s.main_age !== null && s.main_age < 10000;
+    sysCell('sys-main', mainOk ? 'ok' : s.main_connected ? 'warn' : 'bad',
+      mainOk ? (s.source === 'main' ? (s.fps || 0).toFixed(1) + ' fps' : 'connected') :
+      s.main_connected ? 'connected, no frames' : s.main_age !== null ? 'offline · ' + ago(s.main_age) : 'offline');
+    var dispOk = s.display_age !== null && s.display_age < 10000;
+    var eye2Live = s.source === 'eye2' && s.online;
+    sysCell('sys-eye2', eye2Live ? 'ok' : dispOk ? '' : 'bad',
+      eye2Live ? 'live backup · ' + ago(s.eye2_age || 0) : dispOk ? 'standing by' : 'board offline');
+    sysCell('sys-display', dispOk ? 'ok' : 'bad', dispOk ? 'online' : s.display_age !== null ? 'offline · ' + ago(s.display_age) : 'not seen');
+    var trOk = s.tracker_age !== null && s.tracker_age < 5000;
+    sysCell('sys-tracker', trOk ? 'ok' : '', trOk ? 'running' : s.tracker_age !== null ? 'stopped · ' + ago(s.tracker_age) + ' ago' : 'not running');
+    var bad = [mainOk, dispOk].filter(function (x) { return !x; }).length;
+    $('sys-sum').textContent = !bad ? 'All good' : eye2Live ? 'Running on backup' : bad + ' offline';
+  }
   function ago(ms) {
     var s = Math.round(ms / 1000);
     return s < 60 ? s + 's' : s < 3600 ? Math.round(s / 60) + ' min' : Math.round(s / 3600) + ' h';
@@ -1053,6 +1153,8 @@ function viewerPage() {
                     shy: '☺️ Shy', dizzy: '😵 Dizzy', roll: '🙄 Rolling its eyes' };
   var meta = null, metaAt = 0, shown = [], handShown = null;
   var es = new EventSource('/events' + q);
+  es.onerror = function () { if (es.readyState !== 1) { $('live').className = 'live off'; $('live-text').textContent = 'Reconnecting…'; } };
+  es.onopen = function () { refresh(); };
   es.onmessage = function (e) { try { meta = JSON.parse(e.data); metaAt = Date.now(); render(); gesturePop(); } catch (x) {} };
 
   // A new hand sign: pop its emoji over the video (only ones made in the last few seconds,
@@ -1124,6 +1226,12 @@ function viewerPage() {
   setInterval(render, 1000);
 
   // ── Activity timeline ──
+  function rel(t) {
+    var s = Math.round((Date.now() - t) / 1000);
+    return s < 45 ? 'just now' : s < 3600 ? Math.round(s / 60) + ' min ago'
+      : s < 86400 ? new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : new Date(t).toLocaleDateString();
+  }
+  setInterval(function () { document.querySelectorAll('#log time[data-t]').forEach(function (x) { x.textContent = rel(+x.dataset.t); }); }, 20000);
   var LOG_MAX = 20;
   function addLog(e) {
     var list = $('log'), empty = list.querySelector('.empty');
@@ -1133,7 +1241,8 @@ function viewerPage() {
     var dot = document.createElement('i');
     var text = document.createElement('span'); text.textContent = e.text;
     var t = document.createElement('time');
-    t.textContent = new Date(e.t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    t.dataset.t = e.t; t.title = new Date(e.t).toLocaleString();
+    t.textContent = rel(e.t);
     li.append(dot, text, t);
     list.prepend(li);
     while (list.children.length > LOG_MAX) list.lastChild.remove();
@@ -1153,7 +1262,7 @@ function viewerPage() {
     var camOff = !cam;
     $('cam-off-note').hidden = !camOff;
     $('controls').classList.toggle('dim', camOff);
-    $('controls').querySelectorAll('button, select').forEach(function (el) { if (el.id !== 'restart') el.disabled = camOff; });
+    $('controls').querySelectorAll('button, select').forEach(function (el) { if (!el.closest('.keep')) el.disabled = camOff; });
     var ps = $('privacy-screen');
     ps.hidden = !(cam && cam.privacy);
     $('hud-night').hidden = !(cam && cam.night && !cam.privacy);
@@ -1200,26 +1309,34 @@ function viewerPage() {
       var o = document.createElement('option'); o.value = hr; o.textContent = pad(hr) + ':00'; $(id).append(o);
     });
   }
+  var SENT = { message: 'Message sent to the display ✓', emotion: 'ARIA will act it out ✓', view: 'Display updated ✓',
+               screen: 'Display switched ✓', restart_all: 'Restarting camera + display…', zoom2: 'Camera 2 zoom set ✓',
+               zones: 'Detection zones saved ✓', privhours: 'Private hours saved ✓' };
   async function send(cmd, args, extra) {
     try {
       var body = { cmd: cmd, args: args || [] };
       for (var k in (extra || {})) body[k] = extra[k];
       var r = await fetch('/cmd', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
                                     body: JSON.stringify(body) });
-      if (r.status === 401) { lock(); alert('That admin key was not accepted.'); }
-      else if (r.status === 503) alert('The camera is not connected right now.');
+      if (r.status === 401) { lock(); toast('That admin key was not accepted', 'err'); }
+      else if (r.status === 503) toast('The main camera is not connected right now', 'err');
+      else if (r.status >= 400) toast('Not accepted: ' + (await r.text()), 'err');
+      else toast(SENT[cmd] || 'Sent ✓', 'ok');
       return r.status;
-    } catch (e) { alert('Could not reach the relay.'); return 0; }
+    } catch (e) { toast('Could not reach the server', 'err'); return 0; }
   }
   function lock() { adminKey = null; try { localStorage.removeItem('aria-admin'); } catch (e) {} renderCam(); }
-  $('unlock2').onclick = function () { $('unlock').onclick(); };
-  $('unlock').onclick = function () {
-    var k = prompt('Admin key (the camera key, unless you set ADMIN_KEY on Render):');
-    if (!k) return;
-    adminKey = k.trim();
-    try { localStorage.setItem('aria-admin', adminKey); } catch (e) {}
-    renderCam();
-  };
+  document.querySelectorAll('.unlock-form').forEach(function (f) {
+    f.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var k = f.querySelector('input').value.trim();
+      if (!k) return;
+      adminKey = k; f.querySelector('input').value = '';
+      try { localStorage.setItem('aria-admin', adminKey); } catch (x) {}
+      renderCam(); toast('Controls unlocked', 'ok');
+    });
+  });
+  $('lock').onclick = function () { lock(); toast('Controls locked', 'ok'); };
   $('priv').onclick = function () {
     var cameraOn = $('priv').getAttribute('aria-checked') !== 'true';
     $('priv').setAttribute('aria-checked', String(cameraOn));   // optimistic; the next state report confirms
@@ -1350,7 +1467,7 @@ function viewerPage() {
   $('zone-cancel').onclick = function () { zoneMode(false); };
   $('zone-all').onclick = function () { zoneEdit = zoneEdit.map(function () { return true; }); drawZones(); };
   $('zone-save').onclick = async function () {
-    if (!zoneEdit.some(Boolean)) { alert('Leave at least one area watched.'); return; }
+    if (!zoneEdit.some(Boolean)) { toast('Leave at least one area watched', 'err'); return; }
     if (await send('zones', [zonesToHex(zoneEdit)]) === 202) zoneMode(false);
   };
   window.addEventListener('resize', function () { if (zoneEdit) placeZones(); });
