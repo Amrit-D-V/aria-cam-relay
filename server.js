@@ -1022,7 +1022,7 @@ function viewerPage() {
           <div class="ctl"><div>Detection zones<small id="zone-sub">Watching the whole picture</small></div>
             <button class="btn" id="zone-edit">Edit</button></div>
           <div class="ctl wide"><div>Zoom<small id="zoom-sub">Sensor zoom: more detail, not bigger pixels</small></div>
-            <div class="seg view-seg" data-cmd="zoom"><button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button><button data-v="40">4×</button></div></div>
+            <div class="seg view-seg" data-cmd="zoom"><button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="25">2.5×</button><button data-v="30">3×</button></div></div>
           <div class="ctl wide"><div>Resolution<small>Higher = sharper but fewer fps</small></div>
             <div class="seg view-seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400</button><button data-v="1">640</button><button data-v="2">800</button><button data-v="3">720p</button><button data-v="4">1600</button></div></div>
           <div class="ctl keep"><div>Restart system<small>Camera + display, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
