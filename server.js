@@ -490,6 +490,17 @@ function wsFrame(opcode, payload) {
   return Buffer.concat([head, payload]);
 }
 
+// A camera that went away without closing its socket (power cut, WiFi drop)
+// left the relay showing it "connected" with stale settings. No frame and no
+// state for 30 s = gone: drop the socket so the page tells the truth.
+let camLastHeard = 0;
+setInterval(() => {
+  if (camSocket && !camSocket.destroyed && Date.now() - camLastHeard > 30000) {
+    console.log('camera silent for 30 s — dropping its socket');
+    camSocket.destroy();
+  }
+}, 5000);
+
 function notifyCamera() {
   if (camSocket && !camSocket.destroyed) camSocket.write(wsFrame(0x1, Buffer.from(String(viewerCount()))));
 }
@@ -514,7 +525,9 @@ server.on('upgrade', (req, socket) => {
   let buf = Buffer.alloc(0);
   let parts = [];
   let partsLen = 0;
+  camLastHeard = Date.now();
   socket.on('data', (chunk) => {
+    camLastHeard = Date.now();
     buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
     for (;;) {
       if (buf.length < 2) return;
