@@ -2,23 +2,17 @@
 // home router, so nothing on the internet can reach it directly); viewers
 // on any phone/browser watch the latest frames as an MJPEG stream.
 //
-//   GET  /ws         camera → relay WebSocket (header X-Cam-Key: $CAM_KEY).
-//                    Binary messages are JPEG frames; the relay sends the
-//                    live viewer count as a text message every second so the
-//                    camera can slow down when nobody is watching
-//   POST /push       older one-request-per-frame uplink (same key, body: JPEG,
-//                    replies with the viewer count). Much slower over long
-//                    distances: every frame waits a full round trip.
-//                    ?src=eye2 = the display's backup camera (OV7670) while
-//                    the main one is down; ignored while the main one sends
+//   POST /push       the camera (the OV7670 on the display board) → relay
+//                    (header X-Cam-Key: $CAM_KEY, body: JPEG); replies with
+//                    the viewer count. ?src=eye2 is accepted and ignored.
 //   POST /meta       tracker → relay  (header X-Cam-Key, JSON body): face boxes,
 //                    names, emotions and the robot's mood, drawn over the video
 //   GET  /events     Server-Sent Events: /meta updates as messages, plus named
 //                    "log" events for the activity timeline (?key=)
 //   GET  /?key=      viewer page      (key: $VIEW_KEY)
-//   POST /cmd        page → camera command (header X-Admin-Key: $ADMIN_KEY,
-//                    else $CAM_KEY; JSON {cmd, args}) — LED, night mode,
-//                    privacy, resolution, restart
+//   POST /cmd        page → display command (header X-Admin-Key: $ADMIN_KEY,
+//                    else $CAM_KEY; JSON {cmd, args}) — screen, message,
+//                    emotion, view, camera zoom, restart
 //   GET  /display    the OLED display's pending state (?key=): screen on/off,
 //                    latest admin message, latest emotion request — it polls
 //                    this every 2 s (admin sets them via /cmd: screen, message,
@@ -26,9 +20,9 @@
 //   GET  /stream     MJPEG stream     (?key=)
 //   GET  /snapshot   latest JPEG      (?key=)
 //   GET  /status     JSON             (?key=)
-//   GET  /health     camera health history (?key=): fps / WiFi / memory samples
-//                    every 30 s for 24 h, and restarts with their reasons. Kept
-//                    in memory, so it starts over when Render restarts the relay
+//   GET  /health     camera health history (?key=): online / fps samples every
+//                    30 s for 24 h. Kept in memory, so it starts over when
+//                    Render restarts the relay
 //   GET  /healthz    Render health check
 //
 // Zero dependencies — Node's http module only.
@@ -42,7 +36,7 @@ const CAM_KEY = process.env.CAM_KEY || '';
 const VIEW_KEY = process.env.VIEW_KEY || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || CAM_KEY;   // controls; defaults to the camera's key
 const MAX_FRAME_BYTES = 512 * 1024;
-const OFFLINE_AFTER_MS = 10000;   // no frame for this long → camera offline
+const OFFLINE_AFTER_MS = 30000;   // no frame for this long → camera offline (it sends one every few seconds)
 const POLL_VIEWER_MS = 5000;      // snapshot-polling viewers count for this long
 
 if (!CAM_KEY || !VIEW_KEY) {
@@ -60,11 +54,6 @@ let latestMeta = null;            // JSON string of the last /meta
 const metaSubscribers = new Set();
 const frameTimes = [];            // arrival times of recent frames, for the fps readout
 let frameSize = null;             // {w, h} from the latest JPEG's header
-// Which camera the frames come from: 'main' (the ESP32-CAM over /ws) or
-// 'eye2' (the display's OV7670, POSTed to /push?src=eye2 while the main
-// camera is down). The main camera wins whenever it's sending.
-let frameSource = 'main';
-let mainFrameAt = 0;
 // When each part of the system was last heard from, for the page's status strip
 const seen = { eye2: 0, display: 0, tracker: 0 };
 // What the OLED shows, sent with each display poll (POST /display): 128x64,
@@ -77,33 +66,16 @@ const LOG_MAX = 30;
 const activity = [];              // newest first: {t, kind, text}
 const presence = { here: false, lastFace: 0, who: null, sleeping: null };
 
-// Camera state reported over its WebSocket every ~2 s (settings + health).
-let camState = null;
-
-// Health history for the page's charts: a sample every 30 s for 24 h, plus
-// camera restarts (seen as its uptime going backwards) with the reason it
-// gave. In memory only — a relay restart starts it over.
+// Health history for the page's charts: a sample every 30 s for 24 h. In
+// memory only — a relay restart starts it over.
 const HEALTH_EVERY_MS = 30000;
 const HEALTH_KEEP = 24 * 3600 * 1000 / HEALTH_EVERY_MS;
-const healthSamples = [];         // {t, on, fps, rssi, heap}
-const restarts = [];              // newest first: {t, reason}
-let lastUp = null;
+const healthSamples = [];         // {t, on, fps}
 let lastGesture = 0;
-
-function noteCamUptime(m) {
-  if (typeof m.up !== 'number') return;
-  if ((lastUp !== null && m.up < lastUp) || (lastUp === null && m.up < 60)) {
-    restarts.unshift({ t: Date.now() - m.up * 1000, reason: String(m.reset || 'unknown') });
-    if (restarts.length > 50) restarts.pop();
-    logEvent('restart', `Camera restarted (${m.reset || 'unknown'})`);
-  }
-  lastUp = m.up;
-}
 
 setInterval(() => {
   const on = status().online;
-  healthSamples.push({ t: Date.now(), on, fps: on ? Math.round(fps() * 10) / 10 : null,
-                       rssi: on && camState ? camState.rssi : null, heap: on && camState ? camState.heap_kb : null });
+  healthSamples.push({ t: Date.now(), on, fps: on ? Math.round(fps() * 10) / 10 : null });
   if (healthSamples.length > HEALTH_KEEP) healthSamples.shift();
 }, HEALTH_EVERY_MS);
 
@@ -120,35 +92,6 @@ function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
   for (const s of metaSubscribers) s.write(line);
 }
-
-function handleCamText(text) {
-  let m;
-  try { m = JSON.parse(text); } catch { return; }
-  if (m.t === 'state') {
-    delete m.t;
-    const wasPrivate = camState && camState.privacy;
-    camState = m;
-    noteCamUptime(m);
-    broadcast('cam', camState);
-    if (camState.privacy && !wasPrivate) logEvent('privacy', 'Privacy mode on');
-    if (!camState.privacy && wasPrivate) logEvent('privacy', 'Privacy mode off');
-  } else if (m.t === 'motion') {
-    logEvent('motion', 'Motion detected');
-  }
-}
-
-const COMMANDS = {                // name → argument validator
-  led: (a) => /^\d{1,3}$/.test(a[0]) && +a[0] <= 100,
-  ledauto: (a) => /^[01]$/.test(a[0]),
-  night: (a) => ['auto', 'on', 'off'].includes(a[0]),
-  privacy: (a) => /^[01]$/.test(a[0]),
-  privhours: (a) => a.length === 2 && a.every((h) => /^\d{1,2}$/.test(h) && +h < 24),
-  profile: (a) => ['auto', '0', '1', '2', '3', '4'].includes(a[0]),
-  sensitivity: (a) => ['low', 'medium', 'high'].includes(a[0]),
-  zones: (a) => /^[0-9a-f]{12}$/.test(a[0]) && a[0] !== '000000000000',
-  zoom: (a) => /^\d{2}$/.test(a[0]) && +a[0] >= 10 && +a[0] <= 40,     // ×10: 10 = 1×, 40 = 4×
-  restart: (a) => a.length === 0,
-};
 
 function publicDisplay() {
   const m = displayState.msg;
@@ -180,10 +123,9 @@ function handleCmd(req, res) {
       broadcast('display', publicDisplay());
       return send(res, 202, 'text/plain', 'queued');
     }
-    if (cmd === 'restart_all') {       // camera now; the display picks it up on its next poll (≤2 s)
-      if (camSocket && !camSocket.destroyed) camSocket.write(wsFrame(0x1, Buffer.from('restart')));
+    if (cmd === 'restart_all') {       // the display (and its camera) picks it up on its next poll (≤2 s)
       displayState.restart = Date.now();
-      logEvent('privacy', 'System restart (camera + display)');
+      logEvent('privacy', 'System restart');
       return send(res, 202, 'text/plain', 'restarting');
     }
     if (cmd === 'view') {              // what the OLED shows: auto rotation, one screen, or camera 2 live
@@ -205,10 +147,7 @@ function handleCmd(req, res) {
       broadcast('display', publicDisplay());
       return send(res, 202, 'text/plain', 'queued');
     }
-    if (!COMMANDS[cmd] || !COMMANDS[cmd](args)) return send(res, 400, 'text/plain', 'unknown command or bad arguments');
-    if (!camSocket || camSocket.destroyed) return send(res, 503, 'text/plain', 'camera not connected');
-    camSocket.write(wsFrame(0x1, Buffer.from([cmd, ...args].join(' '))));
-    send(res, 202, 'text/plain', 'sent');
+    send(res, 400, 'text/plain', 'unknown command');
   });
 }
 
@@ -304,10 +243,8 @@ function handlePush(req, res) {
   });
   req.on('end', () => {
     if (res.writableEnded) return;
-    const src = new URL(req.url, 'http://x').searchParams.get('src') === 'eye2' ? 'eye2' : 'main';
-    if (src === 'eye2') seen.eye2 = Date.now();
-    if (src === 'eye2' && Date.now() - mainFrameAt < 5000) return send(res, 200, 'text/plain', String(viewerCount()));
-    if (!acceptFrame(Buffer.concat(chunks), src)) return send(res, 400, 'text/plain', 'not a JPEG');
+    seen.eye2 = Date.now();
+    if (!acceptFrame(Buffer.concat(chunks))) return send(res, 400, 'text/plain', 'not a JPEG');
     send(res, 200, 'text/plain', String(viewerCount()));
   });
 }
@@ -365,7 +302,6 @@ function handleEvents(req, res) {
   res.write(': connected\n\n');          // flush headers now — Node holds them until the first write
   if (latestMeta) res.write(`data: ${latestMeta}\n\n`);
   for (const e of [...activity].reverse()) res.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
-  if (camState) res.write(`event: cam\ndata: ${JSON.stringify(camState)}\n\n`);
   res.write(`event: display\ndata: ${JSON.stringify(publicDisplay())}\n\n`);
   if (oledFrame && Date.now() - seen.display < 10000) res.write(`event: oled\ndata: ${JSON.stringify({ f: oledFrame })}\n\n`);
   metaSubscribers.add(res);
@@ -373,13 +309,8 @@ function handleEvents(req, res) {
   res.on('close', () => { clearInterval(ping); metaSubscribers.delete(res); });
 }
 
-function acceptFrame(frame, src = 'main') {
+function acceptFrame(frame) {
   if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) return false;
-  if (src === 'main') mainFrameAt = Date.now();
-  if (src !== frameSource) {
-    frameSource = src;
-    logEvent('backup', src === 'eye2' ? 'Main camera down — showing the backup eye' : 'Main camera back');
-  }
   latestFrame = frame;
   latestAt = Date.now();
   frameTimes.push(latestAt);
@@ -400,7 +331,6 @@ function handleStream(req, res) {
   });
   if (latestFrame) writeFrame(res, latestFrame);
   streamViewers.add(res);
-  notifyCamera();   // speed the camera up now, not at the next tick
   // res (not req): req 'close' fires once the request body is consumed, not on disconnect
   const drop = () => streamViewers.delete(res);
   res.on('close', drop);
@@ -415,11 +345,9 @@ function ages() {
 
 function status() {
   const age = latestAt ? Date.now() - latestAt : null;
-  const limit = frameSource === 'eye2' ? 30000 : OFFLINE_AFTER_MS;   // the backup eye sends a frame every few seconds
-  return { online: age !== null && age < limit, lastFrameAgeMs: age, viewers: viewerCount(),
+  return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
            fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
-           source: frameSource, main_connected: !!(camSocket && !camSocket.destroyed),
-           main_age: mainFrameAt ? Date.now() - mainFrameAt : null, ...ages() };
+           ...ages() };
 }
 
 const server = http.createServer((req, res) => {
@@ -470,94 +398,10 @@ const server = http.createServer((req, res) => {
       return send(res, 200, 'application/json', JSON.stringify(status()));
     case '/health':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
-      return send(res, 200, 'application/json', JSON.stringify({ every: HEALTH_EVERY_MS, samples: healthSamples, restarts }));
+      return send(res, 200, 'application/json', JSON.stringify({ every: HEALTH_EVERY_MS, samples: healthSamples }));
     default:
       return send(res, 404, 'text/plain', 'not found');
   }
-});
-
-// ── Camera WebSocket uplink ─────────────────────────────────────────────
-// Minimal RFC 6455 server for the single camera connection, so the relay
-// stays dependency-free.
-const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-let camSocket = null;
-
-function wsFrame(opcode, payload) {
-  const n = payload.length;
-  const head = n < 126 ? Buffer.from([0x80 | opcode, n])
-    : n < 65536 ? Buffer.from([0x80 | opcode, 126, n >> 8, n & 0xff])
-    : (() => { const h = Buffer.alloc(10); h[0] = 0x80 | opcode; h[1] = 127; h.writeBigUInt64BE(BigInt(n), 2); return h; })();
-  return Buffer.concat([head, payload]);
-}
-
-// A camera that went away without closing its socket (power cut, WiFi drop)
-// left the relay showing it "connected" with stale settings. No frame and no
-// state for 30 s = gone: drop the socket so the page tells the truth.
-let camLastHeard = 0;
-setInterval(() => {
-  if (camSocket && !camSocket.destroyed && Date.now() - camLastHeard > 30000) {
-    console.log('camera silent for 30 s — dropping its socket');
-    camSocket.destroy();
-  }
-}, 5000);
-
-function notifyCamera() {
-  if (camSocket && !camSocket.destroyed) camSocket.write(wsFrame(0x1, Buffer.from(String(viewerCount()))));
-}
-setInterval(notifyCamera, 1000);
-
-server.on('upgrade', (req, socket) => {
-  const url = new URL(req.url, 'http://x');
-  if (url.pathname !== '/ws' || String(req.headers.upgrade).toLowerCase() !== 'websocket' ||
-      !req.headers['sec-websocket-key'] || !keyMatches(req.headers['x-cam-key'], CAM_KEY)) {
-    socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-    return;
-  }
-  const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + WS_GUID).digest('base64');
-  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
-               `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
-  socket.setNoDelay(true);
-  if (camSocket) camSocket.destroy();   // newest camera connection wins
-  camSocket = socket;
-  console.log('camera connected');
-  notifyCamera();
-
-  let buf = Buffer.alloc(0);
-  let parts = [];
-  let partsLen = 0;
-  camLastHeard = Date.now();
-  socket.on('data', (chunk) => {
-    camLastHeard = Date.now();
-    buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
-    for (;;) {
-      if (buf.length < 2) return;
-      const fin = buf[0] & 0x80, opcode = buf[0] & 0x0f, masked = buf[1] & 0x80;
-      let len = buf[1] & 0x7f, off = 2;
-      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
-      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
-      if (partsLen + len > MAX_FRAME_BYTES) { socket.destroy(); return; }
-      const maskAt = off;
-      if (masked) off += 4;
-      if (buf.length < off + len) return;   // wait for the rest of this message
-      const payload = Buffer.from(buf.subarray(off, off + len));
-      if (masked) for (let i = 0; i < len; i++) payload[i] ^= buf[maskAt + (i & 3)];
-      buf = buf.subarray(off + len);
-
-      if (opcode === 0x8) { socket.end(wsFrame(0x8, Buffer.alloc(0))); return; }   // close
-      if (opcode === 0x9) { socket.write(wsFrame(0xA, payload)); continue; }        // ping → pong
-      if (opcode === 0x1 && fin) { handleCamText(payload.toString('utf8')); continue; }   // state / motion
-      if (opcode === 0x2 || opcode === 0x0) {                                        // binary / continuation
-        parts.push(payload);
-        partsLen += len;
-        if (fin) { acceptFrame(Buffer.concat(parts)); parts = []; partsLen = 0; }
-      }
-    }
-  });
-  socket.on('error', () => socket.destroy());
-  socket.on('close', () => {
-    if (camSocket === socket) { camSocket = null; camState = null; broadcast('cam', null); }
-    console.log('camera disconnected');
-  });
 });
 
 // Keep idle HTTP connections longer than Node's 5 s default: the display
@@ -706,14 +550,6 @@ const STYLE = `
   .health b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
   .locked { color: var(--muted); font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   .log li.motion i { background: #fb923c; } .log li.privacy i { background: var(--violet); }
-  .privacy-screen { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px;
-                    background: repeating-linear-gradient(135deg, #0b0e13 0 14px, #0e1218 14px 28px); color: var(--muted); text-align: center; }
-  .privacy-screen[hidden] { display: none; }
-  .privacy-screen svg { width: 44px; height: 44px; color: var(--violet); }
-  .privacy-screen b { color: var(--text); font-size: 17px; }
-  .chip.night { color: #c4b5fd; }
-  .chip.backup { color: #fbbf24; border-color: rgba(251,191,36,.4); }
-  .log li.backup i { background: var(--warn); }
 
   .view-seg { display: flex; flex-wrap: wrap; width: 100%; margin-top: 2px; }
   .view-seg button { flex: 1 1 auto; }
@@ -754,18 +590,6 @@ const STYLE = `
   @keyframes gring { from { transform: scale(.4); opacity: .9; } to { transform: scale(4.5); opacity: 0; } }
   @media (prefers-reduced-motion: reduce) { .g-pop.go .e, .g-pop.go .t { animation: gcap 1.9s ease both; } .g-pop.go .ring { animation: none; } }
 
-  /* Detection zones editor: an 8x6 grid over the video */
-  .zones { position: absolute; display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(6, 1fr);
-           touch-action: none; user-select: none; -webkit-user-select: none; }
-  .zones[hidden] { display: none; }
-  .zones button { border: 1px solid rgba(94,234,212,.35); background: transparent; padding: 0; cursor: pointer; }
-  .zones button.off { background: repeating-linear-gradient(135deg, rgba(248,113,113,.55) 0 6px, rgba(7,9,12,.7) 6px 12px);
-                      border-color: rgba(248,113,113,.4); }
-  .zone-bar { position: absolute; left: 12px; right: 12px; bottom: 12px; display: flex; flex-wrap: wrap; gap: 8px;
-              align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 12px;
-              background: rgba(7,9,12,.8); border: 1px solid var(--line); font-size: 13px; }
-  .zone-bar[hidden] { display: none; }
-  .zone-bar span { color: var(--muted); }
 
   /* Health charts */
   .hc { margin-top: 12px; }
@@ -786,13 +610,6 @@ const STYLE = `
   .h-tip { position: fixed; pointer-events: none; z-index: 5; padding: 6px 9px; border-radius: 8px; font-size: 12px;
            background: var(--surface-2); border: 1px solid var(--line); box-shadow: 0 4px 16px rgba(0,0,0,.4); white-space: nowrap; }
   .h-tip[hidden] { display: none; }
-  .rs-list { list-style: none; margin: 10px 0 0; padding: 0; font-size: 13px; }
-  .rs-list li { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--line); }
-  .rs-list li:last-child { border-bottom: 0; }
-  .rs-list time { color: var(--muted); font-variant-numeric: tabular-nums; }
-  .rs-list .why { display: inline-flex; align-items: center; gap: 6px; }
-  .rs-list .why::before { content: "⚠"; color: var(--warn); }
-  .rs-list .why.ok::before { content: "↻"; color: var(--muted); }
   .note { font-size: 11px; color: var(--muted); margin-top: 8px; }
 
   /* Tabs: the side panel shows one group at a time instead of one long column */
@@ -811,15 +628,13 @@ const STYLE = `
     .side { position: sticky; top: 12px; max-height: calc(100vh - 128px); overflow-y: auto; scrollbar-width: thin; }
   }
   @media (max-width: 900px) { .tabs { top: 0; margin: 0 -16px; border-radius: 0; border-left: 0; border-right: 0; } }
-  .off-note { font-size: 12px; color: var(--warn); background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.25);
-              border-radius: 10px; padding: 8px 10px; margin-bottom: 6px; }
-  #controls.dim .ctl:not(.keep) { opacity: .45; }
   button:disabled { cursor: not-allowed; }
   .slim { font-size: 13px; color: var(--muted); padding: 6px 0 2px; }
   .hc-empty { font-size: 12px; color: var(--muted); padding: 6px 0 12px; }
 
   /* System status strip */
   .sys { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .sys.three > div:first-child { grid-column: 1 / -1; }   /* the camera gets the full width */
   .sys div { background: var(--surface-2); border: 1px solid var(--line); border-radius: 12px; padding: 9px 10px;
              display: grid; grid-template-columns: 10px 1fr; column-gap: 8px; align-items: center; font-size: 13px; }
   .sys i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); grid-row: span 2; }
@@ -898,11 +713,7 @@ function viewerPage() {
       <img id="feed" alt="Live camera feed">
       <canvas id="overlay" aria-hidden="true"></canvas>
       <div class="hud tl"><span class="rec"><i></i>LIVE</span><span class="chip" id="hud-time"></span></div>
-      <div class="hud tr"><span class="chip backup" id="hud-src" hidden>BACKUP · EYE 2</span><span class="chip night" id="hud-night" hidden>☾ Night</span><span class="chip" id="hud-res">—</span><span class="chip" id="hud-fps">— fps</span></div>
-      <div class="privacy-screen" id="privacy-screen" hidden>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
-        <b>Privacy mode on</b><span id="privacy-text">The camera isn&rsquo;t streaming or detecting.</span>
-      </div>
+      <div class="hud tr"><span class="chip" id="hud-res">—</span><span class="chip" id="hud-fps">— fps</span></div>
       <div class="offline" id="offline" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
           <path d="M3 3l18 18M10.6 6H15a2 2 0 0 1 2 2v2l4-3v10M17 17H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2"/></svg>
@@ -910,12 +721,6 @@ function viewerPage() {
       </div>
       <div class="g-pop" id="g-pop" hidden aria-live="polite"><i class="ring"></i><i class="ring"></i>
         <span class="e" id="g-emoji"></span><span class="t" id="g-text"></span></div>
-      <div class="zones" id="zones" hidden aria-label="Detection zones: tap cells to watch or ignore them"></div>
-      <div class="zone-bar" id="zone-bar" hidden>
-        <span id="zone-info">Tap cells to ignore them</span>
-        <span><button class="btn" id="zone-all">Watch all</button> <button class="btn" id="zone-cancel">Cancel</button>
-          <button class="btn primary" id="zone-save">Save</button></span>
-      </div>
       <div class="controls" id="stage-controls">
         <button class="icon" id="btn-overlay" aria-pressed="true" title="Face boxes" aria-label="Toggle face boxes">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
@@ -942,9 +747,8 @@ function viewerPage() {
     <div class="pane" data-pane="home" role="tabpanel">
       <section class="card" aria-label="System">
         <div class="card-head"><h2>System</h2><span class="mood" id="sys-sum">—</span></div>
-        <div class="sys">
-          <div id="sys-main"><i></i><span>Main camera</span><small>–</small></div>
-          <div id="sys-eye2"><i></i><span>Camera 2</span><small>–</small></div>
+        <div class="sys three">
+          <div id="sys-cam"><i></i><span>Camera</span><small>–</small></div>
           <div id="sys-display"><i></i><span>Display</span><small>–</small></div>
           <div id="sys-tracker"><i></i><span>Face tracker</span><small>–</small></div>
         </div>
@@ -1015,41 +819,18 @@ function viewerPage() {
     </div>
 
     <div class="pane" data-pane="camera" role="tabpanel" hidden>
-      <section class="card" aria-label="Camera controls">
-        <div class="card-head"><h2>Main camera</h2><span class="mood" id="cam-conn">—</span></div>
+      <section class="card" aria-label="Camera">
+        <div class="card-head"><h2>Camera</h2><span class="mood" id="cam-state">—</span></div>
+        <div class="slim">The OV7670 on the display board: a picture every few seconds here, live on the OLED.</div>
         <div class="locked" id="locked"><span>Controls are locked — enter the admin key.</span>
           <form class="unlock-form"><input type="password" placeholder="Admin key" autocomplete="current-password" aria-label="Admin key"><button class="btn primary">Unlock</button></form></div>
         <div id="controls" hidden>
-          <div class="off-note" id="cam-off-note" hidden>The main camera is offline, so these settings can't be changed until it reconnects.</div>
-          <div class="ctl"><div>Camera<small id="priv-sub">On — streaming and detecting</small></div>
-            <button class="switch" id="priv" role="switch" aria-checked="true" aria-label="Camera on"></button></div>
-          <div class="ctl"><div>Private hours<small>Daily</small></div>
-            <div class="hours"><select id="ph-s" aria-label="From"></select>–<select id="ph-e" aria-label="To"></select>
-              <button class="btn" id="ph-save">Set</button></div></div>
-          <div class="ctl"><div>Night mode<small id="night-sub">Black &amp; white in the dark</small></div>
-            <div class="seg" data-cmd="night"><button data-v="auto">Auto</button><button data-v="on">On</button><button data-v="off">Off</button></div></div>
-          <div class="ctl"><div>Light<small>Flash LED</small></div>
-            <div class="seg" data-cmd="light"><button data-v="off">Off</button><button data-v="auto">Auto</button><button data-v="30">Low</button><button data-v="100">High</button></div></div>
-          <div class="ctl"><div>Motion alerts<small>Low ignores curtains &amp; plants moving</small></div>
-            <div class="seg" data-cmd="sensitivity"><button data-v="low">Low</button><button data-v="medium">Med</button><button data-v="high">High</button></div></div>
-          <div class="ctl"><div>Detection zones<small id="zone-sub">Watching the whole picture</small></div>
-            <button class="btn" id="zone-edit">Edit</button></div>
-          <div class="ctl wide"><div>Zoom<small id="zoom-sub">Sensor zoom: more detail, not bigger pixels</small></div>
-            <div class="seg view-seg" data-cmd="zoom"><button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="25">2.5×</button><button data-v="30">3×</button></div></div>
-          <div class="ctl wide"><div>Resolution<small>Higher = sharper but fewer fps</small></div>
-            <div class="seg view-seg" data-cmd="profile"><button data-v="auto">Auto</button><button data-v="0">400</button><button data-v="1">640</button><button data-v="2">800</button><button data-v="3">720p</button><button data-v="4">1600</button></div></div>
-          <div class="ctl keep"><div>Restart system<small>Camera + display, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
+          <div class="sub-h">Zoom</div>
+          <div class="seg view-seg" id="zoom2-seg">
+            <button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button>
+          </div>
+          <div class="ctl keep" style="margin-top:8px"><div>Restart system<small>Display + camera, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
           <div class="ctl keep"><div>Admin<small>This browser remembers the key</small></div><button class="lock-link" id="lock">Lock controls</button></div>
-        </div>
-        <div class="health" id="health"></div>
-      </section>
-
-      <section class="card" aria-label="Backup camera">
-        <div class="card-head"><h2>Camera 2 · backup eye</h2><span class="mood" id="cam2-state">—</span></div>
-        <div class="slim">Takes over on the display and this page when the main camera is down.</div>
-        <div class="sub-h">Zoom</div>
-        <div class="seg view-seg" id="zoom2-seg">
-          <button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button>
         </div>
       </section>
     </div>
@@ -1059,17 +840,16 @@ function viewerPage() {
         <div class="card-head"><h2>Health</h2>
           <div class="seg" id="h-range"><button data-h="1">1h</button><button data-h="6" aria-pressed="true">6h</button><button data-h="24">24h</button></div></div>
         <div class="h-sum">
-          <div>Online<b id="h-online">–</b></div><div>Restarts<b id="h-rcount">–</b></div><div>Avg fps<b id="h-fps">–</b></div>
+          <div>Online<b id="h-online">–</b></div><div>Frames now<b id="h-now">–</b></div><div>Avg fps<b id="h-fps">–</b></div>
         </div>
         <div id="h-charts"></div>
-        <ol class="rs-list" id="h-restarts"></ol>
         <div class="note" id="h-note"></div>
       </section>
     </div>
   </aside>
   <div class="h-tip" id="h-tip" hidden></div>
 </main>
-<footer class="foot"><span>ESP32-CAM · streamed via Render · <span id="viewers">0</span> watching</span>
+<footer class="foot"><span>ARIA camera (OV7670) · via Render · <span id="viewers">0</span> watching</span>
   <span class="kbd">Keys: <b>1</b>–<b>4</b> tabs · <b>F</b> fullscreen · <b>S</b> snapshot</span></footer>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
@@ -1143,7 +923,6 @@ function viewerPage() {
       pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   }, 1000);
 
-  var backupLive = false;                      // the display's OV7670 is standing in for the main camera
   async function refresh() {
     var live = $('live'), off = $('offline');
     try {
@@ -1155,12 +934,10 @@ function viewerPage() {
         off.hidden = true;
         $('hud-fps').textContent = (s.fps || 0).toFixed(1) + ' fps';
         if (s.width) $('hud-res').textContent = s.width + '×' + s.height;
-        $('hud-src').hidden = s.source !== 'eye2';
-        $('cam2-state').textContent = s.source === 'eye2' ? 'Live on the page' : 'Standing by';
-        if (backupLive !== (s.source === 'eye2')) { backupLive = s.source === 'eye2'; renderCam(); }
+        $('cam-state').textContent = 'Live';
       } else {
         live.className = 'live off'; $('live-text').textContent = 'Offline';
-        $('cam2-state').textContent = 'Standing by';
+        $('cam-state').textContent = 'Offline';
         off.hidden = false;
         $('offline-text').textContent = s.lastFrameAgeMs === null ? 'Waiting for the camera…'
           : 'Last frame ' + ago(s.lastFrameAgeMs) + ' ago';
@@ -1169,19 +946,15 @@ function viewerPage() {
   }
   function sysCell(id, cls, text) { var el = $(id); el.className = cls; el.querySelector('small').textContent = text; }
   function renderSys(s) {
-    var mainOk = s.main_connected && s.main_age !== null && s.main_age < 10000;
-    sysCell('sys-main', mainOk ? 'ok' : s.main_connected ? 'warn' : 'bad',
-      mainOk ? (s.source === 'main' ? (s.fps || 0).toFixed(1) + ' fps' : 'connected') :
-      s.main_connected ? 'connected, no frames' : s.main_age !== null ? 'offline · ' + ago(s.main_age) : 'offline');
+    var camOk = s.online;
+    sysCell('sys-cam', camOk ? 'ok' : 'bad', camOk ? 'live · ' + (s.width ? s.width + '×' + s.height + ' · ' : '') + 'last frame ' + ago(s.lastFrameAgeMs || 0) + ' ago'
+      : s.eye2_age !== null ? 'no frames · ' + ago(s.eye2_age) : 'no frames yet');
     var dispOk = s.display_age !== null && s.display_age < 10000;
-    var eye2Live = s.source === 'eye2' && s.online;
-    sysCell('sys-eye2', eye2Live ? 'ok' : dispOk ? '' : 'bad',
-      eye2Live ? 'live backup · ' + ago(s.eye2_age || 0) : dispOk ? 'standing by' : 'board offline');
     sysCell('sys-display', dispOk ? 'ok' : 'bad', dispOk ? 'online' : s.display_age !== null ? 'offline · ' + ago(s.display_age) : 'not seen');
     var trOk = s.tracker_age !== null && s.tracker_age < 5000;
     sysCell('sys-tracker', trOk ? 'ok' : '', trOk ? 'running' : s.tracker_age !== null ? 'stopped · ' + ago(s.tracker_age) + ' ago' : 'not running');
-    var bad = [mainOk, dispOk].filter(function (x) { return !x; }).length;
-    $('sys-sum').textContent = !bad ? 'All good' : eye2Live ? 'Running on backup' : bad + ' offline';
+    var bad = [camOk, dispOk].filter(function (x) { return !x; }).length;
+    $('sys-sum').textContent = !bad ? 'All good' : bad + ' offline';
   }
   function ago(ms) {
     var s = Math.round(ms / 1000);
@@ -1244,8 +1017,7 @@ function viewerPage() {
     if (fresh()) {
       var bodies = (meta.bodies || []).length, admin = !!(f && f.admin);
       [['Faces', String(faces.length ? (meta.n || faces.length) : 0)], ['Bodies', String(bodies)],
-       ['Admin', admin ? '👑 ' + f.name + ' present' : 'away'],
-       ['Motion', cam && cam.motion_level !== undefined ? (cam.motion_level / 10).toFixed(1) + '%' : '–']].forEach(function (kv) {
+       ['Admin', admin ? '👑 ' + f.name + ' present' : 'away']].forEach(function (kv) {
         var d = document.createElement('div'); d.textContent = kv[0] + ' ';
         var b = document.createElement('b'); b.textContent = kv[1]; d.append(b); dt.append(d);
       });
@@ -1293,69 +1065,16 @@ function viewerPage() {
   }
 
 
-  // ── Camera: state, controls, privacy screen ──
-  var cam = null;
-  es.addEventListener('cam', function (e) { try { cam = JSON.parse(e.data); renderCam(); } catch (x) {} });
+  // ── Admin key: unlocks the Display and Camera controls ──
   var adminKey = null;
   try { adminKey = localStorage.getItem('aria-admin'); } catch (e) {}
-  function fmtUp(s) { var h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60; return h ? h + 'h ' + m + 'm' : m + 'm'; }
-  function renderCam() {
-    $('cam-conn').textContent = cam ? 'Connected' : backupLive ? 'Main offline · backup eye 2 live' : 'Not connected';
+  function renderLock() {
     $('locked').hidden = !!adminKey; $('controls').hidden = !adminKey;
     $('aria-locked').hidden = !!adminKey; $('aria-controls').hidden = !adminKey;
-    var camOff = !cam;
-    $('cam-off-note').hidden = !camOff;
-    $('controls').classList.toggle('dim', camOff);
-    $('controls').querySelectorAll('button, select').forEach(function (el) { if (!el.closest('.keep')) el.disabled = camOff; });
-    var ps = $('privacy-screen');
-    ps.hidden = !(cam && cam.privacy);
-    $('hud-night').hidden = !(cam && cam.night && !cam.privacy);
-    if (!cam) { $('health').textContent = ''; return; }
-    if (cam.privacy) $('privacy-text').textContent = cam.privacy_manual ? 'Switched on from this page.'
-      : 'Private hours ' + cam.priv_hours[0] + ':00–' + cam.priv_hours[1] + ':00.';
-    $('priv').setAttribute('aria-checked', String(!cam.privacy_manual));      // switch = camera ON
-    $('priv-sub').textContent = cam.privacy ? (cam.privacy_manual ? 'Off — private, nothing leaves the camera'
-      : 'Off — private hours') : 'On — streaming and detecting';
-    $('night-sub').textContent = cam.night ? 'Active now' : 'Black & white in the dark';
-    setSeg('night', cam.night_mode);
-    setSeg('light', cam.ledauto ? 'auto' : cam.led === 0 ? 'off' : cam.led <= 40 ? '30' : '100');
-    setSeg('profile', cam.adaptive ? 'auto' : String(cam.profile_i !== undefined ? cam.profile_i : cam.profile === 'VGA' ? 1 : 0));
-    if (cam.sensitivity) setSeg('sensitivity', cam.sensitivity);
-    if (cam.zoom) {
-      setSeg('zoom', String(cam.zoom));
-      var zmax = cam.zoom_max || 40;
-      document.querySelectorAll('.seg[data-cmd="zoom"] button').forEach(function (b) { b.disabled = +b.dataset.v > zmax; });
-      $('zoom-sub').textContent = zmax <= 10 ? 'Lower the resolution to zoom' : 'Up to ' + (zmax / 10) + '× at this resolution';
-    }
-    if (cam.zones) {
-      var ignored = zonesFromHex(cam.zones).filter(function (w) { return !w; }).length;
-      $('zone-sub').textContent = ignored ? 'Ignoring ' + ignored + ' of 48 areas' : 'Watching the whole picture';
-    }
-    if (document.activeElement !== $('ph-s') && document.activeElement !== $('ph-e')) {
-      $('ph-s').value = cam.priv_hours[0]; $('ph-e').value = cam.priv_hours[1];
-    }
-    var h = $('health'); h.textContent = '';
-    [['Signal', cam.rssi + ' dBm'], ['Uptime', fmtUp(cam.up)], ['Memory free', cam.heap_kb + ' KB'],
-     ['Last restart', cam.reset], ['Brightness', cam.brightness < 0 ? '–' : Math.round(cam.brightness / 2.55) + '%'],
-     ['Last motion', cam.motion_ago ? ago(cam.motion_ago * 1000) + ' ago' : '–'],
-     ['Motion level', cam.motion_level === undefined ? '–' : (cam.motion_level / 10).toFixed(1) + '%']].forEach(function (kv) {
-      var d = document.createElement('div'); d.textContent = kv[0] + ' ';
-      var b = document.createElement('b'); b.textContent = kv[1]; d.append(b); h.append(d);
-    });
-  }
-  function setSeg(cmd, v) {
-    document.querySelectorAll('.seg[data-cmd="' + cmd + '"] button').forEach(function (b) {
-      b.setAttribute('aria-pressed', String(b.dataset.v === v));
-    });
-  }
-  for (var hr = 0; hr < 24; hr++) {
-    ['ph-s', 'ph-e'].forEach(function (id) {
-      var o = document.createElement('option'); o.value = hr; o.textContent = pad(hr) + ':00'; $(id).append(o);
-    });
   }
   var SENT = { message: 'Message sent to the display ✓', emotion: 'ARIA will act it out ✓', view: 'Display updated ✓',
                screen: 'Display switched ✓', restart_all: 'Restarting camera + display…', zoom2: 'Camera 2 zoom set ✓',
-               zones: 'Detection zones saved ✓', privhours: 'Private hours saved ✓' };
+             };
   async function send(cmd, args, extra) {
     try {
       var body = { cmd: cmd, args: args || [] };
@@ -1363,13 +1082,12 @@ function viewerPage() {
       var r = await fetch('/cmd', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
                                     body: JSON.stringify(body) });
       if (r.status === 401) { lock(); toast('That admin key was not accepted', 'err'); }
-      else if (r.status === 503) toast('The main camera is not connected right now', 'err');
       else if (r.status >= 400) toast('Not accepted: ' + (await r.text()), 'err');
       else toast(SENT[cmd] || 'Sent ✓', 'ok');
       return r.status;
     } catch (e) { toast('Could not reach the server', 'err'); return 0; }
   }
-  function lock() { adminKey = null; try { localStorage.removeItem('aria-admin'); } catch (e) {} renderCam(); }
+  function lock() { adminKey = null; try { localStorage.removeItem('aria-admin'); } catch (e) {} renderLock(); }
   document.querySelectorAll('.unlock-form').forEach(function (f) {
     f.addEventListener('submit', function (e) {
       e.preventDefault();
@@ -1377,27 +1095,12 @@ function viewerPage() {
       if (!k) return;
       adminKey = k; f.querySelector('input').value = '';
       try { localStorage.setItem('aria-admin', adminKey); } catch (x) {}
-      renderCam(); toast('Controls unlocked', 'ok');
+      renderLock(); toast('Controls unlocked', 'ok');
     });
   });
   $('lock').onclick = function () { lock(); toast('Controls locked', 'ok'); };
-  $('priv').onclick = function () {
-    var cameraOn = $('priv').getAttribute('aria-checked') !== 'true';
-    $('priv').setAttribute('aria-checked', String(cameraOn));   // optimistic; the next state report confirms
-    send('privacy', [cameraOn ? '0' : '1']);
-  };
-  $('ph-save').onclick = function () { send('privhours', [$('ph-s').value, $('ph-e').value]); };
-  document.querySelectorAll('.seg[data-cmd]').forEach(function (seg) {
-    seg.addEventListener('click', function (e) {
-      var b = e.target.closest('button'); if (!b) return;
-      var v = b.dataset.v, cmd = seg.dataset.cmd;
-      setSeg(cmd, v);
-      if (cmd === 'light') { if (v === 'auto') send('ledauto', ['1']); else send('led', [v === 'off' ? '0' : v]); }
-      else send(cmd, [v]);
-    });
-  });
   $('restart').onclick = function () {
-    if (confirm('Restart the camera and the display? The stream drops for about 20 seconds.')) send('restart_all');
+    if (confirm('Restart the display and its camera? The picture drops for about 20 seconds.')) send('restart_all');
   };
 
   // ── Talk to ARIA: display on/off, messages, emotions ──
@@ -1452,79 +1155,12 @@ function viewerPage() {
     send('emotion', [b.dataset.e]);
     b.classList.add('sent'); setTimeout(function () { b.classList.remove('sent'); }, 900);
   });
-  renderCam();
+  renderLock();
 
-  // ── Detection zones: 8x6 grid, bit = row*8 + col, 1 = watched ──
-  var ZC = 8, ZR = 6, zoneEdit = null, zonePaint = null;
-  var zonesEl = $('zones');
-  function zonesFromHex(h) {
-    var v = BigInt('0x' + (h || 'ffffffffffff')), m = [];
-    for (var i = 0; i < ZC * ZR; i++) m.push(((v >> BigInt(i)) & BigInt(1)) === BigInt(1));
-    return m;
-  }
-  function zonesToHex(m) {
-    var v = BigInt(0);
-    m.forEach(function (on, i) { if (on) v |= BigInt(1) << BigInt(i); });
-    return v.toString(16).padStart(12, '0');
-  }
-  for (var zi = 0; zi < ZC * ZR; zi++) {
-    var zb = document.createElement('button'); zb.type = 'button'; zb.dataset.i = zi;
-    zb.setAttribute('aria-label', 'Row ' + (Math.floor(zi / ZC) + 1) + ', column ' + (zi % ZC + 1));
-    zonesEl.append(zb);
-  }
-  function placeZones() {                    // over the picture itself (object-fit: contain leaves bars)
-    var W = stage.clientWidth, H = stage.clientHeight;
-    var nw = img.naturalWidth || 4, nh = img.naturalHeight || 3, k = Math.min(W / nw, H / nh);
-    zonesEl.style.width = nw * k + 'px'; zonesEl.style.height = nh * k + 'px';
-    zonesEl.style.left = (W - nw * k) / 2 + 'px'; zonesEl.style.top = (H - nh * k) / 2 + 'px';
-  }
-  function drawZones() {
-    var off = 0;
-    zonesEl.querySelectorAll('button').forEach(function (b, i) {
-      b.classList.toggle('off', !zoneEdit[i]); b.setAttribute('aria-pressed', String(!zoneEdit[i]));
-      if (!zoneEdit[i]) off++;
-    });
-    $('zone-info').textContent = off ? off + ' of 48 areas ignored' : 'Tap or drag over areas to ignore';
-  }
-  function setCell(el) {
-    if (!el || el.parentNode !== zonesEl) return;
-    var i = +el.dataset.i;
-    if (zoneEdit[i] !== zonePaint) { zoneEdit[i] = zonePaint; drawZones(); }
-  }
-  zonesEl.addEventListener('pointerdown', function (e) {
-    var b = e.target.closest('button'); if (!b) return;
-    e.preventDefault();
-    zonePaint = !zoneEdit[+b.dataset.i];
-    setCell(b);
-  });
-  zonesEl.addEventListener('pointermove', function (e) {
-    if (zonePaint === null) return;
-    setCell(document.elementFromPoint(e.clientX, e.clientY));
-  });
-  window.addEventListener('pointerup', function () { zonePaint = null; });
-  function zoneMode(on) {
-    zonesEl.hidden = !on; $('zone-bar').hidden = !on; $('stage-controls').hidden = on;
-    if (on) { placeZones(); drawZones(); stage.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-    else zoneEdit = null;
-  }
-  $('zone-edit').onclick = function () { zoneEdit = zonesFromHex(cam && cam.zones); zoneMode(true); };
-  $('zone-cancel').onclick = function () { zoneMode(false); };
-  $('zone-all').onclick = function () { zoneEdit = zoneEdit.map(function () { return true; }); drawZones(); };
-  $('zone-save').onclick = async function () {
-    if (!zoneEdit.some(Boolean)) { toast('Leave at least one area watched', 'err'); return; }
-    if (await send('zones', [zonesToHex(zoneEdit)]) === 202) zoneMode(false);
-  };
-  window.addEventListener('resize', function () { if (zoneEdit) placeZones(); });
-
-  // ── Health history: fps, WiFi, memory, restarts ──
+  // ── Health history: online + frame rate ──
   var hData = null, hHours = 6, hCharts = [];
-  var REASONS = { brownout: ['Brownout — the power dipped', 1], 'power-on': ['Power was cut', 1],
-                  software: ['Restarted itself or by command', 0], crash: ['Crashed', 1], 'task-wdt': ['Froze (watchdog)', 1],
-                  'interrupt-wdt': ['Froze (watchdog)', 1], watchdog: ['Froze (watchdog)', 1], external: ['Reset button', 0] };
   var METRICS = [
     { key: 'fps', title: 'Frames per second', fmt: function (v) { return v.toFixed(1); }, zero: true },
-    { key: 'rssi', title: 'WiFi signal', fmt: function (v) { return v + ' dBm'; } },
-    { key: 'heap', title: 'Free memory', fmt: function (v) { return v + ' KB'; } },
   ];
   async function loadHealth() {
     try { hData = await (await fetch('/health' + q, { cache: 'no-store' })).json(); renderHealth(); } catch (e) {}
@@ -1545,10 +1181,10 @@ function viewerPage() {
     if (!hData) return;
     var now = Date.now(), t0 = now - hHours * 3600e3;
     var S = hData.samples.filter(function (x) { return x.t >= t0; });
-    var R = hData.restarts.filter(function (x) { return x.t >= t0; });
     var on = S.filter(function (x) { return x.on; });
     $('h-online').textContent = S.length ? Math.round(on.length / S.length * 100) + '%' : '–';
-    $('h-rcount').textContent = S.length ? String(R.length) : '–';
+    var lastS = hData.samples[hData.samples.length - 1];
+    $('h-now').textContent = lastS && lastS.on ? lastS.fps.toFixed(1) + ' fps' : 'offline';
     $('h-fps').textContent = on.length ? (on.reduce(function (a, x) { return a + x.fps; }, 0) / on.length).toFixed(1) : '–';
     var box = $('h-charts'); box.textContent = ''; hCharts = [];
     if (S.length < 2) {
@@ -1563,14 +1199,13 @@ function viewerPage() {
     var span = now - t0, nb = Math.max(2, Math.floor(W / 3)), B = [];
     S.forEach(function (x) {
       var k = Math.min(nb - 1, Math.floor((x.t - t0) / span * nb));
-      var b = B[k] || (B[k] = { t: 0, n: 0, on: true, fps: 0, rssi: 0, heap: 0 });
+      var b = B[k] || (B[k] = { t: 0, n: 0, on: true, fps: 0 });
       b.t += x.t; b.n++; if (!x.on) b.on = false;
-      if (x.on) { b.fps += x.fps || 0; b.rssi += x.rssi || 0; b.heap += x.heap || 0; }
+      if (x.on) b.fps += x.fps || 0;
     });
     var Sb = B.filter(Boolean).map(function (b) {
       var n = b.n;
-      return { t: b.t / n, on: b.on, fps: b.on ? Math.round(b.fps / n * 10) / 10 : null,
-               rssi: b.on ? Math.round(b.rssi / n) : null, heap: b.on ? Math.round(b.heap / n) : null };
+      return { t: b.t / n, on: b.on, fps: b.on ? Math.round(b.fps / n * 10) / 10 : null };
     });
     var enough = S.length >= 2;
     METRICS.forEach(function (m) {
@@ -1586,7 +1221,7 @@ function viewerPage() {
       var last = hData.samples[hData.samples.length - 1][m.key];
       wrap.innerHTML = '<div class="hc-head"><span>' + m.title + '</span><b>' + (last === null ? 'offline' : m.fmt(last)) + '</b></div>';
       if (!vals.length) {                          // nothing to plot: the camera was offline the whole time
-        var em = document.createElement('div'); em.className = 'hc-empty'; em.textContent = 'No data — the main camera was offline';
+        var em = document.createElement('div'); em.className = 'hc-empty'; em.textContent = 'No data — the camera was offline';
         wrap.append(em); box.append(wrap); return;
       }
       var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img',
@@ -1608,7 +1243,6 @@ function viewerPage() {
         if (pts.length > 1) svg.append(svgEl('path', { class: 'ar', d: d + 'L' + pts[pts.length - 1][0].toFixed(1) + ' ' + (H - pad) + 'L' + pts[0][0].toFixed(1) + ' ' + (H - pad) + 'Z' }));
         svg.append(svgEl('path', { class: 'ln', d: pts.length > 1 ? d : d + 'l0.1 0' }));
       });
-      R.forEach(function (r) { var x = X(r.t); svg.append(svgEl('line', { class: 'rs', x1: x, x2: x, y1: 0, y2: H })); });
       var xh = svgEl('line', { class: 'xh', y1: 0, y2: H, visibility: 'hidden' });
       var dot = svgEl('circle', { class: 'dot', r: 4, visibility: 'hidden' });
       svg.append(xh, dot);
@@ -1616,14 +1250,6 @@ function viewerPage() {
       svg.addEventListener('pointermove', function (e) { hover(e, svg, Sb, X); });
       svg.addEventListener('pointerleave', unhover);
       wrap.append(svg); box.append(wrap);
-    });
-    var list = $('h-restarts'); list.textContent = '';
-    R.slice(0, 8).forEach(function (r) {
-      var why = REASONS[r.reason] || [r.reason, 1];
-      var li = document.createElement('li');
-      var sp = document.createElement('span'); sp.className = 'why' + (why[1] ? '' : ' ok'); sp.textContent = why[0];
-      var tm = document.createElement('time'); tm.textContent = hm(r.t);
-      li.append(sp, tm); list.append(li);
     });
   }
   function hover(e, svg, S, X) {                 // crosshair on every chart at the nearest sample
