@@ -113,7 +113,8 @@ const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'sh
                   'roll', 'nod', 'yawn', 'purr', 'squint', 'sleep', 'wake'];
 const MSG_MAX = 120;
 const VIEWS = ['auto', 'sage', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
-const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, view: 'auto', zoom2: 10 };
+// view/zoom2 start as null: after a relay restart the display keeps what it shows until someone picks
+const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, view: null, zoom2: null };
 
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
