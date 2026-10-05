@@ -321,6 +321,19 @@ function handleMeta(req, res) {
 // (X-Person: count;confidence;direction). A rise is a new detection; a lower
 // count means the board restarted, so re-baseline.
 let personSeen = null;
+// AYA's auto-framing (X-AF: "x,y,zoom,locked" in the 80x60 frame, or "off"),
+// passed to the page so its video follows the same way as the OLED
+let lastAf = null;
+function noteAf(req) {
+  const v = String(req.headers['x-af'] || '');
+  let af = null;
+  if (v && v !== 'off') {
+    const [x, y, z, t] = v.split(',').map(Number);
+    if ([x, y, z].every(Number.isFinite)) af = { x, y, z, t: t === 1 };
+  }
+  if (JSON.stringify(af) !== JSON.stringify(lastAf)) { lastAf = af; broadcast('af', af || { off: true }); }
+}
+
 function notePerson(req) {
   const [n, conf, dir] = String(req.headers['x-person'] || '').split(';');
   const count = parseInt(n, 10);
@@ -341,6 +354,7 @@ function handleDisplayPost(req, res) {
     const buf = Buffer.concat(chunks);
     seen.display = Date.now();
     notePerson(req);
+    noteAf(req);
     if (buf.length === 1024) {
       const out = Buffer.alloc(1024);
       for (let y = 0; y < 64; y++)
@@ -365,6 +379,7 @@ function handleEvents(req, res) {
   if (latestMeta) res.write(`data: ${latestMeta}\n\n`);
   for (const e of [...activity].reverse()) res.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
   res.write(`event: display\ndata: ${JSON.stringify(publicDisplay())}\n\n`);
+  if (lastAf) res.write(`event: af\ndata: ${JSON.stringify(lastAf)}\n\n`);
   if (oledFrame && Date.now() - seen.display < 10000) res.write(`event: oled\ndata: ${JSON.stringify({ f: oledFrame })}\n\n`);
   metaSubscribers.add(res);
   const ping = setInterval(() => res.write(': ping\n\n'), 15000);   // keep proxies from idling it out
@@ -522,6 +537,10 @@ const STYLE = `
            overflow: hidden; border: 1px solid var(--line); }
   .stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
   #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .frame { position: absolute; inset: 0; transform-origin: 0 0; transition: transform 1.4s cubic-bezier(.25,.8,.25,1); will-change: transform; }
+  .chip.track { color: var(--accent); border-color: rgba(94,234,212,.45); }
+  .chip.track i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; margin-right: 5px; vertical-align: 1px; }
+  .chip.scan { color: var(--muted); }
   .hud { position: absolute; display: flex; gap: 6px; align-items: center; pointer-events: none; }
   .hud.tl { top: 12px; left: 12px; } .hud.tr { top: 12px; right: 12px; }
   @media (max-width: 420px) { #hud-res { display: none; } }   /* keep the two chip rows apart on small phones */
@@ -788,9 +807,9 @@ function viewerPage() {
 <main class="grid">
   <section class="video-col" aria-label="Live video">
     <div class="stage" id="stage">
-      <img id="feed" alt="Live camera feed">
-      <canvas id="overlay" aria-hidden="true"></canvas>
-      <div class="hud tl"><span class="rec"><i></i>LIVE</span><span class="chip" id="hud-time"></span></div>
+      <div class="frame" id="frame"><img id="feed" alt="Live camera feed">
+        <canvas id="overlay" aria-hidden="true"></canvas></div>
+      <div class="hud tl"><span class="rec"><i></i>LIVE</span><span class="chip" id="hud-time"></span><span class="chip" id="hud-af" hidden></span></div>
       <div class="hud tr"><span class="chip" id="hud-res">—</span><span class="chip" id="hud-fps">— fps</span></div>
       <div class="offline" id="offline" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -806,6 +825,10 @@ function viewerPage() {
           <button class="btn primary" id="zone-save">Save</button></span>
       </div>
       <div class="controls" id="stage-controls">
+        <button class="icon" id="btn-af" aria-pressed="true" title="Auto-framing (follow like the OLED)" aria-label="Toggle auto-framing">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/>
+            <circle cx="12" cy="12" r="3"/><path d="M12 7v2M12 15v2M7 12h2M15 12h2"/></svg></button>
         <button class="icon" id="btn-overlay" aria-pressed="true" title="Face boxes" aria-label="Toggle face boxes">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
             <path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/>
@@ -965,6 +988,34 @@ function viewerPage() {
     if (document.fullscreenElement) return document.exitFullscreen();
     (stage.requestFullscreen || stage.webkitRequestFullscreen || function () {}).call(stage);
   };
+  // ── Auto-framing: the video zooms/pans to where AYA's OLED is framing ──
+  var afOn = true, af = null;
+  try { afOn = localStorage.getItem('aya-autoframe') !== '0'; } catch (e) {}
+  function applyAf() {
+    var fr = $('frame'), chip = $('hud-af');
+    $('btn-af').setAttribute('aria-pressed', String(afOn));
+    if (!afOn || !af || af.off) { fr.style.transform = 'none'; chip.hidden = true; return; }
+    var W = stage.clientWidth, H = stage.clientHeight;
+    var nw = img.naturalWidth || 4, nh = img.naturalHeight || 3, k = Math.min(W / nw, H / nh);
+    var dw = nw * k, dh = nh * k, ox = (W - dw) / 2, oy = (H - dh) / 2;
+    var z = Math.max(1, Math.min(3, af.z || 1));
+    var cx = ox + (af.x / 80) * dw, cy = oy + (af.y / 60) * dh;
+    var tx = W / 2 - cx * z, ty = H / 2 - cy * z;
+    function fit(t, lo, hi) { return lo > hi ? (lo + hi) / 2 : Math.min(hi, Math.max(lo, t)); }   // keep the picture covering the stage
+    tx = fit(tx, W - (ox + dw) * z, -ox * z);
+    ty = fit(ty, H - (oy + dh) * z, -oy * z);
+    fr.style.transform = 'translate(' + tx.toFixed(1) + 'px,' + ty.toFixed(1) + 'px) scale(' + z.toFixed(3) + ')';
+    chip.hidden = false;
+    chip.className = 'chip ' + (af.t ? 'track' : 'scan');
+    chip.innerHTML = af.t ? '<i></i>Tracking' : 'Scanning';
+  }
+  $('btn-af').onclick = function () {
+    afOn = !afOn;
+    try { localStorage.setItem('aya-autoframe', afOn ? '1' : '0'); } catch (e) {}
+    applyAf();
+  };
+  window.addEventListener('resize', applyAf);
+
   var showBoxes = true;
   try { showBoxes = localStorage.getItem('aria-boxes') !== '0'; } catch (e) {}
   var boxBtn = $('btn-overlay');
@@ -1072,6 +1123,7 @@ function viewerPage() {
     if (navigator.vibrate) navigator.vibrate(30);
   }
   es.addEventListener('log', function (e) { try { addLog(JSON.parse(e.data)); } catch (x) {} });
+  es.addEventListener('af', function (e) { try { af = JSON.parse(e.data); applyAf(); } catch (x) {} });
 
   function fresh() { return meta && Date.now() - metaAt < 3000; }
 
