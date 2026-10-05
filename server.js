@@ -86,7 +86,7 @@ const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'sh
 const MSG_MAX = 120;
 const VIEWS = ['auto', 'sage', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
 // view/zoom2 start as null: after a relay restart the display keeps what it shows until someone picks
-const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, view: null, zoom2: null };
+const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, view: null, zoom2: null, ignore: null };
 
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
@@ -96,7 +96,8 @@ function broadcast(event, obj) {
 function publicDisplay() {
   const m = displayState.msg;
   return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
-           emotion: displayState.emotion, restart: displayState.restart, view: displayState.view, zoom2: displayState.zoom2 };
+           emotion: displayState.emotion, restart: displayState.restart, view: displayState.view, zoom2: displayState.zoom2,
+           ignore: displayState.ignore };
 }
 
 function handleCmd(req, res) {
@@ -131,6 +132,13 @@ function handleCmd(req, res) {
     if (cmd === 'view') {              // what the OLED shows: auto rotation, one screen, or camera 2 live
       if (!VIEWS.includes(args[0])) return send(res, 400, 'text/plain', 'view ' + VIEWS.join('|'));
       displayState.view = args[0];
+      broadcast('display', publicDisplay());
+      return send(res, 202, 'text/plain', 'queued');
+    }
+    if (cmd === 'ignore') {            // camera zones AYA never counts as motion: 12 rows x 16 bits as 48 hex digits
+      if (!/^[0-9a-f]{48}$/.test(args[0] || '')) return send(res, 400, 'text/plain', 'ignore <48 hex digits>');
+      displayState.ignore = args[0];
+      logEvent('privacy', 'Motion ignore zones updated');
       broadcast('display', publicDisplay());
       return send(res, 202, 'text/plain', 'queued');
     }
@@ -272,14 +280,20 @@ function handleMeta(req, res) {
 
 // The display's poll: GET /display, or POST /display with its 1 KB screen
 // buffer (u8g2 page layout: byte = 8 vertical pixels) in the body.
-// The board sends its PIR trigger count with each poll (X-PIR-Events); a rise
-// is someone walking past. A lower number means the board restarted: re-baseline.
-let pirSeen = null;
-function notePir(req) {
-  const n = parseInt(req.headers['x-pir-events'], 10);
-  if (!Number.isFinite(n)) return;
-  if (pirSeen !== null && n > pirSeen) logEvent('person', n - pirSeen > 1 ? `Person detected (${n - pirSeen}×)` : 'Person detected');
-  pirSeen = n;
+// The board sends its confirmed person detections with each poll
+// (X-Person: count;confidence;direction). A rise is a new detection; a lower
+// count means the board restarted, so re-baseline.
+let personSeen = null;
+function notePerson(req) {
+  const [n, conf, dir] = String(req.headers['x-person'] || '').split(';');
+  const count = parseInt(n, 10);
+  if (!Number.isFinite(count)) return;
+  if (personSeen !== null && count > personSeen) {
+    let text = `Person detected · ${parseInt(conf, 10) || '?'}%`;
+    if (dir === 'left' || dir === 'right') text += ` · moving ${dir}`;
+    logEvent('person', text);
+  }
+  personSeen = count;
 }
 
 function handleDisplayPost(req, res) {
@@ -289,7 +303,7 @@ function handleDisplayPost(req, res) {
   req.on('end', () => {
     const buf = Buffer.concat(chunks);
     seen.display = Date.now();
-    notePir(req);
+    notePerson(req);
     if (buf.length === 1024) {
       const out = Buffer.alloc(1024);
       for (let y = 0; y < 64; y++)
@@ -579,6 +593,15 @@ const STYLE = `
   .showing { font-size: 12px; color: var(--accent); min-height: 16px; }
   .log li.message i { background: var(--accent); }
   .sub-h { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin: 14px 0 4px; }
+  .zones { position: absolute; display: grid; grid-template-columns: repeat(16, 1fr); grid-template-rows: repeat(12, 1fr);
+           touch-action: none; user-select: none; -webkit-user-select: none; z-index: 2; }
+  .zones button { border: 1px solid rgba(94,234,212,.25); background: transparent; padding: 0; cursor: pointer; }
+  .zones button.off { background: repeating-linear-gradient(135deg, rgba(248,113,113,.55) 0 5px, rgba(7,9,12,.7) 5px 10px);
+                      border-color: rgba(248,113,113,.4); }
+  .zone-bar { position: absolute; left: 12px; right: 12px; bottom: 12px; display: flex; flex-wrap: wrap; gap: 8px; z-index: 3;
+              align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 12px;
+              background: rgba(7,9,12,.85); border: 1px solid var(--line); font-size: 13px; }
+  .zone-bar span { color: var(--muted); }
   .log li.restart i { background: var(--bad); } .log li.person i { background: #fb923c; box-shadow: 0 0 6px rgba(251,146,60,.8); } .log li.gesture i { background: #f472b6; }
 
   /* A hand sign seen by the tracker: big emoji pops over the video */
@@ -732,6 +755,12 @@ function viewerPage() {
       </div>
       <div class="g-pop" id="g-pop" hidden aria-live="polite"><i class="ring"></i><i class="ring"></i>
         <span class="e" id="g-emoji"></span><span class="t" id="g-text"></span></div>
+      <div class="zones" id="zones" hidden aria-label="Ignore zones: tap or drag over areas AYA should not watch"></div>
+      <div class="zone-bar" id="zone-bar" hidden>
+        <span id="zone-info">Tap or drag over areas to ignore</span>
+        <span><button class="btn" id="zone-all">Watch all</button> <button class="btn" id="zone-cancel">Cancel</button>
+          <button class="btn primary" id="zone-save">Save</button></span>
+      </div>
       <div class="controls" id="stage-controls">
         <button class="icon" id="btn-overlay" aria-pressed="true" title="Face boxes" aria-label="Toggle face boxes">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
@@ -840,7 +869,9 @@ function viewerPage() {
           <div class="seg view-seg" id="zoom2-seg">
             <button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button>
           </div>
-          <div class="ctl keep" style="margin-top:8px"><div>Restart system<small>Display + camera, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
+          <div class="ctl keep" style="margin-top:8px"><div>Ignore zones<small id="zone-sub">Watching the whole picture</small></div>
+            <button class="btn" id="zone-edit">Edit</button></div>
+          <div class="ctl keep"><div>Restart system<small>Display + camera, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
           <div class="ctl keep"><div>Admin<small>This browser remembers the key</small></div><button class="lock-link" id="lock">Lock controls</button></div>
         </div>
       </section>
@@ -1083,7 +1114,56 @@ function viewerPage() {
     $('locked').hidden = !!adminKey; $('controls').hidden = !adminKey;
     $('aria-locked').hidden = !!adminKey; $('aria-controls').hidden = !adminKey;
   }
-  var SENT = { message: 'Message sent to the display ✓', emotion: 'ARIA will act it out ✓', view: 'Display updated ✓',
+  // ── Ignore zones: 16x12 grid over the picture; bit c of row r = ignore ──
+  var ZC = 16, ZR = 12, zoneEdit = null, zonePaint = null, zonesEl = $('zones');
+  function zonesFromHex(h) {
+    var m = [];
+    for (var r = 0; r < ZR; r++) { var v = h ? parseInt(h.substr(r * 4, 4), 16) : 0; for (var c = 0; c < ZC; c++) m.push(!!(v & (1 << c))); }
+    return m;                                           // true = ignored
+  }
+  function zonesToHex(m) {
+    var out = '';
+    for (var r = 0; r < ZR; r++) { var v = 0; for (var c = 0; c < ZC; c++) if (m[r * ZC + c]) v |= 1 << c; out += ('000' + v.toString(16)).slice(-4); }
+    return out;
+  }
+  for (var zi = 0; zi < ZC * ZR; zi++) {
+    var zb = document.createElement('button'); zb.type = 'button'; zb.dataset.i = zi;
+    zb.setAttribute('aria-label', 'Row ' + (Math.floor(zi / ZC) + 1) + ', column ' + (zi % ZC + 1)); zonesEl.append(zb);
+  }
+  function placeZones() {                              // over the picture itself (object-fit: contain leaves bars)
+    var st = $('stage'), im = $('feed'), W = st.clientWidth, H = st.clientHeight;
+    var nw = im.naturalWidth || 4, nh = im.naturalHeight || 3, k = Math.min(W / nw, H / nh);
+    zonesEl.style.width = nw * k + 'px'; zonesEl.style.height = nh * k + 'px';
+    zonesEl.style.left = (W - nw * k) / 2 + 'px'; zonesEl.style.top = (H - nh * k) / 2 + 'px';
+  }
+  function drawZones() {
+    var n = 0;
+    zonesEl.querySelectorAll('button').forEach(function (b, i) { b.classList.toggle('off', zoneEdit[i]); if (zoneEdit[i]) n++; });
+    $('zone-info').textContent = n ? n + ' of ' + (ZC * ZR) + ' zones ignored' : 'Tap or drag over areas to ignore';
+  }
+  function setCell(el) { if (!el || el.parentNode !== zonesEl) return; var i = +el.dataset.i; if (zoneEdit[i] !== zonePaint) { zoneEdit[i] = zonePaint; drawZones(); } }
+  zonesEl.addEventListener('pointerdown', function (e) { var b = e.target.closest('button'); if (!b) return; e.preventDefault(); zonePaint = !zoneEdit[+b.dataset.i]; setCell(b); });
+  zonesEl.addEventListener('pointermove', function (e) { if (zonePaint !== null) setCell(document.elementFromPoint(e.clientX, e.clientY)); });
+  window.addEventListener('pointerup', function () { zonePaint = null; });
+  function zoneMode(on) {
+    zonesEl.hidden = !on; $('zone-bar').hidden = !on; $('stage-controls').hidden = on;
+    if (on) { placeZones(); drawZones(); $('stage').scrollIntoView({ behavior: 'smooth', block: 'center' }); } else zoneEdit = null;
+  }
+  $('zone-edit').onclick = function () { zoneEdit = zonesFromHex(disp && disp.ignore); zoneMode(true); };
+  $('zone-cancel').onclick = function () { zoneMode(false); };
+  $('zone-all').onclick = function () { zoneEdit = zoneEdit.map(function () { return false; }); drawZones(); };
+  $('zone-save').onclick = async function () {
+    if (zoneEdit.every(Boolean)) { toast('Leave at least one zone watched', 'err'); return; }
+    var hex = zonesToHex(zoneEdit);
+    if (await send('ignore', [hex]) === 202) { if (disp) disp.ignore = hex; renderZoneSub(); zoneMode(false); }
+  };
+  window.addEventListener('resize', function () { if (zoneEdit) placeZones(); });
+  function renderZoneSub() {
+    var n = disp && disp.ignore ? zonesFromHex(disp.ignore).filter(Boolean).length : 0;
+    $('zone-sub').textContent = n ? 'Ignoring ' + n + ' of ' + (ZC * ZR) + ' zones' : 'Watching the whole picture';
+  }
+
+  var SENT = { ignore: 'Ignore zones saved ✓', message: 'Message sent to the display ✓', emotion: 'ARIA will act it out ✓', view: 'Display updated ✓',
                screen: 'Display switched ✓', restart_all: 'Restarting camera + display…', zoom2: 'Camera 2 zoom set ✓',
              };
   async function send(cmd, args, extra) {
@@ -1119,6 +1199,7 @@ function viewerPage() {
   es.addEventListener('display', function (e) { try { disp = JSON.parse(e.data); renderDisp(); } catch (x) {} });
   function renderDisp() {
     if (!disp) return;
+    renderZoneSub();
     $('screen').setAttribute('aria-checked', String(!!disp.screen));
     document.querySelectorAll('#zoom2-seg button').forEach(function (b) {
       b.setAttribute('aria-pressed', String(+b.dataset.v === (disp.zoom2 || 10)));
