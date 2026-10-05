@@ -684,7 +684,6 @@ const STYLE = `
   .meter .bar span { display: block; height: 100%; width: 0; border-radius: 999px; transition: width .8s ease; }
   .meter .val { text-align: right; font-variant-numeric: tabular-nums; }
   #m-energy { background: linear-gradient(90deg, #22d3ee, var(--accent)); }
-  #m-affection { background: linear-gradient(90deg, #f472b6, #fb7185); }
   #m-boredom { background: linear-gradient(90deg, #64748b, #94a3b8); }
 
   .person { display: flex; align-items: center; gap: 12px; }
@@ -977,7 +976,6 @@ function viewerPage() {
         <div class="slim" id="robot-off">The display's screen shows here while it's online.</div>
         <div class="meters" id="meters" hidden>
           <div class="meter"><span>Energy</span><div class="bar"><span id="m-energy"></span></div><span class="val" id="v-energy">–</span></div>
-          <div class="meter"><span>Affection</span><div class="bar"><span id="m-affection"></span></div><span class="val" id="v-affection">–</span></div>
           <div class="meter"><span>Boredom</span><div class="bar"><span id="m-boredom"></span></div><span class="val" id="v-boredom">–</span></div>
         </div>
       </section>
@@ -1282,14 +1280,14 @@ function viewerPage() {
     $('meters').hidden = !r;
     if (r) {
       $('mood').textContent = r.sleeping ? 'Asleep' : EXPR_MOOD[r.expr] ||
-        (r.energy < 0.3 ? 'Tired' : r.boredom > 0.5 ? 'Idle' : r.affection > 0.7 ? 'Engaged' : 'Calm');
-      [['energy', r.energy], ['affection', r.affection], ['boredom', r.boredom]].forEach(function (m) {
+        (r.energy < 0.3 ? 'Tired' : r.boredom > 0.5 ? 'Idle' : 'Calm');
+      [['energy', r.energy], ['boredom', r.boredom]].forEach(function (m) {
         var v = Math.round((m[1] || 0) * 100);
         $('m-' + m[0]).style.width = v + '%'; $('v-' + m[0]).textContent = v + '%';
       });
     } else {                                   // tracker offline: don't show stale numbers
       $('mood').textContent = '—';
-      ['energy', 'affection', 'boredom'].forEach(function (k) {
+      ['energy', 'boredom'].forEach(function (k) {
         $('m-' + k).style.width = '0'; $('v-' + k).textContent = '–';
       });
     }
