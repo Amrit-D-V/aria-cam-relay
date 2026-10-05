@@ -1608,7 +1608,7 @@ function viewerPage() {
     } catch (e) { toast('Could not reach the server', 'err'); return 0; }
   }
   $('shutdown').onclick = function () {
-    if (confirm('Shut AYA down?\n\nShe stops watching: screen, camera and WiFi go off, and this page can\'t wake her. ' +
+    if (confirm('Shut AYA down? She stops watching: screen, camera and WiFi go off, and this page cannot wake her. ' +
                 'Touch her touch sensor to wake her (or unplug and replug her).')) send('shutdown');
   };
   $('restart').onclick = function () {
