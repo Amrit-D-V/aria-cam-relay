@@ -181,7 +181,7 @@ function handleCmd(req, res) {
     }
     if (cmd === 'zoom2') {             // camera 2 (the display's OV7670): digital zoom ×10
       const z = parseInt(args[0], 10);
-      if (!(z >= 10 && z <= 30)) return send(res, 400, 'text/plain', 'zoom2 10..30');
+      if (!(z === 0 || (z >= 10 && z <= 30))) return send(res, 400, 'text/plain', 'zoom2 0 (auto) or 10..30');
       displayState.zoom2 = z;
       broadcast('display', publicDisplay());
       return send(res, 202, 'text/plain', 'queued');
@@ -907,7 +907,7 @@ function viewerPage() {
         <div id="controls">
           <div class="sub-h">Zoom</div>
           <div class="seg view-seg" id="zoom2-seg">
-            <button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button>
+            <button data-v="0">Auto</button><button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button>
           </div>
           <div class="ctl keep" style="margin-top:8px"><div>Ignore zones<small id="zone-sub">Watching the whole picture</small></div>
             <button class="btn" id="zone-edit">Edit</button></div>
@@ -1222,7 +1222,7 @@ function viewerPage() {
     renderZoneSub();
     $('screen').setAttribute('aria-checked', String(!!disp.screen));
     document.querySelectorAll('#zoom2-seg button').forEach(function (b) {
-      b.setAttribute('aria-pressed', String(+b.dataset.v === (disp.zoom2 || 10)));
+      b.setAttribute('aria-pressed', String(+b.dataset.v === (disp.zoom2 == null ? 0 : disp.zoom2)));   // Auto unless set
     });
     document.querySelectorAll('#view-seg button').forEach(function (b) {
       b.setAttribute('aria-pressed', String(b.dataset.v === (disp.view || 'auto')));
