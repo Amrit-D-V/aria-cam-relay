@@ -97,11 +97,15 @@ function broadcast(event, obj) {
   for (const s of metaSubscribers) s.write(line);
 }
 
+// The face the laptop tracker last saw (from /meta), handed to the display on
+// its poll — so the tracker never has to talk to the board directly
+let boardFace = null;
+
 function publicDisplay() {
   const m = displayState.msg;
   return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
            emotion: displayState.emotion, restart: displayState.restart, view: displayState.view, zoom2: displayState.zoom2,
-           ignore: displayState.ignore };
+           ignore: displayState.ignore, face: boardFace && Date.now() - boardFace.t < 3000 ? boardFace : null };
 }
 
 // ── Login: one key (ADMIN_KEY) opens the page ────────────────────────────
@@ -308,6 +312,11 @@ function handleMeta(req, res) {
     let meta;
     try { meta = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
     latestMeta = JSON.stringify(meta);            // re-serialised: only valid JSON reaches viewers
+    const f = Array.isArray(meta.faces) && meta.faces[0];       // the face, passed to the display on its poll
+    if (f && [f.x, f.y, f.w, f.h].every(Number.isFinite)) {
+      boardFace = { x: +((f.x + f.w / 2) * 2 - 1).toFixed(2), y: +((f.y + f.h / 2) * 2 - 1).toFixed(2), s: +f.w.toFixed(3),
+                    id: String(f.id || ''), name: String(f.name || '').slice(0, 20), admin: !!f.admin, emo: String(f.emo || ''), t: Date.now() };
+    }
     seen.tracker = Date.now();
     trackActivity(meta);
     for (const s of metaSubscribers) s.write(`data: ${latestMeta}\n\n`);
