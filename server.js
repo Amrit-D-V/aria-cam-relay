@@ -272,6 +272,16 @@ function handleMeta(req, res) {
 
 // The display's poll: GET /display, or POST /display with its 1 KB screen
 // buffer (u8g2 page layout: byte = 8 vertical pixels) in the body.
+// The board sends its PIR trigger count with each poll (X-PIR-Events); a rise
+// is someone walking past. A lower number means the board restarted: re-baseline.
+let pirSeen = null;
+function notePir(req) {
+  const n = parseInt(req.headers['x-pir-events'], 10);
+  if (!Number.isFinite(n)) return;
+  if (pirSeen !== null && n > pirSeen) logEvent('person', n - pirSeen > 1 ? `Person detected (${n - pirSeen}×)` : 'Person detected');
+  pirSeen = n;
+}
+
 function handleDisplayPost(req, res) {
   const chunks = [];
   let size = 0;
@@ -279,6 +289,7 @@ function handleDisplayPost(req, res) {
   req.on('end', () => {
     const buf = Buffer.concat(chunks);
     seen.display = Date.now();
+    notePir(req);
     if (buf.length === 1024) {
       const out = Buffer.alloc(1024);
       for (let y = 0; y < 64; y++)
@@ -568,7 +579,7 @@ const STYLE = `
   .showing { font-size: 12px; color: var(--accent); min-height: 16px; }
   .log li.message i { background: var(--accent); }
   .sub-h { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin: 14px 0 4px; }
-  .log li.restart i { background: var(--bad); } .log li.gesture i { background: #f472b6; }
+  .log li.restart i { background: var(--bad); } .log li.person i { background: #fb923c; box-shadow: 0 0 6px rgba(251,146,60,.8); } .log li.gesture i { background: #f472b6; }
 
   /* A hand sign seen by the tracker: big emoji pops over the video */
   .g-pop { position: absolute; left: 50%; top: 42%; transform: translate(-50%, -50%); display: grid; justify-items: center;
