@@ -247,6 +247,8 @@ function logEvent(kind, text) {
   for (const s of metaSubscribers) s.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
 }
 
+const objectSeen = new Map();       // label → last time seen
+
 function trackActivity(meta) {
   const now = Date.now();
   const f = (meta.faces || [])[0];
@@ -259,6 +261,13 @@ function trackActivity(meta) {
       if (f.id === 'known') logEvent('known', `${who} is here`);
       else logEvent('stranger', 'Unknown person in view');
     }
+  }
+  // Objects (YOLOX on the laptop): log a kind when it shows up after 10 min away
+  for (const o of Array.isArray(meta.objects) ? meta.objects : []) {
+    const label = String(o.label || '').slice(0, 24);
+    if (!label) continue;
+    if (!objectSeen.has(label) || now - objectSeen.get(label) > 600000) logEvent('object', `Seen: ${label}`);
+    objectSeen.set(label, now);
   }
   const g = meta.gesture;           // {name, who, t} from the tracker's hand-sign reader
   if (g && typeof g.t === 'number' && g.t > lastGesture) {
@@ -673,6 +682,7 @@ const STYLE = `
               align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 12px;
               background: rgba(7,9,12,.85); border: 1px solid var(--line); font-size: 13px; }
   .zone-bar span { color: var(--muted); }
+  .log li.object i { background: #fbbf24; }
   .log li.restart i { background: var(--bad); } .log li.person i { background: #fb923c; box-shadow: 0 0 6px rgba(251,146,60,.8); } .log li.gesture i { background: #f472b6; }
 
   /* A hand sign seen by the tracker: big emoji pops over the video */
@@ -1488,6 +1498,17 @@ function viewerPage() {
       var x = ox + b[0] * dw, y = oy + b[1] * dh;
       ctx.strokeRect(x, y, b[2] * dw, b[3] * dh);
       ctx.fillText('person', x + 5, y + 14);
+    });
+    ctx.setLineDash([]);
+    var objs = showBoxes && meta && Date.now() - metaAt < 2500 ? (meta.objects || []) : [];
+    ctx.setLineDash([4, 4]); ctx.lineWidth = 1.5; ctx.strokeStyle = '#fbbf24';
+    ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+    objs.forEach(function (o) {                          // everything else YOLOX sees (amber, dashed)
+      var x = ox + o.x * dw, y = oy + o.y * dh, w = o.w * dw, h = o.h * dh;
+      ctx.strokeRect(x, y, w, h);
+      var t = o.label + ' ' + Math.round(o.score * 100) + '%', tw = ctx.measureText(t).width + 10;
+      ctx.fillStyle = 'rgba(7,9,12,.72)'; ctx.fillRect(x, Math.max(0, y - 16), tw, 16);
+      ctx.fillStyle = '#fde68a'; ctx.fillText(t, x + 5, Math.max(12, y - 4));
     });
     ctx.setLineDash([]);
     var hand = showBoxes && meta && Date.now() - metaAt < 1500 ? meta.hand : null;
