@@ -259,7 +259,7 @@ function trackActivity(meta) {
     if (who && who !== presence.who) {
       presence.who = who;
       if (f.id === 'known') logEvent('known', `${who} is here`);
-      else logEvent('stranger', 'Unknown person in view');
+      else { logEvent('stranger', 'Unknown person in view'); autoDescribe(); }
     }
   }
   // Objects (YOLOX on the laptop): log a kind when it shows up after 10 min away
@@ -338,6 +338,85 @@ function handleMeta(req, res) {
 // The board sends its confirmed person detections with each poll
 // (X-Person: count;confidence;direction). A rise is a new detection; a lower
 // count means the board restarted, so re-baseline.
+// ── AYA's scene understanding ───────────────────────────────────────────
+// One camera 2 frame goes to an open-weight vision model (Llama 4 Scout) on
+// Hugging Face Inference Providers — only when something happens (a person,
+// a stranger) or someone asks on the page. Free accounts get a small monthly
+// credit, so there's a daily cap, and automatic descriptions leave room for
+// questions. HF_TOKEN: a fine-grained token with only "Inference Providers".
+const HF_TOKEN = process.env.HF_TOKEN || '';
+const VISION_MODEL = process.env.VISION_MODEL || 'meta-llama/Llama-4-Scout-17B-16E-Instruct';
+const VISION_DAILY = parseInt(process.env.VISION_DAILY || '30', 10);
+const VISION_AUTO_MAX = Math.max(0, VISION_DAILY - 10);   // the last 10 a day are for questions
+const VISION_AUTO_GAP_MS = 3 * 60 * 1000;                 // at most one automatic description per 3 min
+const vision = { day: '', used: 0, auto: 0, busy: false, lastAuto: 0, err: null };
+
+function visionDay() {
+  const d = new Date().toISOString().slice(0, 10);
+  if (d !== vision.day) { vision.day = d; vision.used = 0; vision.auto = 0; }
+}
+
+async function askVision(question) {
+  visionDay();
+  if (!HF_TOKEN) throw new Error('AI is not set up on the server (HF_TOKEN missing)');
+  if (!latestFrame || Date.now() - latestAt > OFFLINE_AFTER_MS) throw new Error('the camera is offline');
+  if (vision.used >= VISION_DAILY) throw new Error(`today's limit of ${VISION_DAILY} AI looks is used up`);
+  if (vision.busy) throw new Error('AYA is still looking — try again in a moment');
+  vision.busy = true;
+  vision.used++;
+  try {
+    const ask = question
+      ? `${question}\nAnswer in one or two short sentences. If the picture can't show it, say so.`
+      : 'In one short sentence, say what is happening. Mention people first (how many, what they are doing); say so if nobody is there.';
+    const r = await fetch('https://router.huggingface.co/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + HF_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: VISION_MODEL, max_tokens: 120, temperature: 0.2, messages: [
+        { role: 'system', content: 'You are AYA, a home security camera. The picture is a small 160x120 grayscale frame, so be brief and honest about what is unclear.' },
+        { role: 'user', content: [{ type: 'text', text: ask },
+          { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + latestFrame.toString('base64') } }] }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!r.ok) throw new Error(`AI service error ${r.status}`);
+    const d = await r.json();
+    const text = String((d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || '')
+      .replace(/\s+/g, ' ').trim().slice(0, 400);
+    if (!text) throw new Error('the AI gave no answer');
+    vision.err = null;
+    return text;
+  } catch (e) {
+    vision.err = String(e.message || e).slice(0, 160);
+    throw e;
+  } finally {
+    vision.busy = false;
+  }
+}
+
+function autoDescribe() {                         // after a person/stranger event
+  visionDay();
+  if (!HF_TOKEN || vision.auto >= VISION_AUTO_MAX || Date.now() - vision.lastAuto < VISION_AUTO_GAP_MS) return;
+  vision.lastAuto = Date.now();
+  vision.auto++;
+  setTimeout(() => askVision(null).then((t) => logEvent('ai', t)).catch(() => {}), 1500);  // let them walk into view
+}
+
+function handleAsk(req, res) {
+  if (!sessionOk(req)) return send(res, 401, 'application/json', JSON.stringify({ error: 'not logged in' }));
+  const chunks = [];
+  req.on('data', (c) => { chunks.push(c); if (chunks.length > 4) req.destroy(); });
+  req.on('end', async () => {
+    let q;
+    try { q = String(JSON.parse(Buffer.concat(chunks).toString('utf8')).q || '').trim().slice(0, 200); }
+    catch { return send(res, 400, 'application/json', JSON.stringify({ error: 'bad json' })); }
+    try {
+      const text = await askVision(q || null);
+      send(res, 200, 'application/json', JSON.stringify({ text, left: VISION_DAILY - vision.used }));
+    } catch (e) {
+      send(res, 503, 'application/json', JSON.stringify({ error: String(e.message || e), left: VISION_DAILY - vision.used }));
+    }
+  });
+}
+
 let personSeen = null;
 // AYA's auto-framing (X-AF: "x,y,zoom,locked" in the 80x60 frame, or "off"),
 // passed to the page so its video follows the same way as the OLED
@@ -360,6 +439,7 @@ function notePerson(req) {
     let text = `Person detected · ${parseInt(conf, 10) || '?'}%`;
     if (dir === 'left' || dir === 'right') text += ` · moving ${dir}`;
     logEvent('person', text);
+    autoDescribe();
   }
   personSeen = count;
 }
@@ -442,7 +522,7 @@ function status() {
   const age = latestAt ? Date.now() - latestAt : null;
   return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
            fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
-           ...ages() };
+           ...ages(), vision: { on: !!HF_TOKEN, used: (visionDay(), vision.used), limit: VISION_DAILY, err: vision.err } };
 }
 
 const server = http.createServer((req, res) => {
@@ -455,6 +535,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && url.pathname === '/meta') return handleMeta(req, res);
   if (req.method === 'POST' && url.pathname === '/cmd') return handleCmd(req, res);
   if (req.method === 'POST' && url.pathname === '/login') return handleLogin(req, res);
+  if (req.method === 'POST' && url.pathname === '/ask') return handleAsk(req, res);
   if (req.method === 'POST' && url.pathname === '/display') {
     if (!device) return send(res, 401, 'text/plain', 'bad key');
     return handleDisplayPost(req, res);
@@ -683,6 +764,17 @@ const STYLE = `
               background: rgba(7,9,12,.85); border: 1px solid var(--line); font-size: 13px; }
   .zone-bar span { color: var(--muted); }
   .log li.object i { background: #fbbf24; }
+  .log li.ai i { background: #a78bfa; box-shadow: 0 0 6px rgba(167,139,250,.7); }
+  .ask { display: flex; gap: 8px; }
+  .ask input { flex: 1; min-width: 0; background: var(--surface-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px; font: inherit; }
+  .ask input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .ask-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .ask-chips .btn { font-size: 12px; padding: 5px 10px; }
+  .ask-a { margin-top: 10px; padding: 10px 12px; border-radius: 10px; background: var(--surface-2);
+    border-left: 3px solid #a78bfa; line-height: 1.45; }
+  .ask-a.err { border-left-color: var(--bad); color: var(--muted); }
+  .ask-a.wait { color: var(--muted); }
   .log li.restart i { background: var(--bad); } .log li.person i { background: #fb923c; box-shadow: 0 0 6px rgba(251,146,60,.8); } .log li.gesture i { background: #f472b6; }
 
   /* A hand sign seen by the tracker: big emoji pops over the video */
@@ -898,6 +990,16 @@ function viewerPage() {
         <div class="health" id="detect"></div>
       </section>
 
+      <section class="card" aria-label="Ask AYA">
+        <div class="card-head"><h2>Ask AYA</h2><span class="mood" id="ask-left">—</span></div>
+        <form class="ask" id="ask-form">
+          <input id="ask-q" maxlength="200" autocomplete="off" placeholder="Is anyone in the room? What's on the table?">
+          <button class="btn primary" id="ask-go" type="submit">Ask</button>
+        </form>
+        <div class="ask-chips"><button class="btn" data-q="">What's happening?</button><button class="btn" data-q="Is anyone there?">Anyone there?</button><button class="btn" data-q="Is the light on?">Light on?</button></div>
+        <div class="ask-a" id="ask-a" hidden></div>
+      </section>
+
       <section class="card" aria-label="Activity">
         <div class="card-head"><h2>Activity</h2></div>
         <ol class="log" id="log"><li class="empty">Nothing yet</li></ol>
@@ -1102,6 +1204,7 @@ function viewerPage() {
       : s.eye2_age !== null ? 'no frames · ' + ago(s.eye2_age) : 'no frames yet');
     var dispOk = s.display_age !== null && s.display_age < 10000;
     sysCell('sys-display', dispOk ? 'ok' : 'bad', dispOk ? 'online' : s.display_age !== null ? 'offline · ' + ago(s.display_age) : 'not seen');
+    if (s.vision) $('ask-left').textContent = s.vision.on ? (s.vision.limit - s.vision.used) + ' left today' : 'AI not set up';
     var trOk = s.tracker_age !== null && s.tracker_age < 5000;
     sysCell('sys-tracker', trOk ? 'ok' : '', trOk ? 'running' : s.tracker_age !== null ? 'stopped · ' + ago(s.tracker_age) + ' ago' : 'not running');
     var bad = [camOk, dispOk].filter(function (x) { return !x; }).length;
@@ -1216,6 +1319,23 @@ function viewerPage() {
     while (list.children.length > LOG_MAX) list.lastChild.remove();
   }
 
+
+  // ── Ask AYA: one look by the vision model at the current frame ──
+  async function ask(q) {
+    var a = $('ask-a'), go = $('ask-go');
+    a.hidden = false; a.className = 'ask-a wait'; a.textContent = 'Looking…'; go.disabled = true;
+    try {
+      var r = await fetch('/ask', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q: q }) });
+      var d = await r.json();
+      a.className = 'ask-a' + (d.error ? ' err' : ''); a.textContent = d.error || d.text;
+      if (typeof d.left === 'number') $('ask-left').textContent = d.left + ' left today';
+    } catch (e) { a.className = 'ask-a err'; a.textContent = 'Could not reach AYA.'; }
+    go.disabled = false;
+  }
+  $('ask-form').addEventListener('submit', function (e) { e.preventDefault(); ask($('ask-q').value.trim()); });
+  document.querySelectorAll('.ask-chips .btn').forEach(function (b) {
+    b.addEventListener('click', function () { $('ask-q').value = b.dataset.q; ask(b.dataset.q); });
+  });
 
   // ── Ignore zones: 16x12 grid over the picture; bit c of row r = ignore ──
   var ZC = 16, ZR = 12, zoneEdit = null, zonePaint = null, zonesEl = $('zones');
