@@ -276,7 +276,7 @@ function trackActivity(meta) {
   }
   const r = meta.robot;
   if (r && typeof r.sleeping === 'boolean' && r.sleeping !== presence.sleeping) {
-    if (presence.sleeping !== null) logEvent(r.sleeping ? 'sleep' : 'wake', r.sleeping ? 'ARIA fell asleep' : 'ARIA woke up');
+    if (presence.sleeping !== null) logEvent(r.sleeping ? 'sleep' : 'wake', r.sleeping ? 'AYA fell asleep' : 'AYA woke up');
     presence.sleeping = r.sleeping;
   }
 }
@@ -467,7 +467,7 @@ const server = http.createServer((req, res) => {
     case '/manifest.webmanifest':                  // "Add to home screen": opens straight into the viewer
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/manifest+json', JSON.stringify({
-        name: 'ARIA Cam', short_name: 'ARIA', display: 'standalone', background_color: '#07090c', theme_color: '#07090c',
+        name: 'AYA Cam', short_name: 'AYA', display: 'standalone', background_color: '#07090c', theme_color: '#07090c',
         start_url: '/', scope: '/',
         icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }] }));
     case '/icon.svg':
@@ -800,9 +800,9 @@ const LOGO = `<svg viewBox="0 0 26 26" fill="#5eead4" aria-hidden="true">
 function loginPage(error) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#07090c">
-<title>ARIA Cam · Sign in</title><style>${STYLE}</style></head><body>
+<title>AYA Cam · Sign in</title><style>${STYLE}</style></head><body>
 <div class="login"><form method="post" action="/login">
-  <div class="brand"><div class="logo">${LOGO}</div><div><div class="name">ARIA</div><div class="tag">Home camera</div></div></div>
+  <div class="brand"><div class="logo">${LOGO}</div><div><div class="name">AYA</div><div class="tag">Home camera</div></div></div>
   <h1>Sign in</h1>
   <p>Private system. Enter the access key to continue.</p>
   ${error ? `<p class="err">${error}</p>` : ''}
@@ -814,12 +814,12 @@ function loginPage(error) {
 function viewerPage() {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#07090c"><title>ARIA Cam</title>
+<meta name="theme-color" content="#07090c"><title>AYA Cam</title>
 <link rel="manifest" id="manifest-link"><link rel="icon" href="/icon.svg"><link rel="apple-touch-icon" href="/icon.svg">
 <meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">
 <style>${STYLE}</style></head><body>
 <header class="top">
-  <div class="brand"><div class="logo">${LOGO}</div><div><div class="name">ARIA</div><div class="tag">Home camera</div></div></div>
+  <div class="brand"><div class="logo">${LOGO}</div><div><div class="name">AYA</div><div class="tag">Home camera</div></div></div>
   <div class="top-right"><span class="clock" id="clock"></span><span class="live" id="live"><i></i><span id="live-text">Connecting</span></span></div>
 </header>
 
@@ -879,9 +879,9 @@ function viewerPage() {
           <div id="sys-tracker"><i></i><span>Face tracker</span><small>–</small></div>
         </div>
       </section>
-      <section class="card" aria-label="ARIA">
-        <div class="card-head"><h2>ARIA</h2><span class="mood" id="mood">—</span></div>
-        <div class="robot-wrap" id="robot-wrap" hidden><canvas id="robot" width="128" height="64" aria-label="ARIA's display, live"></canvas></div>
+      <section class="card" aria-label="AYA">
+        <div class="card-head"><h2>AYA</h2><span class="mood" id="mood">—</span></div>
+        <div class="robot-wrap" id="robot-wrap" hidden><canvas id="robot" width="128" height="64" aria-label="AYA's display, live"></canvas></div>
         <div class="slim" id="robot-off">The display's screen shows here while it's online.</div>
         <div class="meters" id="meters" hidden>
           <div class="meter"><span>Energy</span><div class="bar"><span id="m-energy"></span></div><span class="val" id="v-energy">–</span></div>
@@ -905,8 +905,8 @@ function viewerPage() {
     </div>
 
     <div class="pane" data-pane="display" role="tabpanel" hidden>
-      <section class="card" aria-label="ARIA controls">
-        <div class="card-head"><h2>Talk to ARIA</h2><span class="mood" id="disp-state">—</span></div>
+      <section class="card" aria-label="AYA controls">
+        <div class="card-head"><h2>Talk to AYA</h2><span class="mood" id="disp-state">—</span></div>
         <div id="aria-controls">
           <div class="ctl"><div>Display<small>Turn the OLED screen on or off</small></div>
             <button class="switch" id="screen" role="switch" aria-checked="true" aria-label="Display on"></button></div>
@@ -973,7 +973,7 @@ function viewerPage() {
   </aside>
   <div class="h-tip" id="h-tip" hidden></div>
 </main>
-<footer class="foot"><span>ARIA camera (OV7670) · via Render · <span id="viewers">0</span> watching</span>
+<footer class="foot"><span>AYA camera (OV7670) · via Render · <span id="viewers">0</span> watching</span>
   <span class="kbd">Keys: <b>1</b>–<b>4</b> tabs · <b>F</b> fullscreen · <b>S</b> snapshot</span></footer>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
