@@ -449,8 +449,8 @@ const server = http.createServer((req, res) => {
     case '/stream':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return handleStream(req, res);
-    case '/snapshot':
-      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+    case '/snapshot':                              // the page, or the laptop's face tracker (X-Cam-Key)
+      if (!authed && !keyMatches(req.headers['x-cam-key'], CAM_KEY)) return send(res, 401, 'text/plain', 'bad key');
       lastPollAt = Date.now();
       if (!latestFrame) return send(res, 503, 'text/plain', 'no frame yet');
       return send(res, 200, 'image/jpeg', latestFrame);
