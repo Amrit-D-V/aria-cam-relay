@@ -258,8 +258,8 @@ function trackActivity(meta) {
     const who = f.id === 'known' ? f.name : f.id === 'unknown' ? 'stranger' : null;
     if (who && who !== presence.who) {
       presence.who = who;
-      if (f.id === 'known') logEvent('known', `${who} is here`);
-      else { logEvent('stranger', 'Unknown person in view'); autoDescribe(); }
+      if (f.id === 'known') { logEvent('known', `${who} is here`); captureEvent('known', `${who} is here`); }
+      else { logEvent('stranger', 'Unknown person in view'); captureEvent('stranger', 'Unknown person in view'); autoDescribe(); }
     }
   }
   // Objects (YOLOX on the laptop): log a kind when it shows up after 10 min away
@@ -397,7 +397,11 @@ function autoDescribe() {                         // after a person/stranger eve
   if (!HF_TOKEN || vision.auto >= VISION_AUTO_MAX || Date.now() - vision.lastAuto < VISION_AUTO_GAP_MS) return;
   vision.lastAuto = Date.now();
   vision.auto++;
-  setTimeout(() => askVision(null).then((t) => logEvent('ai', t)).catch(() => {}), 1500);  // let them walk into view
+  setTimeout(() => askVision(null).then((t) => {
+    logEvent('ai', t);
+    const ev = gallery[0];                         // the description belongs with the event's snapshot
+    if (ev && Date.now() - ev.t < 20000 && !ev.ai) { ev.ai = t; broadcast('gallery', galleryItem(ev)); }
+  }).catch(() => {}), 1500);  // let them walk into view
 }
 
 function handleAsk(req, res) {
@@ -439,9 +443,62 @@ function notePerson(req) {
     let text = `Person detected · ${parseInt(conf, 10) || '?'}%`;
     if (dir === 'left' || dir === 'right') text += ` · moving ${dir}`;
     logEvent('person', text);
+    captureEvent('person', text);
     autoDescribe();
   }
   personSeen = count;
+}
+
+// The display's real screen state (a long touch can switch it): "on,seq",
+// where seq counts its local changes — a newer one wins over the page's switch
+let screenSeq = 0;
+function noteScreen(req) {
+  const [on, seq] = String(req.headers['x-screen'] || '').split(',').map(Number);
+  if (!Number.isFinite(on) || !Number.isFinite(seq)) return;
+  if (seq < screenSeq) screenSeq = seq;           // it restarted: its count starts over
+  if (seq > screenSeq) {
+    screenSeq = seq;
+    const v = on ? 1 : 0;
+    if (displayState.screen !== v) {
+      displayState.screen = v;
+      broadcast('display', publicDisplay());
+      logEvent('screen', `Screen turned ${v ? 'on' : 'off'} by touch`);
+    }
+  }
+}
+
+// Sent with the display's first poll after it starts: why it (re)started
+function noteBoot(req) {
+  const why = String(req.headers['x-boot'] || '').replace(/[^\x20-\x7e]/g, '').slice(0, 60);
+  if (why) logEvent('restart', `AYA started · ${why}`);
+}
+
+// ── Event gallery ───────────────────────────────────────────────────────
+// A person, a stranger or a family member arriving keeps a snapshot — the
+// frame at that moment plus up to two more over the next 2 s (whoever it was
+// usually walks further into view). Kept in memory: the last 60 events,
+// ~3 KB a frame; a relay restart (redeploy) clears them.
+const GALLERY_MAX = 60;
+const gallery = [];               // newest first: {id, t, kind, text, frames: [Buffer], ai}
+let galleryId = 0;
+const lastShot = {};              // kind → time, so a burst of detections is one event
+function galleryItem(e) { return { id: e.id, t: e.t, kind: e.kind, text: e.text, ai: e.ai, n: e.frames.length }; }
+function captureEvent(kind, text) {
+  const now = Date.now();
+  if (!latestFrame || now - latestAt > OFFLINE_AFTER_MS) return;
+  if (kind === 'person' && now - (lastShot.person || 0) < 20000) return;
+  lastShot[kind] = now;
+  const ev = { id: ++galleryId, t: now, kind, text, frames: [latestFrame], ai: null };
+  gallery.unshift(ev);
+  if (gallery.length > GALLERY_MAX) gallery.pop();
+  broadcast('gallery', galleryItem(ev));
+  let tries = 0;
+  const more = () => {
+    if (latestFrame && latestFrame !== ev.frames[ev.frames.length - 1]) ev.frames.push(latestFrame);
+    if (ev.frames.length < 3 && ++tries < 4) setTimeout(more, 700);
+    else broadcast('gallery', galleryItem(ev));
+  };
+  setTimeout(more, 700);
 }
 
 function handleDisplayPost(req, res) {
@@ -453,6 +510,8 @@ function handleDisplayPost(req, res) {
     seen.display = Date.now();
     notePerson(req);
     noteAf(req);
+    noteScreen(req);
+    noteBoot(req);
     if (buf.length === 1024) {
       const out = Buffer.alloc(1024);
       for (let y = 0; y < 64; y++)
@@ -578,11 +637,23 @@ const server = http.createServer((req, res) => {
     case '/status':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(status()));
+    case '/gallery':
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return send(res, 200, 'application/json', JSON.stringify(gallery.map(galleryItem)), { 'Cache-Control': 'no-store' });
     case '/health':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify({ every: HEALTH_EVERY_MS, samples: healthSamples }));
-    default:
+    default: {
+      const g = /^\/gallery\/(\d+)\/(\d)\.jpg$/.exec(url.pathname);   // one snapshot of an event
+      if (g) {
+        if (!authed) return send(res, 401, 'text/plain', 'bad key');
+        const ev = gallery.find((e) => e.id === +g[1]);
+        const f = ev && ev.frames[+g[2]];
+        if (!f) return send(res, 404, 'text/plain', 'gone');
+        return send(res, 200, 'image/jpeg', f, { 'Cache-Control': 'private, max-age=86400' });
+      }
       return send(res, 404, 'text/plain', 'not found');
+    }
   }
 });
 
@@ -763,6 +834,37 @@ const STYLE = `
               background: rgba(7,9,12,.85); border: 1px solid var(--line); font-size: 13px; }
   .zone-bar span { color: var(--muted); }
   .log li.object i { background: #fbbf24; }
+  .log li.screen i { background: var(--muted); }
+  .gal-seg { margin-bottom: 10px; }
+  .gal { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  .gal .slim { grid-column: 1 / -1; }
+  .tile { position: relative; padding: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+          background: var(--surface-2); cursor: pointer; text-align: left; color: var(--text); font: inherit; }
+  .tile img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: #000; }
+  .tile .cap { padding: 6px 8px; font-size: 12px; display: grid; gap: 1px; }
+  .tile .cap b { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile .cap span { color: var(--muted); }
+  .tile .kind { position: absolute; top: 6px; left: 6px; font-size: 11px; font-weight: 700; padding: 2px 7px;
+                border-radius: 999px; background: rgba(7,9,12,.75); }
+  .tile.person .kind { color: #fdba74; } .tile.stranger .kind { color: var(--warn); } .tile.known .kind { color: var(--good); }
+  .tile .ai-mark { position: absolute; top: 6px; right: 6px; width: 8px; height: 8px; border-radius: 50%; background: #a78bfa; }
+  .tile:focus-visible { outline: 2px solid var(--accent); }
+  .gal-note { margin-top: 10px; }
+  .viewer { border: 1px solid var(--line); border-radius: 14px; padding: 0; background: var(--surface); color: var(--text);
+            width: min(640px, calc(100vw - 32px)); }
+  .viewer::backdrop { background: rgba(0,0,0,.7); }
+  .v-img { position: relative; background: #000; }
+  .v-img img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; image-rendering: auto; }
+  .v-step { position: absolute; bottom: 8px; right: 10px; font-size: 12px; color: #cbd5e1; background: rgba(7,9,12,.7);
+            padding: 2px 8px; border-radius: 999px; }
+  .v-body { padding: 14px 16px 16px; display: grid; gap: 6px; }
+  .v-title { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+  .v-title i { width: 9px; height: 9px; border-radius: 50%; background: #fb923c; flex: none; }
+  .v-time { color: var(--muted); font-size: 13px; }
+  .v-ai { border-left: 3px solid #a78bfa; padding: 6px 10px; background: var(--surface-2); border-radius: 8px; line-height: 1.45; }
+  .v-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  .v-row .primary { margin-left: auto; }
+  .v-row a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   .log li.ai i { background: #a78bfa; box-shadow: 0 0 6px rgba(167,139,250,.7); }
   .ask { display: flex; gap: 8px; }
   .ask input { flex: 1; min-width: 0; background: var(--surface-2); color: var(--text); border: 1px solid var(--line);
@@ -958,6 +1060,7 @@ function viewerPage() {
       <button role="tab" data-tab="home" aria-selected="true"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>Home</button>
       <button role="tab" data-tab="display" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>Display</button>
       <button role="tab" data-tab="camera" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 10l5-3v10l-5-3z"/><rect x="2" y="6" width="13" height="12" rx="2"/></svg></span>Camera</button>
+      <button role="tab" data-tab="events" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.8"/><path d="M21 16l-5-5-9 8"/></svg></span>Events</button>
       <button role="tab" data-tab="health" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span>Health</button>
     </nav>
 
@@ -1058,6 +1161,32 @@ function viewerPage() {
         </div>
       </section>
     </div>
+
+    <div class="pane" data-pane="events" role="tabpanel" hidden>
+      <section class="card" aria-label="Events">
+        <div class="card-head"><h2>Events</h2><span class="mood" id="gal-count">—</span></div>
+        <div class="seg gal-seg" id="gal-seg">
+          <button data-k="all" aria-pressed="true">All</button><button data-k="person">People</button>
+          <button data-k="stranger">Strangers</button><button data-k="known">Family</button>
+        </div>
+        <div class="gal" id="gal"><div class="slim">No events yet. Snapshots appear here when AYA detects someone.</div></div>
+        <div class="slim gal-note">The last 60 events are kept until the server restarts.</div>
+      </section>
+    </div>
+    <dialog class="viewer" id="viewer">
+      <div class="v-img"><img id="v-img" alt="Event snapshot"><span class="v-step" id="v-step"></span></div>
+      <div class="v-body">
+        <div class="v-title"><i id="v-dot"></i><b id="v-text"></b></div>
+        <div class="v-time" id="v-time"></div>
+        <div class="v-ai" id="v-ai" hidden></div>
+        <div class="v-row">
+          <button class="btn" id="v-prev" aria-label="Newer event">‹ Newer</button>
+          <a class="btn" id="v-dl" download>Download</a>
+          <button class="btn" id="v-next" aria-label="Older event">Older ›</button>
+          <button class="btn primary" id="v-close">Close</button>
+        </div>
+      </div>
+    </dialog>
 
     <div class="pane" data-pane="health" role="tabpanel" hidden>
       <section class="card" aria-label="Camera health">
@@ -1243,6 +1372,13 @@ function viewerPage() {
     if (navigator.vibrate) navigator.vibrate(30);
   }
   es.addEventListener('log', function (e) { try { addLog(JSON.parse(e.data)); } catch (x) {} });
+  es.addEventListener('gallery', function (e) {
+    try {
+      var ev = JSON.parse(e.data), i = gal.findIndex(function (x) { return x.id === ev.id; });
+      if (i >= 0) gal[i] = ev; else { gal.unshift(ev); if (gal.length > 60) gal.pop(); }
+      if (!$('viewer').open) galRender();
+    } catch (x) {}
+  });
   es.addEventListener('af', function (e) { try { af = JSON.parse(e.data); applyAf(); } catch (x) {} });
 
   function fresh() { return meta && Date.now() - metaAt < 3000; }
@@ -1317,6 +1453,71 @@ function viewerPage() {
     while (list.children.length > LOG_MAX) list.lastChild.remove();
   }
 
+
+  // ── Events: snapshots of people, strangers and family arriving ──
+  var gal = [], galKind = 'all', galOpen = -1, galPlay = null;
+  var KIND = { person: 'Person', stranger: 'Stranger', known: 'Family' };
+  function galShown() { return gal.filter(function (e) { return galKind === 'all' || e.kind === galKind; }); }
+  function galRender() {
+    var list = galShown(), box = $('gal');
+    $('gal-count').textContent = gal.length ? gal.length + (gal.length === 1 ? ' event' : ' events') : '—';
+    box.textContent = '';
+    if (!list.length) {
+      var p = document.createElement('div'); p.className = 'slim';
+      p.textContent = gal.length ? 'Nothing of this kind yet.' : 'No events yet. Snapshots appear here when AYA detects someone.';
+      box.append(p); return;
+    }
+    list.forEach(function (e, i) {
+      var b = document.createElement('button'); b.className = 'tile ' + e.kind; b.type = 'button';
+      var img = document.createElement('img'); img.loading = 'lazy'; img.alt = e.text; img.src = '/gallery/' + e.id + '/0.jpg';
+      var k = document.createElement('span'); k.className = 'kind'; k.textContent = KIND[e.kind] || e.kind;
+      var cap = document.createElement('span'); cap.className = 'cap';
+      var t = document.createElement('b'); t.textContent = e.text;
+      var w = document.createElement('span'); w.textContent = new Date(e.t).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+      cap.append(t, w); b.append(img, k, cap);
+      if (e.ai) { var m = document.createElement('i'); m.className = 'ai-mark'; m.title = 'AI description'; b.append(m); }
+      b.addEventListener('click', function () { galView(i); });
+      box.append(b);
+    });
+  }
+  function galView(i) {
+    var list = galShown(); if (!list[i]) return;
+    galOpen = i; var e = list[i], f = 0;
+    $('v-text').textContent = e.text;
+    $('v-time').textContent = new Date(e.t).toLocaleString();
+    $('v-ai').hidden = !e.ai; $('v-ai').textContent = e.ai || '';
+    $('v-dot').style.background = e.kind === 'stranger' ? 'var(--warn)' : e.kind === 'known' ? 'var(--good)' : '#fb923c';
+    $('v-prev').disabled = i === 0; $('v-next').disabled = i === list.length - 1;
+    function show() {
+      $('v-img').src = '/gallery/' + e.id + '/' + f + '.jpg';
+      $('v-dl').href = $('v-img').src; $('v-dl').setAttribute('download', 'aya-' + e.kind + '-' + e.id + '-' + (f + 1) + '.jpg');
+      $('v-step').textContent = e.n > 1 ? (f + 1) + ' / ' + e.n : '';
+    }
+    show();
+    clearInterval(galPlay);
+    if (e.n > 1) galPlay = setInterval(function () { f = (f + 1) % e.n; show(); }, 900);   // the moments, as a loop
+    if (!$('viewer').open) $('viewer').showModal();
+  }
+  $('v-close').addEventListener('click', function () { $('viewer').close(); });
+  $('viewer').addEventListener('close', function () { clearInterval(galPlay); galOpen = -1; });
+  $('viewer').addEventListener('click', function (e) { if (e.target === $('viewer')) $('viewer').close(); });
+  $('v-prev').addEventListener('click', function () { galView(galOpen - 1); });
+  $('v-next').addEventListener('click', function () { galView(galOpen + 1); });
+  document.addEventListener('keydown', function (e) {
+    if (!$('viewer').open) return;
+    if (e.key === 'ArrowLeft') galView(galOpen - 1);
+    if (e.key === 'ArrowRight') galView(galOpen + 1);
+  });
+  $('gal-seg').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    galKind = b.dataset.k;
+    $('gal-seg').querySelectorAll('button').forEach(function (x) { x.setAttribute('aria-pressed', String(x === b)); });
+    galRender();
+  });
+  async function galLoad() {
+    try { gal = await (await fetch('/gallery', { cache: 'no-store' })).json(); galRender(); } catch (e) {}
+  }
+  galLoad();
 
   // ── Ask AYA: one look by the vision model at the current frame ──
   async function ask(q) {
