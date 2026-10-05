@@ -90,7 +90,7 @@ const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'sh
 const MSG_MAX = 120;
 const VIEWS = ['auto', 'sage', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
 // view/zoom2 start as null: after a relay restart the display keeps what it shows until someone picks
-const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, view: null, zoom2: null, ignore: null };
+const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, shutdown: 0, view: null, zoom2: null, ignore: null };
 
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
@@ -104,7 +104,8 @@ let boardFace = null;
 function publicDisplay() {
   const m = displayState.msg;
   return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
-           emotion: displayState.emotion, restart: displayState.restart, view: displayState.view, zoom2: displayState.zoom2,
+           emotion: displayState.emotion, restart: displayState.restart, shutdown: displayState.shutdown,
+           view: displayState.view, zoom2: displayState.zoom2,
            ignore: displayState.ignore, face: boardFace && Date.now() - boardFace.t < 3000 ? boardFace : null };
 }
 
@@ -169,6 +170,11 @@ function handleCmd(req, res) {
       displayState.restart = Date.now();
       logEvent('privacy', 'System restart');
       return send(res, 202, 'text/plain', 'restarting');
+    }
+    if (cmd === 'shutdown') {          // deep sleep on its next poll; only a touch (or EN / power) wakes it
+      displayState.shutdown = Date.now();
+      logEvent('restart', 'Shut down from the page · touch AYA to wake her');
+      return send(res, 202, 'text/plain', 'shutting down');
     }
     if (cmd === 'view') {              // what the OLED shows: auto rotation, one screen, or camera 2 live
       if (!VIEWS.includes(args[0])) return send(res, 400, 'text/plain', 'view ' + VIEWS.join('|'));
@@ -1157,6 +1163,7 @@ function viewerPage() {
           <div class="ctl keep" style="margin-top:8px"><div>Ignore zones<small id="zone-sub">Watching the whole picture</small></div>
             <button class="btn" id="zone-edit">Edit</button></div>
           <div class="ctl keep"><div>Restart system<small>Display + camera, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
+          <div class="ctl keep"><div>Shut down<small>Screen, camera and WiFi off. Wake AYA by touching her touch sensor (or unplug and replug)</small></div><button class="btn danger" id="shutdown">Shut down</button></div>
           <div class="ctl keep"><div>Session<small>Signed in on this browser for 30 days</small></div><a class="btn" href="/logout">Sign out</a></div>
         </div>
       </section>
@@ -1586,7 +1593,7 @@ function viewerPage() {
   }
 
   var SENT = { ignore: 'Ignore zones saved', message: 'Message sent to the display', emotion: 'Sent to the display', view: 'Display updated',
-               screen: 'Display switched', restart_all: 'Restarting camera + display…', zoom2: 'Camera 2 zoom set',
+               screen: 'Display switched', restart_all: 'Restarting camera + display…', shutdown: 'Shutting down…', zoom2: 'Camera 2 zoom set',
              };
   async function send(cmd, args, extra) {
     try {
@@ -1600,6 +1607,10 @@ function viewerPage() {
       return r.status;
     } catch (e) { toast('Could not reach the server', 'err'); return 0; }
   }
+  $('shutdown').onclick = function () {
+    if (confirm('Shut AYA down?\n\nShe stops watching: screen, camera and WiFi go off, and this page can\'t wake her. ' +
+                'Touch her touch sensor to wake her (or unplug and replug her).')) send('shutdown');
+  };
   $('restart').onclick = function () {
     if (confirm('Restart the display and its camera? The picture drops for about 20 seconds.')) send('restart_all');
   };
