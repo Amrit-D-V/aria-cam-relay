@@ -9,7 +9,11 @@
 //                    names, emotions and the robot's mood, drawn over the video
 //   GET  /events     Server-Sent Events: /meta updates as messages, plus named
 //                    "log" events for the activity timeline (?key=)
-//   GET  /?key=      viewer page      (key: $VIEW_KEY)
+//   GET  /           the page — behind a login: POST /login with the admin key
+//                    sets a signed cookie (30 days); GET /logout clears it.
+//                    The page's own requests (/stream, /events, /status…) need
+//                    that cookie. Devices keep their keys (VIEW_KEY for the
+//                    display's /display poll, CAM_KEY for /push and /meta).
 //   POST /cmd        page → display command (header X-Admin-Key: $ADMIN_KEY,
 //                    else $CAM_KEY; JSON {cmd, args}) — screen, message,
 //                    emotion, view, camera zoom, restart
@@ -100,8 +104,41 @@ function publicDisplay() {
            ignore: displayState.ignore };
 }
 
+// ── Login: one key (ADMIN_KEY) opens the page ────────────────────────────
+// The cookie is "<expiry>.<HMAC(expiry)>" signed with the admin key, so it
+// survives relay restarts and changing ADMIN_KEY on Render logs everyone out.
+const SESSION_DAYS = 30;
+function sign(exp) { return crypto.createHmac('sha256', 'aya-session:' + ADMIN_KEY).update(String(exp)).digest('hex'); }
+function newSession() { const exp = Date.now() + SESSION_DAYS * 86400e3; return exp + '.' + sign(exp); }
+function sessionOk(req) {
+  const m = /(?:^|;\s*)aya_session=([0-9]+)\.([0-9a-f]{64})/.exec(req.headers.cookie || '');
+  if (!m || +m[1] < Date.now()) return false;
+  return keyMatches(m[2], sign(m[1]));
+}
+const loginFails = new Map();                   // ip → {n, until}: 5 wrong keys = 10 min wait
+function clientIp(req) { return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(); }
+function handleLogin(req, res) {
+  const ip = clientIp(req), f = loginFails.get(ip);
+  if (f && f.until > Date.now()) return send(res, 429, 'text/html; charset=utf-8', loginPage('Too many wrong keys. Try again in a few minutes.'));
+  const chunks = [];
+  req.on('data', (c) => { chunks.push(c); if (chunks.length > 4) req.destroy(); });
+  req.on('end', () => {
+    const key = new URLSearchParams(Buffer.concat(chunks).toString('utf8')).get('key') || '';
+    if (!keyMatches(key.trim(), ADMIN_KEY)) {
+      const n = (f && f.until <= Date.now() && f.n >= 5 ? 0 : (f ? f.n : 0)) + 1;
+      loginFails.set(ip, { n, until: n >= 5 ? Date.now() + 10 * 60e3 : 0 });
+      logEvent('privacy', 'Failed login attempt');
+      return send(res, 401, 'text/html; charset=utf-8', loginPage('That key is not valid.'));
+    }
+    loginFails.delete(ip);
+    res.writeHead(303, { Location: '/', 'Cache-Control': 'no-store',
+      'Set-Cookie': `aya_session=${newSession()}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly; Secure; SameSite=Strict` });
+    res.end();
+  });
+}
+
 function handleCmd(req, res) {
-  if (!keyMatches(req.headers['x-admin-key'], ADMIN_KEY)) return send(res, 401, 'text/plain', 'bad admin key');
+  if (!sessionOk(req) && !keyMatches(req.headers['x-admin-key'], ADMIN_KEY)) return send(res, 401, 'text/plain', 'not logged in');
   const chunks = [];
   req.on('data', (c) => { chunks.push(c); if (chunks.length > 8) req.destroy(); });
   req.on('end', () => {
@@ -378,13 +415,15 @@ function status() {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   const key = url.searchParams.get('key');
-  const authed = keyMatches(key, VIEW_KEY);
+  const device = keyMatches(key, VIEW_KEY);       // the display board's poll
+  const authed = sessionOk(req);                  // a logged-in browser
 
   if (req.method === 'POST' && url.pathname === '/push') return handlePush(req, res);
   if (req.method === 'POST' && url.pathname === '/meta') return handleMeta(req, res);
   if (req.method === 'POST' && url.pathname === '/cmd') return handleCmd(req, res);
+  if (req.method === 'POST' && url.pathname === '/login') return handleLogin(req, res);
   if (req.method === 'POST' && url.pathname === '/display') {
-    if (!authed) return send(res, 401, 'text/plain', 'bad key');
+    if (!device) return send(res, 401, 'text/plain', 'bad key');
     return handleDisplayPost(req, res);
   }
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'text/plain', 'method not allowed');
@@ -396,13 +435,17 @@ const server = http.createServer((req, res) => {
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/manifest+json', JSON.stringify({
         name: 'ARIA Cam', short_name: 'ARIA', display: 'standalone', background_color: '#07090c', theme_color: '#07090c',
-        start_url: '/?key=' + encodeURIComponent(key), scope: '/',
+        start_url: '/', scope: '/',
         icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }] }));
     case '/icon.svg':
       return send(res, 200, 'image/svg+xml', ICON_SVG, { 'Cache-Control': 'public, max-age=86400' });
     case '/':
-      return send(res, authed ? 200 : 401, 'text/html; charset=utf-8', authed ? viewerPage() : keyPage(key !== null),
+      return send(res, authed ? 200 : 401, 'text/html; charset=utf-8', authed ? viewerPage() : loginPage(''),
         { 'Referrer-Policy': 'no-referrer' });
+    case '/logout':
+      res.writeHead(303, { Location: '/', 'Cache-Control': 'no-store',
+        'Set-Cookie': 'aya_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict' });
+      return res.end();
     case '/stream':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return handleStream(req, res);
@@ -415,7 +458,7 @@ const server = http.createServer((req, res) => {
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return handleEvents(req, res);
     case '/display':
-      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      if (!device) return send(res, 401, 'text/plain', 'bad key');
       seen.display = Date.now();                   // only the display board polls this
       return send(res, 200, 'application/json', JSON.stringify(publicDisplay()));
     case '/status':
@@ -581,7 +624,7 @@ const STYLE = `
   .emo-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 8px; }
   .emo-grid button { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 6px 2px;
                      cursor: pointer; font-size: 11px; color: var(--muted); display: grid; gap: 2px; justify-items: center; }
-  .emo-grid button b { font-size: 18px; line-height: 1; }
+  .emo-grid button { padding: 9px 4px; font-size: 12.5px; }
   .emo-grid button:hover { border-color: rgba(94,234,212,.4); color: var(--text); }
   .emo-grid button.sent { border-color: var(--accent); color: var(--accent); }
   .msg-box { display: grid; gap: 8px; margin-top: 4px; }
@@ -651,7 +694,8 @@ const STYLE = `
           border-radius: 12px; position: sticky; top: 0; z-index: 4; }
   .tabs button { flex: 1; border: 0; background: transparent; color: var(--muted); padding: 9px 4px; border-radius: 9px;
                  cursor: pointer; font-size: 13px; font-weight: 600; display: grid; justify-items: center; gap: 1px; }
-  .tabs button span { font-size: 16px; line-height: 1; }
+  .tabs button span { display: grid; place-items: center; }
+  .tabs button span svg { width: 18px; height: 18px; }
   .tabs button[aria-selected="true"] { background: var(--accent-dim); color: var(--accent); }
   .pane { display: flex; flex-direction: column; gap: 12px; }
   .side .card { padding: 14px; }
@@ -715,17 +759,17 @@ const LOGO = `<svg viewBox="0 0 26 26" fill="#5eead4" aria-hidden="true">
   <rect x="3" y="7" width="8" height="10" rx="3"/><rect x="15" y="7" width="8" height="10" rx="3"/>
   <rect x="5" y="9" width="2.5" height="2" rx="1" fill="#07090c"/><rect x="17" y="9" width="2.5" height="2" rx="1" fill="#07090c"/></svg>`;
 
-function keyPage(wrongKey) {
+function loginPage(error) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#07090c">
-<title>ARIA Cam</title><style>${STYLE}</style></head><body>
-<div class="login"><form method="get" action="/">
+<title>ARIA Cam · Sign in</title><style>${STYLE}</style></head><body>
+<div class="login"><form method="post" action="/login">
   <div class="brand"><div class="logo">${LOGO}</div><div><div class="name">ARIA</div><div class="tag">Home camera</div></div></div>
-  <h1>Enter view key</h1>
-  <p>This camera is private. Ask its owner for the key.</p>
-  ${wrongKey ? '<p class="err">That key is not valid.</p>' : ''}
-  <input name="key" type="password" placeholder="View key" autocomplete="off" required autofocus aria-label="View key">
-  <button type="submit">Watch</button>
+  <h1>Sign in</h1>
+  <p>Private system. Enter the access key to continue.</p>
+  ${error ? `<p class="err">${error}</p>` : ''}
+  <input name="key" type="password" placeholder="Access key" autocomplete="current-password" required autofocus aria-label="Access key">
+  <button type="submit">Continue</button>
 </form></div></body></html>`;
 }
 
@@ -778,10 +822,10 @@ function viewerPage() {
 
   <aside class="side">
     <nav class="tabs" role="tablist" aria-label="Panels">
-      <button role="tab" data-tab="home" aria-selected="true"><span>👁</span>Home</button>
-      <button role="tab" data-tab="display" aria-selected="false"><span>💬</span>Display</button>
-      <button role="tab" data-tab="camera" aria-selected="false"><span>📷</span>Camera</button>
-      <button role="tab" data-tab="health" aria-selected="false"><span>📈</span>Health</button>
+      <button role="tab" data-tab="home" aria-selected="true"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>Home</button>
+      <button role="tab" data-tab="display" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>Display</button>
+      <button role="tab" data-tab="camera" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 10l5-3v10l-5-3z"/><rect x="2" y="6" width="13" height="12" rx="2"/></svg></span>Camera</button>
+      <button role="tab" data-tab="health" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span>Health</button>
     </nav>
 
     <div class="pane" data-pane="home" role="tabpanel">
@@ -821,9 +865,7 @@ function viewerPage() {
     <div class="pane" data-pane="display" role="tabpanel" hidden>
       <section class="card" aria-label="ARIA controls">
         <div class="card-head"><h2>Talk to ARIA</h2><span class="mood" id="disp-state">—</span></div>
-        <div class="locked" id="aria-locked"><span>Controls are locked — enter the admin key.</span>
-          <form class="unlock-form"><input type="password" placeholder="Admin key" autocomplete="current-password" aria-label="Admin key"><button class="btn primary">Unlock</button></form></div>
-        <div id="aria-controls" hidden>
+        <div id="aria-controls">
           <div class="ctl"><div>Display<small>Turn the OLED screen on or off</small></div>
             <button class="switch" id="screen" role="switch" aria-checked="true" aria-label="Display on"></button></div>
           <div class="sub-h">Display shows</div>
@@ -845,14 +887,14 @@ function viewerPage() {
           </div>
           <div class="sub-h">Emotion</div>
           <div class="emo-grid" id="emo-grid">
-            <button data-e="giggle"><b>😆</b>Giggle</button><button data-e="wink"><b>😉</b>Wink</button>
-            <button data-e="heart"><b>😍</b>Love</button><button data-e="surprise"><b>😲</b>Surprise</button>
-            <button data-e="curious"><b>🧐</b>Curious</button><button data-e="think"><b>🤔</b>Think</button>
-            <button data-e="shy"><b>☺️</b>Shy</button><button data-e="dizzy"><b>😵</b>Dizzy</button>
-            <button data-e="roll"><b>🙄</b>Eye-roll</button><button data-e="nod"><b>🙂</b>Nod</button>
-            <button data-e="squint"><b>🤨</b>Suspicious</button><button data-e="purr"><b>😌</b>Purr</button>
-            <button data-e="yawn"><b>🥱</b>Yawn</button><button data-e="sleep"><b>😴</b>Sleep</button>
-            <button data-e="wake"><b>☀️</b>Wake up</button>
+            <button data-e="giggle">Giggle</button><button data-e="wink">Wink</button>
+            <button data-e="heart">Love</button><button data-e="surprise">Surprise</button>
+            <button data-e="curious">Curious</button><button data-e="think">Think</button>
+            <button data-e="shy">Shy</button><button data-e="dizzy">Dizzy</button>
+            <button data-e="roll">Eye-roll</button><button data-e="nod">Nod</button>
+            <button data-e="squint">Suspicious</button><button data-e="purr">Purr</button>
+            <button data-e="yawn">Yawn</button><button data-e="sleep">Sleep</button>
+            <button data-e="wake">Wake up</button>
           </div>
         </div>
       </section>
@@ -862,9 +904,7 @@ function viewerPage() {
       <section class="card" aria-label="Camera">
         <div class="card-head"><h2>Camera</h2><span class="mood" id="cam-state">—</span></div>
         <div class="slim">The OV7670 on the display board: a picture every few seconds here, live on the OLED.</div>
-        <div class="locked" id="locked"><span>Controls are locked — enter the admin key.</span>
-          <form class="unlock-form"><input type="password" placeholder="Admin key" autocomplete="current-password" aria-label="Admin key"><button class="btn primary">Unlock</button></form></div>
-        <div id="controls" hidden>
+        <div id="controls">
           <div class="sub-h">Zoom</div>
           <div class="seg view-seg" id="zoom2-seg">
             <button data-v="10">1×</button><button data-v="15">1.5×</button><button data-v="20">2×</button><button data-v="30">3×</button>
@@ -872,7 +912,7 @@ function viewerPage() {
           <div class="ctl keep" style="margin-top:8px"><div>Ignore zones<small id="zone-sub">Watching the whole picture</small></div>
             <button class="btn" id="zone-edit">Edit</button></div>
           <div class="ctl keep"><div>Restart system<small>Display + camera, about 20 seconds</small></div><button class="btn danger" id="restart">Restart</button></div>
-          <div class="ctl keep"><div>Admin<small>This browser remembers the key</small></div><button class="lock-link" id="lock">Lock controls</button></div>
+          <div class="ctl keep"><div>Session<small>Signed in on this browser for 30 days</small></div><a class="btn" href="/logout">Sign out</a></div>
         </div>
       </section>
     </div>
@@ -896,8 +936,7 @@ function viewerPage() {
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script>
-  var key = new URLSearchParams(location.search).get('key');
-  var q = '?key=' + encodeURIComponent(key);
+  var q = '';                                        // the login cookie authenticates every request
   var $ = function (id) { return document.getElementById(id); };
   $('manifest-link').href = '/manifest.webmanifest' + q;
 
@@ -1005,11 +1044,11 @@ function viewerPage() {
   refresh(); setInterval(refresh, 3000);
 
   // ── Tracker data (faces, ARIA's mood + face) over Server-Sent Events ──
-  var EMOJI = { happy: '😊', surprise: '😮', sad: '😢', angry: '😠', neutral: '🙂' };
-  var EXPR_MOOD = { purr: '😌 Purring', heart: '😍 In love', yawn: '🥱 Yawning', sideeye: '😒 Sulking',
-                    wink: '😉 Winking', surprise: '😲 Surprised', think: '🤔 Thinking', curious: '🧐 Curious',
-                    squint: '🤨 Suspicious', wake: '😪 Waking up', nod: '🙂 Nodding', giggle: '😆 Giggling',
-                    shy: '☺️ Shy', dizzy: '😵 Dizzy', roll: '🙄 Rolling its eyes' };
+  var EMOJI = { happy: 'Happy', surprise: 'Surprised', sad: 'Sad', angry: 'Annoyed', neutral: '' };
+  var EXPR_MOOD = { purr: 'Content', heart: 'Affectionate', yawn: 'Tired', sideeye: 'Sulking',
+                    wink: 'Playful', surprise: 'Surprised', think: 'Thinking', curious: 'Curious',
+                    squint: 'Suspicious', wake: 'Waking up', nod: 'Acknowledging', giggle: 'Amused',
+                    shy: 'Shy', dizzy: 'Dizzy', roll: 'Unimpressed' };
   var meta = null, metaAt = 0, shown = [], handShown = null;
   var es = new EventSource('/events' + q);
   es.onerror = function () { if (es.readyState !== 1) { $('live').className = 'live off'; $('live-text').textContent = 'Reconnecting…'; } };
@@ -1059,7 +1098,7 @@ function viewerPage() {
     if (fresh()) {
       var bodies = (meta.bodies || []).length, admin = !!(f && f.admin);
       [['Faces', String(faces.length ? (meta.n || faces.length) : 0)], ['Bodies', String(bodies)],
-       ['Admin', admin ? '👑 ' + f.name + ' present' : 'away']].forEach(function (kv) {
+       ['Admin', admin ? f.name + ' present' : 'away']].forEach(function (kv) {
         var d = document.createElement('div'); d.textContent = kv[0] + ' ';
         var b = document.createElement('b'); b.textContent = kv[1]; d.append(b); dt.append(d);
       });
@@ -1068,8 +1107,8 @@ function viewerPage() {
     var r = fresh() && meta.robot;
     $('meters').hidden = !r;
     if (r) {
-      $('mood').textContent = r.sleeping ? '😴 Asleep' : EXPR_MOOD[r.expr] ||
-        (r.energy < 0.3 ? '😩 Tired' : r.boredom > 0.5 ? '😐 Bored' : r.affection > 0.7 ? '🥰 Affectionate' : '🙂 Calm');
+      $('mood').textContent = r.sleeping ? 'Asleep' : EXPR_MOOD[r.expr] ||
+        (r.energy < 0.3 ? 'Tired' : r.boredom > 0.5 ? 'Idle' : r.affection > 0.7 ? 'Engaged' : 'Calm');
       [['energy', r.energy], ['affection', r.affection], ['boredom', r.boredom]].forEach(function (m) {
         var v = Math.round((m[1] || 0) * 100);
         $('m-' + m[0]).style.width = v + '%'; $('v-' + m[0]).textContent = v + '%';
@@ -1107,13 +1146,6 @@ function viewerPage() {
   }
 
 
-  // ── Admin key: unlocks the Display and Camera controls ──
-  var adminKey = null;
-  try { adminKey = localStorage.getItem('aria-admin'); } catch (e) {}
-  function renderLock() {
-    $('locked').hidden = !!adminKey; $('controls').hidden = !adminKey;
-    $('aria-locked').hidden = !!adminKey; $('aria-controls').hidden = !adminKey;
-  }
   // ── Ignore zones: 16x12 grid over the picture; bit c of row r = ignore ──
   var ZC = 16, ZR = 12, zoneEdit = null, zonePaint = null, zonesEl = $('zones');
   function zonesFromHex(h) {
@@ -1163,33 +1195,21 @@ function viewerPage() {
     $('zone-sub').textContent = n ? 'Ignoring ' + n + ' of ' + (ZC * ZR) + ' zones' : 'Watching the whole picture';
   }
 
-  var SENT = { ignore: 'Ignore zones saved ✓', message: 'Message sent to the display ✓', emotion: 'ARIA will act it out ✓', view: 'Display updated ✓',
-               screen: 'Display switched ✓', restart_all: 'Restarting camera + display…', zoom2: 'Camera 2 zoom set ✓',
+  var SENT = { ignore: 'Ignore zones saved', message: 'Message sent to the display', emotion: 'Sent to the display', view: 'Display updated',
+               screen: 'Display switched', restart_all: 'Restarting camera + display…', zoom2: 'Camera 2 zoom set',
              };
   async function send(cmd, args, extra) {
     try {
       var body = { cmd: cmd, args: args || [] };
       for (var k in (extra || {})) body[k] = extra[k];
-      var r = await fetch('/cmd', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+      var r = await fetch('/cmd', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify(body) });
-      if (r.status === 401) { lock(); toast('That admin key was not accepted', 'err'); }
+      if (r.status === 401) { location.reload(); return 401; }            // signed out: back to the sign-in page
       else if (r.status >= 400) toast('Not accepted: ' + (await r.text()), 'err');
-      else toast(SENT[cmd] || 'Sent ✓', 'ok');
+      else toast(SENT[cmd] || 'Sent', 'ok');
       return r.status;
     } catch (e) { toast('Could not reach the server', 'err'); return 0; }
   }
-  function lock() { adminKey = null; try { localStorage.removeItem('aria-admin'); } catch (e) {} renderLock(); }
-  document.querySelectorAll('.unlock-form').forEach(function (f) {
-    f.addEventListener('submit', function (e) {
-      e.preventDefault();
-      var k = f.querySelector('input').value.trim();
-      if (!k) return;
-      adminKey = k; f.querySelector('input').value = '';
-      try { localStorage.setItem('aria-admin', adminKey); } catch (x) {}
-      renderLock(); toast('Controls unlocked', 'ok');
-    });
-  });
-  $('lock').onclick = function () { lock(); toast('Controls locked', 'ok'); };
   $('restart').onclick = function () {
     if (confirm('Restart the display and its camera? The picture drops for about 20 seconds.')) send('restart_all');
   };
@@ -1247,7 +1267,6 @@ function viewerPage() {
     send('emotion', [b.dataset.e]);
     b.classList.add('sent'); setTimeout(function () { b.classList.remove('sent'); }, 900);
   });
-  renderLock();
 
   // ── Health history: online + frame rate ──
   var hData = null, hHours = 6, hCharts = [];
@@ -1418,7 +1437,7 @@ function viewerPage() {
       ctx.strokeStyle = '#f472b6'; ctx.lineWidth = 2; ctx.shadowColor = '#f472b6'; ctx.shadowBlur = 10;
       ctx.beginPath(); ctx.roundRect ? ctx.roundRect(hx, hy, hw, hh, 10) : ctx.rect(hx, hy, hw, hh); ctx.stroke();
       ctx.shadowBlur = 0;
-      var hl = hand.g || '✋ hand';
+      var hl = hand.g || 'Hand';
       ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
       var hlw = ctx.measureText(hl).width + 14, hly = hy + hh + 4;
       ctx.fillStyle = 'rgba(7,9,12,.72)';
@@ -1442,7 +1461,7 @@ function viewerPage() {
       });
       ctx.stroke();
       ctx.shadowBlur = 0;
-      var label = (f.admin ? '👑 ' : '') + (f.id === 'known' ? f.name : f.id === 'unknown' ? 'Stranger' : 'Identifying…') +
+      var label = (f.id === 'known' ? f.name : f.id === 'unknown' ? 'Stranger' : 'Identifying…') +
         (f.admin ? ' · admin' : '') + '  ' + (EMOJI[f.emo] || '');
       ctx.font = '600 13px ui-sans-serif, system-ui, sans-serif';
       var tw = ctx.measureText(label).width + 16, ly = Math.max(4, y - 28);
