@@ -507,6 +507,20 @@ function captureEvent(kind, text) {
   setTimeout(more, 700);
 }
 
+// The display keeps a copy of the history on its SD card: it says what it
+// last saved (X-Log-Since / X-Shot-Since, ms) and gets what's newer, oldest
+// first, a few at a time. No headers (no card) = nothing extra in the reply.
+function deviceReply(req) {
+  const out = publicDisplay();
+  const logSince = Number(req.headers['x-log-since']), shotSince = Number(req.headers['x-shot-since']);
+  if (Number.isFinite(logSince) || Number.isFinite(shotSince)) out.now = Date.now();
+  if (Number.isFinite(logSince))
+    out.log = activity.filter((e) => e.t > logSince).reverse().slice(0, 10).map((e) => ({ t: e.t, kind: e.kind, text: e.text }));
+  if (Number.isFinite(shotSince))
+    out.shots = gallery.filter((e) => e.t > shotSince).reverse().slice(0, 5).map((e) => ({ t: e.t, kind: e.kind, text: e.text }));
+  return out;
+}
+
 function handleDisplayPost(req, res) {
   const chunks = [];
   let size = 0;
@@ -527,7 +541,7 @@ function handleDisplayPost(req, res) {
       oledFrame = b64;
       broadcast('oled', { f: b64 });               // every poll (~2 s), so the page knows it's live
     }
-    send(res, 200, 'application/json', JSON.stringify(publicDisplay()));
+    send(res, 200, 'application/json', JSON.stringify(deviceReply(req)));
   });
 }
 
