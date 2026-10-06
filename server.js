@@ -510,8 +510,89 @@ function captureEvent(kind, text) {
 // The display keeps a copy of the history on its SD card: it says what it
 // last saved (X-Log-Since / X-Shot-Since, ms) and gets what's newer, oldest
 // first, a few at a time. No headers (no card) = nothing extra in the reply.
+// ── SD card browser ─────────────────────────────────────────────────────
+// The page asks for a folder listing or a file; the request rides out on the
+// display's next poll reply (sdreq, up to 3 at a time), and the display POSTs
+// the result to /sdres. Each page request waits up to 20 s. Photos (.jpg)
+// don't change once written, so they're cached here.
+const SD_MAX_BYTES = 2 * 1024 * 1024;
+const SD_WAIT_MS = 20000;
+let sdNextId = 0;
+const sdPending = [];             // {id, op, path, at, sentAt, waiters: [resolve]}
+const sdJpgCache = new Map();     // path → Buffer (newest last; 300 kept)
+let sdInfo = null;                // {ok, mb, free} from the display's X-SD header
+
+function noteSd(req) {
+  const [ok, mb, free] = String(req.headers['x-sd'] || '').split(',').map(Number);
+  if (Number.isFinite(ok)) sdInfo = { ok: ok === 1, mb: mb || 0, free: free || 0, t: Date.now() };
+}
+
+function sdPathOk(p) {
+  return typeof p === 'string' && p.startsWith('/') && p.length < 120 && !p.includes('..') && !/[\\\x00-\x1f]/.test(p);
+}
+
+function sdRequest(op, path) {
+  return new Promise((resolve) => {
+    let r = sdPending.find((x) => x.op === op && x.path === path);
+    if (!r) { r = { id: ++sdNextId, op, path, at: Date.now(), sentAt: 0, waiters: [] }; sdPending.push(r); }
+    const done = (v) => { clearTimeout(timer); resolve(v); };
+    const timer = setTimeout(() => {
+      r.waiters = r.waiters.filter((w) => w !== done);
+      resolve({ ok: false, status: 504, body: Buffer.from('AYA did not answer in time (is she online?)') });
+    }, SD_WAIT_MS);
+    r.waiters.push(done);
+  });
+}
+
+setInterval(() => {                               // drop requests nobody waits for any more
+  for (let i = sdPending.length - 1; i >= 0; i--)
+    if (!sdPending[i].waiters.length && Date.now() - sdPending[i].at > SD_WAIT_MS) sdPending.splice(i, 1);
+}, 5000);
+
+function handleSdRes(req, res, url) {
+  const id = Number(url.searchParams.get('id'));
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => { size += c.length; if (size > SD_MAX_BYTES) { req.destroy(); return; } chunks.push(c); });
+  req.on('end', () => {
+    const i = sdPending.findIndex((x) => x.id === id);
+    send(res, 200, 'text/plain', 'ok');
+    if (i < 0) return;
+    const r = sdPending.splice(i, 1)[0];
+    const body = Buffer.concat(chunks);
+    const ok = req.headers['x-sd-status'] === 'ok';
+    if (ok && r.op === 'get' && /\.jpe?g$/i.test(r.path)) {
+      sdJpgCache.set(r.path, body);
+      if (sdJpgCache.size > 300) sdJpgCache.delete(sdJpgCache.keys().next().value);
+    }
+    for (const w of r.waiters) w({ ok, status: ok ? 200 : 404, body });
+  });
+}
+
+function sdType(path) {
+  return /\.jpe?g$/i.test(path) ? 'image/jpeg' : /\.(jsonl?|txt|csv|log)$/i.test(path) ? 'text/plain; charset=utf-8' : 'application/octet-stream';
+}
+
+async function handleSdGet(req, res, url, op) {
+  const path = url.searchParams.get('path') || '/';
+  if (!sdPathOk(path)) return send(res, 400, 'text/plain', 'bad path');
+  if (op === 'get' && sdJpgCache.has(path)) return send(res, 200, 'image/jpeg', sdJpgCache.get(path), { 'Cache-Control': 'private, max-age=86400' });
+  if (!seen.display || Date.now() - seen.display > 10000) return send(res, 503, 'text/plain', 'AYA is offline');
+  const r = await sdRequest(op, path);
+  if (!r.ok) return send(res, r.status, 'text/plain', r.body.toString('utf8').slice(0, 200));
+  if (op === 'ls') return send(res, 200, 'application/json', r.body, { 'Cache-Control': 'no-store' });
+  const extra = { 'Cache-Control': /\.jpe?g$/i.test(path) ? 'private, max-age=86400' : 'no-store' };
+  if (url.searchParams.get('dl') === '1') extra['Content-Disposition'] = 'attachment; filename="' + path.split('/').pop().replace(/"/g, '') + '"';
+  return send(res, 200, sdType(path), r.body, extra);
+}
+
 function deviceReply(req) {
   const out = publicDisplay();
+  const due = sdPending.filter((r) => r.waiters.length && (!r.sentAt || Date.now() - r.sentAt > 8000)).slice(0, 3);
+  if (due.length) {                               // SD card requests from the page
+    for (const r of due) r.sentAt = Date.now();
+    out.sdreq = due.map((r) => ({ id: r.id, op: r.op, path: r.path }));
+  }
   const logSince = Number(req.headers['x-log-since']), shotSince = Number(req.headers['x-shot-since']);
   if (Number.isFinite(logSince) || Number.isFinite(shotSince)) out.now = Date.now();
   if (Number.isFinite(logSince))
@@ -532,6 +613,7 @@ function handleDisplayPost(req, res) {
     noteAf(req);
     noteScreen(req);
     noteBoot(req);
+    noteSd(req);
     if (buf.length === 1024) {
       const out = Buffer.alloc(1024);
       for (let y = 0; y < 64; y++)
@@ -615,6 +697,10 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && url.pathname === '/cmd') return handleCmd(req, res);
   if (req.method === 'POST' && url.pathname === '/login') return handleLogin(req, res);
   if (req.method === 'POST' && url.pathname === '/ask') return handleAsk(req, res);
+  if (req.method === 'POST' && url.pathname === '/sdres') {   // the display answering an SD request
+    if (!device) return send(res, 401, 'text/plain', 'bad key');
+    return handleSdRes(req, res, url);
+  }
   if (req.method === 'POST' && url.pathname === '/display') {
     if (!device) return send(res, 401, 'text/plain', 'bad key');
     return handleDisplayPost(req, res);
@@ -657,6 +743,13 @@ const server = http.createServer((req, res) => {
     case '/status':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(status()));
+    case '/sd/ls':
+    case '/sd/get':
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return handleSdGet(req, res, url, url.pathname === '/sd/ls' ? 'ls' : 'get');
+    case '/sd/info':
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return send(res, 200, 'application/json', JSON.stringify(sdInfo), { 'Cache-Control': 'no-store' });
     case '/gallery':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(gallery.map(galleryItem)), { 'Cache-Control': 'no-store' });
@@ -870,6 +963,32 @@ const STYLE = `
   .tile .ai-mark { position: absolute; top: 6px; right: 6px; width: 8px; height: 8px; border-radius: 50%; background: #a78bfa; }
   .tile:focus-visible { outline: 2px solid var(--accent); }
   .gal-note { margin-top: 10px; }
+  .sd-crumbs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 8px; font-size: 13px; }
+  .sd-crumbs button { border: 0; background: var(--surface-2); color: var(--text); padding: 4px 9px; border-radius: 8px; cursor: pointer; font: inherit; }
+  .sd-crumbs button:last-child { background: var(--accent-dim); color: var(--accent); }
+  .sd-crumbs span { color: var(--muted); }
+  .sd-status { margin-bottom: 8px; }
+  .sd-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; max-height: 420px; overflow-y: auto; }
+  .sd-list li button { width: 100%; display: grid; grid-template-columns: 22px 1fr auto auto; gap: 10px; align-items: center;
+                       padding: 8px 10px; border: 0; border-radius: 8px; background: transparent; color: var(--text);
+                       cursor: pointer; text-align: left; font: inherit; font-size: 13px; }
+  .sd-list li button:hover, .sd-list li button:focus-visible { background: var(--surface-2); outline: none; }
+  .sd-list svg { width: 18px; height: 18px; color: var(--muted); }
+  .sd-list .dir svg { color: var(--accent); }
+  .sd-list .nm { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sd-list .sz, .sd-list .dt { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  @media (max-width: 520px) { .sd-list li button { grid-template-columns: 22px 1fr auto; } .sd-list .dt { display: none; } }
+  .sd-view { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .sd-view-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .sd-view-head b { word-break: break-all; }
+  .sd-view-head a.btn { text-decoration: none; }
+  .sd-view img { display: block; width: 100%; max-width: 640px; image-rendering: auto; border-radius: 8px; background: #000; }
+  .sd-view pre { margin: 0; max-height: 360px; overflow: auto; font-size: 12px; background: var(--surface-2); padding: 10px; border-radius: 8px; white-space: pre-wrap; }
+  .sd-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .sd-table td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .sd-table td:first-child { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .sd-table td:nth-child(2) { color: var(--muted); white-space: nowrap; }
+  .sd-table-wrap { max-height: 380px; overflow: auto; }
   .viewer { border: 1px solid var(--line); border-radius: 14px; padding: 0; background: var(--surface); color: var(--text);
             width: min(640px, calc(100vw - 32px)); }
   .viewer::backdrop { background: rgba(0,0,0,.7); }
@@ -1191,7 +1310,17 @@ function viewerPage() {
           <button data-k="stranger">Strangers</button><button data-k="known">Family</button>
         </div>
         <div class="gal" id="gal"><div class="slim">No events yet. Snapshots appear here when AYA detects someone.</div></div>
-        <div class="slim gal-note">The last 60 events are kept until the server restarts.</div>
+        <div class="slim gal-note">The last 60 events are kept until the server restarts. Everything is also saved on the SD card below.</div>
+      </section>
+      <section class="card" aria-label="SD card">
+        <div class="card-head"><h2>SD card on AYA</h2><span class="mood" id="sd-info">—</span></div>
+        <nav class="sd-crumbs" id="sd-crumbs" aria-label="Folder"></nav>
+        <div class="sd-status slim" id="sd-status">Open a folder to browse the card. Each step asks AYA, which takes a few seconds.</div>
+        <ul class="sd-list" id="sd-list"></ul>
+        <div class="sd-view" id="sd-view" hidden>
+          <div class="sd-view-head"><b id="sd-view-name"></b><span><a class="btn" id="sd-dl" download>Download</a> <button class="btn" id="sd-view-close">Close</button></span></div>
+          <div id="sd-view-body"></div>
+        </div>
       </section>
     </div>
     <dialog class="viewer" id="viewer">
@@ -1539,6 +1668,107 @@ function viewerPage() {
     try { gal = await (await fetch('/gallery', { cache: 'no-store' })).json(); galRender(); } catch (e) {}
   }
   galLoad();
+
+  // ── SD card browser: listings and files come from AYA via the server ──
+  var sdPath = '/', sdBusy = false;
+  var ICON = {
+    dir: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+    img: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M21 16l-5-5-9 8"/></svg>',
+    log: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h9l3 3v15H6z"/><path d="M9 10h6M9 14h6M9 18h4"/></svg>',
+    file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M6 3h9l3 3v15H6z"/></svg>'
+  };
+  function sdSize(b) { return b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(1) + ' KB' : (b / 1048576).toFixed(1) + ' MB'; }
+  function sdKind(n) { return /[.]jpe?g$/i.test(n) ? 'img' : /[.](jsonl?|txt|log|csv)$/i.test(n) ? 'log' : 'file'; }
+  function sdUrl(op, path, dl) { return '/sd/' + op + '?path=' + encodeURIComponent(path) + (dl ? '&dl=1' : ''); }
+  function sdJoin(dir, n) { return (dir === '/' ? '' : dir) + '/' + n; }
+  function sdCrumbs() {
+    var box = $('sd-crumbs'); box.textContent = '';
+    var parts = sdPath.split('/').filter(Boolean), acc = '';
+    function crumb(label, path) {
+      var b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+      b.addEventListener('click', function () { sdOpen(path); });
+      box.append(b);
+    }
+    crumb('SD card', '/');
+    parts.forEach(function (p) { var sep = document.createElement('span'); sep.textContent = '/'; box.append(sep); acc += '/' + p; crumb(p, acc); });
+  }
+  async function sdOpen(path) {
+    if (sdBusy) return;
+    sdBusy = true; sdPath = path; sdCrumbs();
+    $('sd-status').textContent = 'Asking AYA for ' + path + ' ...';
+    $('sd-list').textContent = '';
+    try {
+      var r = await fetch(sdUrl('ls', path), { cache: 'no-store' });
+      if (!r.ok) { $('sd-status').textContent = 'Could not open: ' + (await r.text()); sdBusy = false; return; }
+      var d = await r.json();
+      var items = d.entries.slice().sort(function (a, b) { return b.d - a.d || (a.n < b.n ? -1 : 1); });
+      if (/^[/]aya[/](log|events)/.test(path)) items.sort(function (a, b) { return b.d - a.d || (a.n < b.n ? 1 : -1); });   // newest first
+      $('sd-status').textContent = items.length + (items.length === 1 ? ' item' : ' items') + (d.more ? ' (first 500 shown)' : '');
+      items.forEach(function (e) {
+        var li = document.createElement('li'), b = document.createElement('button'); b.type = 'button';
+        var k = e.d ? 'dir' : sdKind(e.n); b.className = k;
+        var ic = document.createElement('span'); ic.innerHTML = ICON[k];
+        var nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = e.n;
+        var sz = document.createElement('span'); sz.className = 'sz'; sz.textContent = e.d ? '' : sdSize(e.s);
+        var dt = document.createElement('span'); dt.className = 'dt'; dt.textContent = e.m && e.m.indexOf('1980') !== 0 ? e.m : '';
+        b.append(ic, nm, sz, dt);
+        b.addEventListener('click', function () { var p = sdJoin(path, e.n); if (e.d) sdOpen(p); else sdShow(p, e); });
+        li.append(b); $('sd-list').append(li);
+      });
+    } catch (x) { $('sd-status').textContent = 'Could not reach the server.'; }
+    sdBusy = false;
+  }
+  async function sdShow(path, e) {
+    var body = $('sd-view-body'), k = sdKind(e.n);
+    $('sd-view').hidden = false; $('sd-view-name').textContent = path;
+    $('sd-dl').href = sdUrl('get', path, true);
+    body.textContent = 'Loading from AYA ...';
+    if (k === 'img') {
+      var img = new Image(); img.alt = e.n;
+      img.onload = function () { body.textContent = ''; body.append(img); };
+      img.onerror = function () { body.textContent = 'Could not load this photo from AYA.'; };
+      img.src = sdUrl('get', path);
+      return;
+    }
+    if (e.s > 1800000) { body.textContent = 'Too big to show here. Use Download.'; return; }
+    try {
+      var r = await fetch(sdUrl('get', path), { cache: 'no-store' });
+      var text = await r.text();
+      if (!r.ok) { body.textContent = 'Could not open: ' + text; return; }
+      var lines = text.split(String.fromCharCode(10)).filter(Boolean), rows = [];
+      if (/[.]jsonl$/i.test(path)) lines.forEach(function (l) { try { rows.push(JSON.parse(l)); } catch (x) {} });
+      body.textContent = '';
+      if (rows.length) {                                  // a log or an event index: a table, newest first
+        var wrap = document.createElement('div'); wrap.className = 'sd-table-wrap';
+        var t = document.createElement('table'); t.className = 'sd-table';
+        rows.reverse().forEach(function (o) {
+          var tr = document.createElement('tr');
+          var a = document.createElement('td'); a.textContent = o.t ? new Date(o.t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' }) : '';
+          var b2 = document.createElement('td'); b2.textContent = o.kind || '';
+          var c = document.createElement('td'); c.textContent = (o.text || '') + (o.frames ? '  (' + o.frames + ' photos)' : '');
+          tr.append(a, b2, c); t.append(tr);
+        });
+        wrap.append(t); body.append(wrap);
+      } else {
+        var pre = document.createElement('pre'); pre.textContent = text.slice(0, 65536); body.append(pre);
+      }
+    } catch (x) { body.textContent = 'Could not reach the server.'; }
+  }
+  $('sd-view-close').addEventListener('click', function () { $('sd-view').hidden = true; });
+  async function sdInfoLoad() {
+    try {
+      var i = await (await fetch('/sd/info', { cache: 'no-store' })).json();
+      $('sd-info').textContent = !i ? 'AYA has not reported yet' : !i.ok ? 'no card' :
+        (i.free ? (i.free / 1024).toFixed(1) + ' GB free of ' : '') + (i.mb / 1024).toFixed(1) + ' GB';
+    } catch (x) {}
+  }
+  sdInfoLoad(); setInterval(sdInfoLoad, 60000);
+  sdCrumbs();
+  var sdFirst = true;
+  document.querySelector('.tabs').addEventListener('click', function (e) {     // open the card the first time Events is shown
+    var b = e.target.closest('button'); if (b && b.dataset.tab === 'events' && sdFirst) { sdFirst = false; sdOpen('/aya'); }
+  });
+  try { if (localStorage.getItem('aria-tab') === 'events') { sdFirst = false; sdOpen('/aya'); } } catch (x) {}
 
   // ── Ask AYA: one look by the vision model at the current frame ──
   async function ask(q) {
