@@ -730,7 +730,8 @@ const server = http.createServer((req, res) => {
       return handleStream(req, res);
     case '/snapshot':                              // the page, or the laptop's face tracker (X-Cam-Key)
       if (!authed && !keyMatches(req.headers['x-cam-key'], CAM_KEY)) return send(res, 401, 'text/plain', 'bad key');
-      lastPollAt = Date.now();
+      if (authed) lastPollAt = Date.now();         // a person on the page (the tracker isn't a viewer:
+                                                   // the display slows its uploads when nobody watches)
       if (!latestFrame) return send(res, 503, 'text/plain', 'no frame yet');
       return send(res, 200, 'image/jpeg', latestFrame);
     case '/events':
