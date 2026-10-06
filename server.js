@@ -88,7 +88,7 @@ setInterval(() => {
 const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'shy', 'dizzy',
                   'roll', 'nod', 'yawn', 'purr', 'squint', 'sleep', 'wake'];
 const MSG_MAX = 120;
-const VIEWS = ['auto', 'sage', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
+const VIEWS = ['auto', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
 // view/zoom2 start as null: after a relay restart the display keeps what it shows until someone picks
 const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, shutdown: 0, view: null, zoom2: null, ignore: null };
 
@@ -1255,7 +1255,7 @@ function viewerPage() {
             <button class="switch" id="screen" role="switch" aria-checked="true" aria-label="Display on"></button></div>
           <div class="sub-h">Display shows</div>
           <div class="seg view-seg" id="view-seg">
-            <button data-v="auto">Auto</button><button data-v="sage">Sage</button><button data-v="eyes">Eyes</button><button data-v="clock">Clock</button>
+            <button data-v="auto">Auto</button><button data-v="eyes">Eyes</button><button data-v="clock">Clock</button>
             <button data-v="weather">Weather</button><button data-v="stats">Stats</button><button data-v="detect">Detection</button>
             <button data-v="cam2">Camera 2</button>
           </div>
