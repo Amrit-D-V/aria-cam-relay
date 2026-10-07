@@ -92,9 +92,25 @@ const VIEWS = ['auto', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
 // view/zoom2 start as null: after a relay restart the display keeps what it shows until someone picks
 const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, shutdown: 0, view: null, zoom2: null, ignore: null };
 
+// SSE subscribers: a page that stops reading (sleeping phone, dead link) would
+// otherwise buffer every event here. Over 1 MB queued, it's skipped; still
+// over after 30 s, it's dropped (the page's EventSource reconnects by itself).
+const SSE_MAX_SUBS = 50;
+const SSE_MAX_QUEUED = 1024 * 1024;
+const sseStuckSince = new Map();  // res → when it went over SSE_MAX_QUEUED
+function sseWrite(s, line) {
+  if (s.writableLength > SSE_MAX_QUEUED) {
+    const since = sseStuckSince.get(s);
+    if (!since) sseStuckSince.set(s, Date.now());
+    else if (Date.now() - since > 30000) { sseStuckSince.delete(s); metaSubscribers.delete(s); s.destroy(); }
+    return;
+  }
+  sseStuckSince.delete(s);
+  s.write(line);
+}
 function broadcast(event, obj) {
   const line = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
-  for (const s of metaSubscribers) s.write(line);
+  for (const s of metaSubscribers) sseWrite(s, line);
 }
 
 // The face the laptop tracker last saw (from /meta), handed to the display on
@@ -120,19 +136,58 @@ function sessionOk(req) {
   if (!m || +m[1] < Date.now()) return false;
   return keyMatches(m[2], sign(m[1]));
 }
-const loginFails = new Map();                   // ip → {n, until}: 5 wrong keys = 10 min wait
-function clientIp(req) { return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(); }
+const loginFails = new Map();                   // ip → {n, until, at}: 5 wrong keys = 10 min wait
+const LOGIN_FAILS_MAX = 1000;
+// Render's proxy appends the real client address to X-Forwarded-For, so the
+// LAST entry is the one to trust (the first can be anything the client sent)
+function clientIp(req) {
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+  return xff.length ? xff[xff.length - 1] : String(req.socket.remoteAddress || '');
+}
+function pruneLoginFails() {
+  const now = Date.now();
+  for (const [ip, f] of loginFails)               // a failure counts for 10 min, a lockout until it ends
+    if (Math.max(f.until, f.at + 10 * 60e3) < now) loginFails.delete(ip);
+  while (loginFails.size > LOGIN_FAILS_MAX) loginFails.delete(loginFails.keys().next().value);   // oldest first
+}
+// At most one "Failed login attempt" line a minute, so a flood can't push the
+// real events out of the 30-entry log; the ones held back are counted in the next
+const failLog = { last: 0, pending: 0 };
+function logLoginFail() {
+  failLog.pending++;
+  flushLoginFails();
+}
+function flushLoginFails() {
+  if (!failLog.pending || Date.now() - failLog.last < 60000) return;
+  logEvent('privacy', failLog.pending > 1 ? `${failLog.pending} failed login attempts` : 'Failed login attempt');
+  failLog.last = Date.now();
+  failLog.pending = 0;
+}
+setInterval(() => { pruneLoginFails(); flushLoginFails(); }, 60000).unref();
+// Request bodies for /login, /cmd and /ask: up to `max` bytes, else the request is destroyed
+function readBody(req, max, cb) {
+  const chunks = [];
+  let size = 0, over = false;
+  req.on('data', (c) => {
+    if (over) return;
+    size += c.length;
+    if (size > max) { over = true; req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on('end', () => { if (!over) cb(Buffer.concat(chunks)); });
+}
+const SMALL_BODY_MAX = 8 * 1024;
 function handleLogin(req, res) {
   const ip = clientIp(req), f = loginFails.get(ip);
   if (f && f.until > Date.now()) return send(res, 429, 'text/html; charset=utf-8', loginPage('Too many wrong keys. Try again in a few minutes.'));
-  const chunks = [];
-  req.on('data', (c) => { chunks.push(c); if (chunks.length > 4) req.destroy(); });
-  req.on('end', () => {
-    const key = new URLSearchParams(Buffer.concat(chunks).toString('utf8')).get('key') || '';
+  readBody(req, SMALL_BODY_MAX, (body) => {
+    const key = new URLSearchParams(body.toString('utf8')).get('key') || '';
     if (!keyMatches(key.trim(), ADMIN_KEY)) {
       const n = (f && f.until <= Date.now() && f.n >= 5 ? 0 : (f ? f.n : 0)) + 1;
-      loginFails.set(ip, { n, until: n >= 5 ? Date.now() + 10 * 60e3 : 0 });
-      logEvent('privacy', 'Failed login attempt');
+      loginFails.delete(ip);                       // re-insert: Map order stays oldest-first for the cap
+      loginFails.set(ip, { n, until: n >= 5 ? Date.now() + 10 * 60e3 : 0, at: Date.now() });
+      if (loginFails.size > LOGIN_FAILS_MAX) pruneLoginFails();
+      logLoginFail();
       return send(res, 401, 'text/html; charset=utf-8', loginPage('That key is not valid.'));
     }
     loginFails.delete(ip);
@@ -144,11 +199,9 @@ function handleLogin(req, res) {
 
 function handleCmd(req, res) {
   if (!sessionOk(req) && !keyMatches(req.headers['x-admin-key'], ADMIN_KEY)) return send(res, 401, 'text/plain', 'not logged in');
-  const chunks = [];
-  req.on('data', (c) => { chunks.push(c); if (chunks.length > 8) req.destroy(); });
-  req.on('end', () => {
+  readBody(req, SMALL_BODY_MAX, (raw) => {
     let body;
-    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
+    try { body = JSON.parse(raw.toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
     const cmd = String(body.cmd || ''), args = (body.args || []).map(String);
     // Display commands are kept here for the display to pick up (/display).
     if (cmd === 'screen') {
@@ -250,7 +303,8 @@ function logEvent(kind, text) {
   const e = { t: Date.now(), kind, text };
   activity.unshift(e);
   if (activity.length > LOG_MAX) activity.pop();
-  for (const s of metaSubscribers) s.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
+  const line = `event: log\ndata: ${JSON.stringify(e)}\n\n`;
+  for (const s of metaSubscribers) sseWrite(s, line);
 }
 
 const objectSeen = new Map();       // label → last time seen
@@ -412,11 +466,9 @@ function autoDescribe() {                         // after a person/stranger eve
 
 function handleAsk(req, res) {
   if (!sessionOk(req)) return send(res, 401, 'application/json', JSON.stringify({ error: 'not logged in' }));
-  const chunks = [];
-  req.on('data', (c) => { chunks.push(c); if (chunks.length > 4) req.destroy(); });
-  req.on('end', async () => {
+  readBody(req, SMALL_BODY_MAX, async (raw) => {
     let q;
-    try { q = String(JSON.parse(Buffer.concat(chunks).toString('utf8')).q || '').trim().slice(0, 200); }
+    try { q = String(JSON.parse(raw.toString('utf8')).q || '').trim().slice(0, 200); }
     catch { return send(res, 400, 'application/json', JSON.stringify({ error: 'bad json' })); }
     try {
       const text = await askVision(q || null);
@@ -519,7 +571,9 @@ const SD_MAX_BYTES = 2 * 1024 * 1024;
 const SD_WAIT_MS = 20000;
 let sdNextId = 0;
 const sdPending = [];             // {id, op, path, at, sentAt, waiters: [resolve]}
-const sdJpgCache = new Map();     // path → Buffer (newest last; 300 kept)
+const sdJpgCache = new Map();     // path → Buffer (newest last; 300 / 20 MB kept)
+const SD_CACHE_MAX_BYTES = 20 * 1024 * 1024;
+let sdJpgCacheBytes = 0;
 let sdInfo = null;                // {ok, mb, free} from the display's X-SD header
 
 function noteSd(req) {
@@ -562,8 +616,14 @@ function handleSdRes(req, res, url) {
     const body = Buffer.concat(chunks);
     const ok = req.headers['x-sd-status'] === 'ok';
     if (ok && r.op === 'get' && /\.jpe?g$/i.test(r.path)) {
+      if (sdJpgCache.has(r.path)) { sdJpgCacheBytes -= sdJpgCache.get(r.path).length; sdJpgCache.delete(r.path); }
       sdJpgCache.set(r.path, body);
-      if (sdJpgCache.size > 300) sdJpgCache.delete(sdJpgCache.keys().next().value);
+      sdJpgCacheBytes += body.length;
+      while (sdJpgCache.size && (sdJpgCache.size > 300 || sdJpgCacheBytes > SD_CACHE_MAX_BYTES)) {
+        const k = sdJpgCache.keys().next().value;  // oldest first
+        sdJpgCacheBytes -= sdJpgCache.get(k).length;
+        sdJpgCache.delete(k);
+      }
     }
     for (const w of r.waiters) w({ ok, status: ok ? 200 : 404, body });
   });
@@ -582,7 +642,11 @@ async function handleSdGet(req, res, url, op) {
   if (!r.ok) return send(res, r.status, 'text/plain', r.body.toString('utf8').slice(0, 200));
   if (op === 'ls') return send(res, 200, 'application/json', r.body, { 'Cache-Control': 'no-store' });
   const extra = { 'Cache-Control': /\.jpe?g$/i.test(path) ? 'private, max-age=86400' : 'no-store' };
-  if (url.searchParams.get('dl') === '1') extra['Content-Disposition'] = 'attachment; filename="' + path.split('/').pop().replace(/"/g, '') + '"';
+  if (url.searchParams.get('dl') === '1') {
+    const name = path.split('/').pop() || 'file';
+    const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\;]/g, '_');
+    extra['Content-Disposition'] = `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+  }
   return send(res, 200, sdType(path), r.body, extra);
 }
 
@@ -602,6 +666,15 @@ function deviceReply(req) {
   return out;
 }
 
+// The display says whether nothing is happening (X-Idle: 0|1). /status and
+// /snapshot (X-AYA-Idle) pass it on so the laptop's tracker can slow down.
+const deviceIdle = { idle: false, t: 0 };
+function noteIdle(req) {
+  const v = req.headers['x-idle'];
+  if (v === '0' || v === '1') { deviceIdle.idle = v === '1'; deviceIdle.t = Date.now(); }
+}
+function isIdle() { return deviceIdle.idle && Date.now() - deviceIdle.t < 10000; }
+
 function handleDisplayPost(req, res) {
   const chunks = [];
   let size = 0;
@@ -614,6 +687,7 @@ function handleDisplayPost(req, res) {
     noteScreen(req);
     noteBoot(req);
     noteSd(req);
+    noteIdle(req);
     if (buf.length === 1024) {
       const out = Buffer.alloc(1024);
       for (let y = 0; y < 64; y++)
@@ -628,6 +702,7 @@ function handleDisplayPost(req, res) {
 }
 
 function handleEvents(req, res) {
+  if (metaSubscribers.size >= SSE_MAX_SUBS) return send(res, 503, 'text/plain', 'too many viewers', { 'Retry-After': '30' });
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-store',
@@ -642,7 +717,7 @@ function handleEvents(req, res) {
   if (oledFrame && Date.now() - seen.display < 10000) res.write(`event: oled\ndata: ${JSON.stringify({ f: oledFrame })}\n\n`);
   metaSubscribers.add(res);
   const ping = setInterval(() => res.write(': ping\n\n'), 15000);   // keep proxies from idling it out
-  res.on('close', () => { clearInterval(ping); metaSubscribers.delete(res); });
+  res.on('close', () => { clearInterval(ping); metaSubscribers.delete(res); sseStuckSince.delete(res); });
 }
 
 function acceptFrame(frame) {
@@ -683,7 +758,7 @@ function status() {
   const age = latestAt ? Date.now() - latestAt : null;
   return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
            fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
-           ...ages(), vision: { on: !!HF_TOKEN, used: (visionDay(), vision.used), limit: VISION_DAILY, err: vision.err } };
+           idle: isIdle(), ...ages(), vision: { on: !!HF_TOKEN, used: (visionDay(), vision.used), limit: VISION_DAILY, err: vision.err } };
 }
 
 const server = http.createServer((req, res) => {
@@ -733,7 +808,7 @@ const server = http.createServer((req, res) => {
       if (authed) lastPollAt = Date.now();         // a person on the page (the tracker isn't a viewer:
                                                    // the display slows its uploads when nobody watches)
       if (!latestFrame) return send(res, 503, 'text/plain', 'no frame yet');
-      return send(res, 200, 'image/jpeg', latestFrame);
+      return send(res, 200, 'image/jpeg', latestFrame, { 'X-AYA-Idle': isIdle() ? '1' : '0' });
     case '/events':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return handleEvents(req, res);
@@ -778,6 +853,10 @@ server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
 server.listen(PORT, () => console.log(`cam relay listening on :${PORT}`));
 
+// One bad request must not take the relay (and every camera viewer) down
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
+process.on('uncaughtException', (e) => console.error('uncaughtException:', e));
+
 // ── Pages ───────────────────────────────────────────────────────────────
 // Dark "smart camera" dashboard. No external assets: system fonts, inline SVG.
 const STYLE = `
@@ -810,6 +889,9 @@ const STYLE = `
   .live i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
   .live.on i { background: var(--good); box-shadow: 0 0 0 0 rgba(74,222,128,.6); animation: pulse 1.8s infinite; }
   .live.off i { background: var(--bad); }
+  .live.stale i { background: var(--warn); }
+  .stage.stale #feed { opacity: .6; filter: saturate(.5); transition: opacity .4s, filter .4s; }
+  .stage.stale .rec i { animation: none; background: var(--warn); }
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(74,222,128,.55); } 70% { box-shadow: 0 0 0 8px rgba(74,222,128,0); }
                      100% { box-shadow: 0 0 0 0 rgba(74,222,128,0); } }
 
@@ -911,14 +993,11 @@ const STYLE = `
                    background: var(--muted); transition: transform .2s, background .2s; }
   .switch[aria-checked="true"] { background: var(--accent-dim); border-color: rgba(94,234,212,.4); }
   .switch[aria-checked="true"]::after { transform: translateX(18px); background: var(--accent); }
-  .hours { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
-  .hours select { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 5px; font: inherit; }
   .btn { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; cursor: pointer; font-size: 13px; }
   .btn.primary { background: var(--accent); color: #04110f; border: 0; font-weight: 700; }
   .btn.danger { color: var(--bad); }
   .health { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 12px; margin-top: 12px; font-size: 12px; color: var(--muted); }
   .health b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
-  .locked { color: var(--muted); font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   .log li.motion i { background: #fb923c; } .log li.privacy i { background: var(--violet); }
 
   .view-seg { display: flex; flex-wrap: wrap; width: 100%; margin-top: 2px; }
@@ -1098,11 +1177,6 @@ const STYLE = `
   .toast.ok { border-color: rgba(74,222,128,.45); } .toast.err { border-color: rgba(248,113,113,.55); color: #fecaca; }
   .toast.out { opacity: 0; transform: translateY(6px); transition: opacity .3s, transform .3s; }
   @keyframes tin { from { opacity: 0; transform: translateY(8px); } }
-  .unlock-form { display: flex; gap: 8px; width: 100%; }
-  .unlock-form input { flex: 1; min-width: 0; background: var(--surface-2); color: var(--text); border: 1px solid var(--line);
-                       border-radius: 10px; padding: 8px 10px; font: inherit; }
-  .locked { flex-wrap: wrap; }
-  .lock-link { background: none; border: 0; color: var(--muted); font-size: 12px; cursor: pointer; text-decoration: underline; padding: 0; }
   .kbd { font-size: 11px; color: var(--muted); }
   .kbd b { font-weight: 600; border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; margin: 0 2px; }
   @media (hover: none) { .kbd { display: none; } }
@@ -1120,6 +1194,17 @@ const STYLE = `
   .login input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
   .login button { background: var(--accent); color: #04110f; border: 0; border-radius: 10px; padding: 12px; font-weight: 700; cursor: pointer; }
   .err { color: var(--bad); }
+
+  /* Less motion when the system asks for it: no pulsing, blinking, sliding or smooth scrolling */
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .live.on i, .rec i { animation: none; }
+    .frame { transition: none; }
+    .log li.new { animation: none; }
+    .toast { animation: none; }
+    .toast.out { transition: none; }
+    .stage.stale #feed { transition: none; }
+  }
 `;
 
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#07090c"/>
@@ -1197,14 +1282,14 @@ function viewerPage() {
 
   <aside class="side">
     <nav class="tabs" role="tablist" aria-label="Panels">
-      <button role="tab" data-tab="home" aria-selected="true"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>Home</button>
-      <button role="tab" data-tab="display" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>Display</button>
-      <button role="tab" data-tab="camera" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 10l5-3v10l-5-3z"/><rect x="2" y="6" width="13" height="12" rx="2"/></svg></span>Camera</button>
-      <button role="tab" data-tab="events" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.8"/><path d="M21 16l-5-5-9 8"/></svg></span>Events</button>
-      <button role="tab" data-tab="health" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span>Health</button>
+      <button role="tab" id="tab-home" aria-controls="pane-home" data-tab="home" aria-selected="true"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>Home</button>
+      <button role="tab" id="tab-display" aria-controls="pane-display" data-tab="display" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>Display</button>
+      <button role="tab" id="tab-camera" aria-controls="pane-camera" data-tab="camera" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 10l5-3v10l-5-3z"/><rect x="2" y="6" width="13" height="12" rx="2"/></svg></span>Camera</button>
+      <button role="tab" id="tab-events" aria-controls="pane-events" data-tab="events" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.8"/><path d="M21 16l-5-5-9 8"/></svg></span>Events</button>
+      <button role="tab" id="tab-health" aria-controls="pane-health" data-tab="health" aria-selected="false"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span>Health</button>
     </nav>
 
-    <div class="pane" data-pane="home" role="tabpanel">
+    <div class="pane" id="pane-home" data-pane="home" role="tabpanel" aria-labelledby="tab-home">
       <section class="card" aria-label="System">
         <div class="card-head"><h2>System</h2><span class="mood" id="sys-sum">—</span></div>
         <div class="sys three">
@@ -1212,6 +1297,10 @@ function viewerPage() {
           <div id="sys-display"><i></i><span>Display</span><small>–</small></div>
           <div id="sys-tracker"><i></i><span>Face tracker</span><small>–</small></div>
         </div>
+      </section>
+      <section class="card" aria-label="Activity">
+        <div class="card-head"><h2>Activity</h2></div>
+        <ol class="log" id="log"><li class="empty">Nothing yet</li></ol>
       </section>
       <section class="card" aria-label="AYA">
         <div class="card-head"><h2>AYA</h2><span class="mood" id="mood">—</span></div>
@@ -1241,13 +1330,9 @@ function viewerPage() {
         <div class="ask-a" id="ask-a" hidden></div>
       </section>
 
-      <section class="card" aria-label="Activity">
-        <div class="card-head"><h2>Activity</h2></div>
-        <ol class="log" id="log"><li class="empty">Nothing yet</li></ol>
-      </section>
     </div>
 
-    <div class="pane" data-pane="display" role="tabpanel" hidden>
+    <div class="pane" id="pane-display" data-pane="display" role="tabpanel" aria-labelledby="tab-display" hidden>
       <section class="card" aria-label="AYA controls">
         <div class="card-head"><h2>Talk to AYA</h2><span class="mood" id="disp-state">—</span></div>
         <div id="aria-controls">
@@ -1285,7 +1370,7 @@ function viewerPage() {
       </section>
     </div>
 
-    <div class="pane" data-pane="camera" role="tabpanel" hidden>
+    <div class="pane" id="pane-camera" data-pane="camera" role="tabpanel" aria-labelledby="tab-camera" hidden>
       <section class="card" aria-label="Camera">
         <div class="card-head"><h2>Camera</h2><span class="mood" id="cam-state">—</span></div>
         <div class="slim">The OV7670 on the display board: a picture every few seconds here, live on the OLED.</div>
@@ -1303,7 +1388,7 @@ function viewerPage() {
       </section>
     </div>
 
-    <div class="pane" data-pane="events" role="tabpanel" hidden>
+    <div class="pane" id="pane-events" data-pane="events" role="tabpanel" aria-labelledby="tab-events" hidden>
       <section class="card" aria-label="Events">
         <div class="card-head"><h2>Events</h2><span class="mood" id="gal-count">—</span></div>
         <div class="seg gal-seg" id="gal-seg">
@@ -1339,7 +1424,7 @@ function viewerPage() {
       </div>
     </dialog>
 
-    <div class="pane" data-pane="health" role="tabpanel" hidden>
+    <div class="pane" id="pane-health" data-pane="health" role="tabpanel" aria-labelledby="tab-health" hidden>
       <section class="card" aria-label="Camera health">
         <div class="card-head"><h2>Health</h2>
           <div class="seg" id="h-range"><button data-h="1">1h</button><button data-h="6" aria-pressed="true">6h</button><button data-h="24">24h</button></div></div>
@@ -1354,10 +1439,14 @@ function viewerPage() {
   <div class="h-tip" id="h-tip" hidden></div>
 </main>
 <footer class="foot"><span>AYA camera (OV7670) · via Render · <span id="viewers">0</span> watching</span>
-  <span class="kbd">Keys: <b>1</b>–<b>4</b> tabs · <b>F</b> fullscreen · <b>S</b> snapshot</span></footer>
+  <span class="kbd">Keys: <b>1</b>–<b>5</b> tabs · <b>F</b> fullscreen · <b>S</b> snapshot</span></footer>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script>
+  // NOTE: this script sits inside a JS template literal in server.js, so every
+  // escape is resolved twice. Never write a backslash or a dollar-brace here
+  // (use String.fromCharCode(10) for a newline, [.] in regexes). A raw newline
+  // inside a string once broke the whole page.
   var q = '';                                        // the login cookie authenticates every request
   var $ = function (id) { return document.getElementById(id); };
   $('manifest-link').href = '/manifest.webmanifest' + q;
@@ -1376,7 +1465,7 @@ function viewerPage() {
   img.onerror = function () {
     if (polling) return;
     polling = true;
-    var tick = function () { img.src = '/snapshot' + q + '&t=' + Date.now(); };
+    var tick = function () { img.src = '/snapshot' + q + '?t=' + Date.now(); };
     img.onload = function () { setTimeout(tick, 250); };
     img.onerror = function () { setTimeout(tick, 2000); };
     tick();
@@ -1430,7 +1519,7 @@ function viewerPage() {
     document.querySelectorAll('.tabs button').forEach(function (b) { b.setAttribute('aria-selected', String(b.dataset.tab === name)); });
     document.querySelectorAll('.pane').forEach(function (p) { p.hidden = p.dataset.pane !== name; });
     try { localStorage.setItem('aria-tab', name); } catch (e) {}
-    if (name === 'health' && typeof renderHealth === 'function') renderHealth();   // charts need a visible width
+    if (name === 'health') { renderHealth(); loadHealth(); }   // charts need a visible width; fresh data on open
   }
   document.querySelector('.tabs').addEventListener('click', function (e) {
     var b = e.target.closest('button'); if (b) showTab(b.dataset.tab);
@@ -1439,8 +1528,8 @@ function viewerPage() {
 
   document.addEventListener('keydown', function (e) {
     if (e.ctrlKey || e.metaKey || e.altKey || /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
-    var tabs = ['home', 'display', 'camera', 'health'];
-    if (e.key >= '1' && e.key <= '4') showTab(tabs[+e.key - 1]);
+    var tabs = ['home', 'display', 'camera', 'events', 'health'];
+    if (e.key >= '1' && e.key <= '5') showTab(tabs[+e.key - 1]);
     else if (e.key === 'f' || e.key === 'F') $('btn-fs').click();
     else if (e.key === 's' || e.key === 'S') { $('btn-snap').click(); toast('Snapshot saved', 'ok'); }
   });
@@ -1460,7 +1549,15 @@ function viewerPage() {
       var s = await (await fetch('/status' + q, { cache: 'no-store' })).json();
       $('viewers').textContent = s.viewers;
       renderSys(s);
-      if (s.online) {
+      var stale = s.online && s.lastFrameAgeMs > 10000;   // online, but no new picture for a while
+      stage.classList.toggle('stale', !!stale);
+      if (stale) {
+        live.className = 'live stale'; $('live-text').textContent = 'Paused';
+        live.title = 'No new picture for ' + ago(s.lastFrameAgeMs);
+        off.hidden = true;
+        $('cam-state').textContent = 'Paused';
+      } else if (s.online) {
+        live.title = '';
         live.className = 'live on'; $('live-text').textContent = 'Live';
         off.hidden = true;
         $('hud-fps').textContent = (s.fps || 0).toFixed(1) + ' fps';
@@ -1503,7 +1600,8 @@ function viewerPage() {
   var meta = null, metaAt = 0, shown = [], handShown = null;
   var es = new EventSource('/events' + q);
   es.onerror = function () { if (es.readyState !== 1) { $('live').className = 'live off'; $('live-text').textContent = 'Reconnecting…'; } };
-  es.onopen = function () { refresh(); };
+  var esOpens = 0;
+  es.onopen = function () { refresh(); if (esOpens++) galLoad(); };   // a reconnect: fetch events missed meanwhile
   es.onmessage = function (e) { try { meta = JSON.parse(e.data); metaAt = Date.now(); render(); gesturePop(); } catch (x) {} };
 
   // A new hand sign: pop its emoji over the video (only ones made in the last few seconds,
@@ -1588,8 +1686,12 @@ function viewerPage() {
       : s < 86400 ? new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : new Date(t).toLocaleDateString();
   }
   setInterval(function () { document.querySelectorAll('#log time[data-t]').forEach(function (x) { x.textContent = rel(+x.dataset.t); }); }, 20000);
-  var LOG_MAX = 20;
+  var LOG_MAX = 20, logSeen = new Set(), logSeenOrder = [];
   function addLog(e) {
+    var id = e.t + '|' + e.kind + '|' + e.text;   // the server replays its last 30 on every (re)connect
+    if (logSeen.has(id)) return;
+    logSeen.add(id); logSeenOrder.push(id);
+    while (logSeenOrder.length > 100) logSeen.delete(logSeenOrder.shift());
     var list = $('log'), empty = list.querySelector('.empty');
     if (empty) empty.remove();
     var li = document.createElement('li');
@@ -1821,7 +1923,7 @@ function viewerPage() {
   window.addEventListener('pointerup', function () { zonePaint = null; });
   function zoneMode(on) {
     zonesEl.hidden = !on; $('zone-bar').hidden = !on; $('stage-controls').hidden = on;
-    if (on) { placeZones(); drawZones(); $('stage').scrollIntoView({ behavior: 'smooth', block: 'center' }); } else zoneEdit = null;
+    if (on) { placeZones(); drawZones(); $('stage').scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'center' }); } else zoneEdit = null;
   }
   $('zone-edit').onclick = function () { zoneEdit = zonesFromHex(disp && disp.ignore); zoneMode(true); };
   $('zone-cancel').onclick = function () { zoneMode(false); };
@@ -2029,7 +2131,8 @@ function viewerPage() {
     $('h-tip').hidden = true;
     hCharts.forEach(function (c) { c.xh.setAttribute('visibility', 'hidden'); c.dot.setAttribute('visibility', 'hidden'); });
   }
-  loadHealth(); setInterval(loadHealth, 30000);
+  // About 100 KB a time: only while the Health tab is showing (showTab loads it once on opening)
+  setInterval(function () { if (!document.hidden && !$('pane-health').hidden) loadHealth(); }, 30000);
   window.addEventListener('resize', renderHealth);
 
   // ── ARIA's live face (the OLED's 128×64 frame, 1 bit per pixel) ──
