@@ -526,6 +526,21 @@ function noteScreen(req) {
   }
 }
 
+// Events the display decides itself (X-Event: seq;kind;text) — lights on,
+// unusual activity for the hour. Sent until replaced, so each seq is logged
+// once; seq restarts at 1 when the display reboots.
+let lastDeviceEvent = '';
+function noteDeviceEvent(req) {
+  const v = String(req.headers['x-event'] || '');
+  if (!v || v === lastDeviceEvent) return;
+  lastDeviceEvent = v;
+  const [, kind, ...rest] = v.split(';');
+  const k = String(kind || '').replace(/[^a-z]/g, '').slice(0, 12), text = rest.join(';').replace(/[^\x20-\x7e]/g, '').slice(0, 80);
+  if (!k || !text) return;
+  logEvent(k, text);
+  if (k === 'unusual') captureEvent('unusual', text);
+}
+
 // Sent with the display's first poll after it starts: why it (re)started
 function noteBoot(req) {
   const why = String(req.headers['x-boot'] || '').replace(/[^\x20-\x7e]/g, '').slice(0, 60);
@@ -688,6 +703,7 @@ function handleDisplayPost(req, res) {
     noteScreen(req);
     noteBoot(req);
     noteSd(req);
+    noteDeviceEvent(req);
     noteIdle(req);
     if (buf.length === 1024) {
       const out = Buffer.alloc(1024);
@@ -1037,6 +1053,8 @@ const STYLE = `
   .zone-bar span { color: var(--muted); }
   .log li.object i { background: #fbbf24; }
   .log li.screen i { background: var(--muted); }
+  .log li.unusual i { background: var(--bad); box-shadow: 0 0 6px rgba(248,113,113,.8); } .log li.lights i { background: #fde68a; }
+  .tile.unusual .kind { color: var(--bad); }
   .gal-seg { margin-bottom: 10px; }
   .gal { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
   .gal .slim { grid-column: 1 / -1; }
@@ -1402,7 +1420,7 @@ function viewerPage() {
         <div class="card-head"><h2>Events</h2><span class="mood" id="gal-count">—</span></div>
         <div class="seg gal-seg" id="gal-seg">
           <button data-k="all" aria-pressed="true">All</button><button data-k="person">People</button>
-          <button data-k="stranger">Strangers</button><button data-k="known">Family</button>
+          <button data-k="stranger">Strangers</button><button data-k="known">Family</button><button data-k="unusual">Unusual</button>
         </div>
         <div class="gal" id="gal"><div class="slim">No events yet. Snapshots appear here when AYA detects someone.</div></div>
         <div class="slim gal-note">The last 60 events are kept until the server restarts. Everything is also saved on the SD card below.</div>
@@ -1718,7 +1736,7 @@ function viewerPage() {
 
   // ── Events: snapshots of people, strangers and family arriving ──
   var gal = [], galKind = 'all', galOpen = -1, galPlay = null;
-  var KIND = { person: 'Person', stranger: 'Stranger', known: 'Family' };
+  var KIND = { person: 'Person', stranger: 'Stranger', known: 'Family', unusual: 'Unusual' };
   function galShown() { return gal.filter(function (e) { return galKind === 'all' || e.kind === galKind; }); }
   function galRender() {
     var list = galShown(), box = $('gal');
