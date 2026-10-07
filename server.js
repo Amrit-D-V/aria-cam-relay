@@ -51,6 +51,7 @@ if (!CAM_KEY || !VIEW_KEY) {
 const MAX_META_BYTES = 8 * 1024;
 
 let latestFrame = null;
+let latestSeq = 0;                // bumps with each frame: the snapshot ETag, so a poller gets a 304, not the same JPEG again
 let latestAt = 0;
 let lastPollAt = 0;
 const streamViewers = new Set();
@@ -723,6 +724,7 @@ function handleEvents(req, res) {
 function acceptFrame(frame) {
   if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) return false;
   latestFrame = frame;
+  latestSeq++;
   latestAt = Date.now();
   frameTimes.push(latestAt);
   frameSize = jpegSize(frame) || frameSize;
@@ -808,7 +810,14 @@ const server = http.createServer((req, res) => {
       if (authed) lastPollAt = Date.now();         // a person on the page (the tracker isn't a viewer:
                                                    // the display slows its uploads when nobody watches)
       if (!latestFrame) return send(res, 503, 'text/plain', 'no frame yet');
-      return send(res, 200, 'image/jpeg', latestFrame, { 'X-AYA-Idle': isIdle() ? '1' : '0' });
+      {
+        const etag = '"f' + latestSeq + '"', idle = isIdle() ? '1' : '0';
+        if (req.headers['if-none-match'] === etag) {
+          res.writeHead(304, { ETag: etag, 'X-AYA-Idle': idle, 'Cache-Control': 'no-cache' });
+          return res.end();
+        }
+        return send(res, 200, 'image/jpeg', latestFrame, { ETag: etag, 'X-AYA-Idle': idle, 'Cache-Control': 'no-cache' });
+      }
     case '/events':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return handleEvents(req, res);
