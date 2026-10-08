@@ -38,6 +38,14 @@
 //   POST /push?src=eye2&pano=<id>&k=<i>&n=<count>   panorama frames (kept for
 //                    the last 5 panoramas) → SSE "pano"
 //   GET  /panos      the panoramas kept; GET /pano/<id>/<k>.jpg one frame
+//   Room map: POST /display X-Map: cols,rows,p0,p1,t0,t1 (pan p0..p1 = columns
+//                    0..cols-1, tilt t0..t1 = rows 0..rows-1; smaller tilt looks
+//                    up, so row 0 is the top). POST /push?src=eye2&map=1&c=&r=&p=&t=
+//                    keeps the latest picture per cell → SSE "map". People and
+//                    security events add to the activity of the cell the head
+//                    points at (decays ×0.9 an hour); X-Event "changed ... view c,r"
+//                    marks a cell. GET /map.json, GET /map/<c>_<r>.jpg.
+//                    POST /cmd head_map: a full scan of the room.
 //   The tracker's hand signs (/meta gesture + hand) go to the display once
 //   each, as `sign: {k, t, hx}` in its poll reply.
 //
@@ -320,6 +328,7 @@ function fps() {
 }
 
 function logEvent(kind, text) {
+  mapActivity(kind, text);
   const e = { t: Date.now(), kind, text };
   activity.unshift(e);
   if (activity.length > LOG_MAX) activity.pop();
@@ -385,6 +394,7 @@ function handlePush(req, res, url) {
     const frame = Buffer.concat(chunks);
     if (!acceptFrame(frame)) return send(res, 400, 'text/plain', 'not a JPEG');
     notePano(url, frame);                          // a panorama frame is also the live picture
+    noteMapFrame(url, frame);                      // so is a room map frame
     send(res, 200, 'text/plain', String(viewerCount()) + (deviceKick ? ',p' : ''));
   });
 }
@@ -557,10 +567,17 @@ function noteDeviceEvent(req) {
   if (!v || v === lastDeviceEvent) return;
   lastDeviceEvent = v;
   const [, kind, ...rest] = v.split(';');
-  const k = String(kind || '').replace(/[^a-z]/g, '').slice(0, 12), text = rest.join(';').replace(/[^\x20-\x7e]/g, '').slice(0, 80);
+  // The display turns anything outside ASCII into spaces, so its " · " arrives as a run of spaces
+  const k = String(kind || '').replace(/[^a-z]/g, '').slice(0, 12),
+        text = rest.join(';').replace(/[^\x20-\x7e]/g, '').replace(/ {2,}/g, ' · ').trim().slice(0, 80);
   if (!k || !text) return;
+  if (k === 'changed') {                           // "Something changed · view <c>,<r>": mark that cell of the map
+    const m = /view (\d+),(\d+)/.exec(text);
+    if (m && +m[1] < MAP_MAX_COLS && +m[2] < MAP_MAX_ROWS) { roomMap.changed.set(m[1] + ',' + m[2], Date.now()); mapHint = m[1] + ',' + m[2]; }
+  }
   logEvent(k, text);
-  if (k === 'unusual') captureEvent('unusual', text);
+  mapHint = null;
+  if (k === 'unusual' || k === 'changed') captureEvent(k, text);
 }
 
 // Sent with the display's first poll after it starts: why it (re)started
@@ -574,14 +591,14 @@ function noteBoot(req) {
 // until it acks them (X-Head-Ack: the last id it applied). Ids restart with
 // the relay, so an ack above the current max id is from before a restart: 0.
 const HEAD_MODES = ['follow', 'patrol', 'hold'];
-const HEAD_STATES = ['search', 'face', 'motion', 'inspect', 'hold', 'gesture', 'spot', 'pano', 'centre', '-'];
+const HEAD_STATES = ['search', 'face', 'motion', 'inspect', 'hold', 'gesture', 'spot', 'pano', 'map', 'centre', '-'];
 const HEAD_GESTURES = ['nod', 'shake', 'curious', 'startle', 'droop', 'stretch', 'excited'];
 const SPOT_RE = /^[a-z0-9_-]{1,12}$/;
 const HEADQ_MAX = 8;
 const HEADQ_TTL_MS = 60000;       // a nudge from minutes ago must not fire when the display comes back
 const headq = [];                 // {id, op, a, b, name, at}
 let headId = 0;
-let head = null;                  // {pan, tilt, mode, state, spots: [{name, pan, tilt}]} from X-Head / X-Spots
+let head = null;                  // {pan, tilt, mode, state, spots: [{name, pan, tilt}], rest, map} from X-Head / X-Spots / X-Map
 
 function headPush(op, a, b, name) {
   headq.push({ id: ++headId, op, a: +a || 0, b: +b || 0, name: name || '', at: Date.now() });
@@ -626,6 +643,9 @@ function headCmd(res, cmd, args) {
     case 'head_pano':
       headPush('pano', 0, 0, '');
       break;
+    case 'head_map':                                     // a full scan of the room, then back to its mode
+      headPush('map', 0, 0, '');
+      break;
     case 'head_rest_save': case 'head_rest_go':          // save the current position as the rest position / go there
       headPush(cmd.slice(5), 0, 0, '');
       break;
@@ -662,7 +682,8 @@ function noteHead(req) {
   }
   const h = { pan: r1(pan), tilt: r1(tilt), mode: HEAD_MODES.includes(mode) ? mode : null,
               state: HEAD_STATES.includes(state) ? state : '-', spots,
-              rest: rp && rt && Number.isFinite(+rp) && Number.isFinite(+rt) ? { pan: r1(+rp), tilt: r1(+rt) } : null };
+              rest: rp && rt && Number.isFinite(+rp) && Number.isFinite(+rt) ? { pan: r1(+rp), tilt: r1(+rt) } : null,
+              map: mapGeom() };
   if (JSON.stringify(h) !== JSON.stringify(head)) { head = h; broadcast('head', head); }
 }
 
@@ -725,6 +746,75 @@ function notePano(url, frame) {
   }
   p.frames[k] = frame;
   broadcast('pano', { id: p.id, t: p.t, n: p.n, have: panoItem(p).have, k });
+}
+
+// ── Room map ────────────────────────────────────────────────────────────
+// While patrolling, the display uploads one frame per grid cell once the head
+// has settled there (?map=1&c=&r=&p=&t=); the latest per cell is kept. Its
+// X-Map header gives the grid: pan p0..p1 across columns 0..cols-1, tilt t0..t1
+// down rows 0..rows-1 (a smaller tilt looks up, so row 0 is the top of the
+// room). Activity: people and security events count toward the cell the head
+// points at, fading ×0.9 an hour. In memory only.
+const MAP_MAX_COLS = 12, MAP_MAX_ROWS = 8;
+const MAP_HEAT_KINDS = new Set(['person', 'arrive', 'known', 'stranger', 'unknown', 'motion', 'changed', 'unusual', 'wave']);
+const roomMap = { cols: null, rows: null, p0: null, p1: null, t0: null, t1: null,
+                  cells: new Map(),       // "c,r" → {jpeg, pan, tilt, t}
+                  activity: new Map(),    // "c,r" → {n, last}
+                  changed: new Map() };   // "c,r" → when the display last saw something change there
+let mapHint = null;                       // the cell a "changed" event names, for its activity
+function mapGeom() {
+  const m = roomMap;
+  return m.cols ? { cols: m.cols, rows: m.rows, p0: m.p0, p1: m.p1, t0: m.t0, t1: m.t1 } : null;
+}
+function noteMapGeom(req) {
+  const v = req.headers['x-map'];
+  if (v === undefined) return;
+  const a = String(v).split(',').map((x) => x.trim());
+  if (a.length !== 6 || a.some((x) => x === '')) return;
+  const [cols, rows, p0, p1, t0, t1] = a.map(Number);
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || cols > MAP_MAX_COLS || rows < 1 || rows > MAP_MAX_ROWS) return;
+  if (![p0, p1, t0, t1].every((n) => Number.isFinite(n) && n >= 0 && n <= 180)) return;
+  const m = roomMap;
+  if (m.cols !== null && (m.cols !== cols || m.rows !== rows)) { m.cells.clear(); m.activity.clear(); m.changed.clear(); }
+  Object.assign(m, { cols, rows, p0, p1, t0, t1 });
+}
+function noteMapFrame(url, frame) {
+  if (url.searchParams.get('map') !== '1') return;
+  const cs = url.searchParams.get('c') || '', rs = url.searchParams.get('r') || '';
+  const ps = url.searchParams.get('p') || '', ts = url.searchParams.get('t') || '';
+  if (!/^\d{1,2}$/.test(cs) || !/^\d{1,2}$/.test(rs) || ps.trim() === '' || ts.trim() === '') return;
+  const c = +cs, r = +rs, pan = Number(ps), tilt = Number(ts);
+  if (c >= MAP_MAX_COLS || r >= MAP_MAX_ROWS || !Number.isFinite(pan) || !Number.isFinite(tilt) ||
+      pan < 0 || pan > 180 || tilt < 0 || tilt > 180) return;
+  const cell = { jpeg: frame, pan: Math.round(pan * 10) / 10, tilt: Math.round(tilt * 10) / 10, t: Date.now() };
+  roomMap.cells.set(c + ',' + r, cell);
+  broadcast('map', { c, r, pan: cell.pan, tilt: cell.tilt, t: cell.t });
+}
+function mapCellAt(pan, tilt) {                   // the cell nearest a head position
+  const m = roomMap;
+  const idx = (v, a, b, n) => n < 2 || a === b ? 0 : Math.min(n - 1, Math.max(0, Math.round((v - a) / (b - a) * (n - 1))));
+  return idx(pan, m.p0, m.p1, m.cols) + ',' + idx(tilt, m.t0, m.t1, m.rows);
+}
+function mapActivity(kind) {
+  if (!MAP_HEAT_KINDS.has(kind)) return;
+  const key = mapHint || (head && roomMap.cols ? mapCellAt(head.pan, head.tilt) : null);
+  if (!key) return;
+  const a = roomMap.activity.get(key) || { n: 0, last: 0 };
+  a.n += 1;
+  a.last = Date.now();
+  roomMap.activity.set(key, a);
+}
+setInterval(() => {                               // activity fades: ×0.9 an hour
+  for (const [k, a] of roomMap.activity) { a.n *= 0.9; if (a.n < 0.05) roomMap.activity.delete(k); }
+}, 3600e3).unref();
+function mapJson() {
+  const keys = new Set([...roomMap.cells.keys(), ...roomMap.activity.keys(), ...roomMap.changed.keys()]);
+  const cells = [...keys].map((k) => {
+    const [c, r] = k.split(',').map(Number), cell = roomMap.cells.get(k), a = roomMap.activity.get(k);
+    return { c, r, pan: cell ? cell.pan : null, tilt: cell ? cell.tilt : null, t: cell ? cell.t : null,
+             act: a ? Math.round(a.n * 100) / 100 : 0, changedAt: roomMap.changed.get(k) || null };
+  }).sort((x, y) => x.r - y.r || x.c - y.c);
+  return { ...(mapGeom() || { cols: null, rows: null, p0: null, p1: null, t0: null, t1: null }), cells };
 }
 
 // ── Event gallery ───────────────────────────────────────────────────────
@@ -883,6 +973,8 @@ function handleDisplayPost(req, res) {
     const buf = Buffer.concat(chunks);
     seen.display = Date.now();
     deviceKick = false;                            // it's polling now
+    noteMapGeom(req);                              // the grid and the head first: events below land on the
+    noteHead(req);                                 // map cell the head points at now (and the head event carries the grid)
     notePerson(req);
     noteAf(req);
     noteScreen(req);
@@ -890,7 +982,6 @@ function handleDisplayPost(req, res) {
     noteSd(req);
     noteDeviceEvent(req);
     noteIdle(req);
-    noteHead(req);
     noteHeadAck(req);
     if (buf.length === 1024) {
       const out = Buffer.alloc(1024);
@@ -964,7 +1055,7 @@ function status() {
   const age = latestAt ? Date.now() - latestAt : null;
   return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
            fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
-           idle: isIdle(), head, ...ages(), vision: { on: !!HF_TOKEN, used: (visionDay(), vision.used), limit: VISION_DAILY, err: vision.err } };
+           idle: isIdle(), head, map: mapGeom(), ...ages(), vision: { on: !!HF_TOKEN, used: (visionDay(), vision.used), limit: VISION_DAILY, err: vision.err } };
 }
 
 const server = http.createServer((req, res) => {
@@ -1045,6 +1136,9 @@ const server = http.createServer((req, res) => {
     case '/panos':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(panos.slice().reverse().map(panoItem)), { 'Cache-Control': 'no-store' });
+    case '/map.json':
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return send(res, 200, 'application/json', JSON.stringify(mapJson()), { 'Cache-Control': 'no-store' });
     case '/health':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify({ every: HEALTH_EVERY_MS, samples: healthSamples }));
@@ -1064,6 +1158,13 @@ const server = http.createServer((req, res) => {
         const f = p && p.frames[+pm[2]];
         if (!f) return send(res, 404, 'text/plain', 'not here');
         return send(res, 200, 'image/jpeg', f, { 'Cache-Control': 'private, max-age=3600' });
+      }
+      const mm = /^\/map\/(\d{1,2})_(\d{1,2})\.jpg$/.exec(url.pathname);   // one cell of the room map
+      if (mm) {
+        if (!authed) return send(res, 401, 'text/plain', 'bad key');
+        const cell = roomMap.cells.get(+mm[1] + ',' + +mm[2]);
+        if (!cell) return send(res, 404, 'text/plain', 'not mapped yet');
+        return send(res, 200, 'image/jpeg', cell.jpeg, { 'Cache-Control': 'private, max-age=60' });
       }
       return send(res, 404, 'text/plain', 'not found');
     }
@@ -1254,7 +1355,8 @@ const STYLE = `
   .log li.screen i { background: var(--muted); }
   .log li.unusual i { background: var(--bad); box-shadow: 0 0 6px rgba(248,113,113,.8); } .log li.lights i { background: #fde68a; }
   .tile.unusual .kind { color: var(--bad); }
-  .gal-seg { margin-bottom: 10px; }
+  .log li.changed i { background: var(--bad); } .tile.changed .kind { color: var(--bad); }
+  .gal-seg { margin-bottom: 10px; flex-wrap: wrap; max-width: 100%; }
   .gal { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
   .gal .slim { grid-column: 1 / -1; }
   .tile { position: relative; padding: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
@@ -1474,6 +1576,45 @@ const STYLE = `
   .pano-old { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .pano-old button { font-size: 12px; padding: 5px 9px; }
   .pano-old button[aria-pressed="true"] { border-color: rgba(94,234,212,.45); color: var(--accent); }
+  /* Room map: one picture per patrol stop, row 0 (looking up) at the top */
+  .map-scan { display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px; }
+  .map-scan svg { width: 15px; height: 15px; }
+  .map-wrap { position: relative; }
+  .map-grid { display: grid; gap: 3px; }
+  .map-tile { position: relative; display: block; min-width: 0; aspect-ratio: 4 / 3; padding: 0; border: 0; border-radius: 5px;
+              overflow: hidden; cursor: pointer; background: #000; color: var(--text); font: inherit; }
+  .map-tile img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .map-tile.empty { background: repeating-linear-gradient(135deg, var(--surface-2) 0 5px, var(--surface) 5px 10px); }
+  .map-tile .heat { position: absolute; inset: 0; background: var(--accent); opacity: 0; pointer-events: none; transition: opacity .6s; }
+  .map-tile .cnt { position: absolute; right: 2px; top: 2px; min-width: 14px; padding: 0 3px; border-radius: 999px; line-height: 14px;
+                   font-size: 10px; font-weight: 700; text-align: center; color: var(--accent); background: rgba(7,9,12,.82);
+                   font-variant-numeric: tabular-nums; pointer-events: none; }
+  .map-tile .pill { position: absolute; left: 0; right: 0; bottom: 0; overflow: hidden; text-align: center; white-space: nowrap;
+                    line-height: 13px; font-size: 9px; font-weight: 700;
+                    color: #fff; background: rgba(220,38,38,.88); pointer-events: none; }
+  .map-tile.chg::after { content: ""; position: absolute; inset: 0; border: 2px solid var(--bad); border-radius: inherit; pointer-events: none; }
+  .map-tile:hover::before, .map-tile:focus-visible::before { content: ""; position: absolute; inset: 0; z-index: 1;
+                    border: 2px solid var(--accent); border-radius: inherit; pointer-events: none; }
+  .map-tile:focus-visible { outline: none; }
+  .map-marks { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+  .map-marks > span { position: absolute; inset: 0; }
+  .map-marks i { position: absolute; transform: translate(-50%, -50%); font-style: normal; }
+  .map-head { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--accent); background: rgba(7,9,12,.35);
+              box-shadow: 0 0 0 2px rgba(7,9,12,.5), 0 0 10px rgba(94,234,212,.75); transition: left .6s ease, top .6s ease; }
+  .map-head::before, .map-head::after { content: ""; position: absolute; left: 50%; top: 50%; background: var(--accent); transform: translate(-50%, -50%); }
+  .map-head::before { width: 24px; height: 1.5px; } .map-head::after { width: 1.5px; height: 24px; }
+  .map-head.off { border-color: var(--muted); box-shadow: 0 0 0 2px rgba(7,9,12,.5); }
+  .map-head.off::before, .map-head.off::after { background: var(--muted); }
+  .map-spot { width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid #fff; background: rgba(7,9,12,.6); }
+  .map-spot b { position: absolute; left: 50%; top: 8px; transform: translateX(-50%); padding: 0 4px; border-radius: 4px; white-space: nowrap;
+                font-size: 9.5px; font-weight: 600; line-height: 13px; color: var(--text); background: rgba(7,9,12,.78); }
+  .map-rest { width: 9px; height: 9px; border-radius: 2px; border: 1.5px dashed var(--accent); background: rgba(7,9,12,.4); }
+  .map-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; margin-top: 8px;
+              font-size: 12px; color: var(--muted); }
+  .map-foot span { min-width: 0; flex: 1 1 200px; }
+  .map-flip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; font-size: 12px; }
+  .map-flip svg { width: 14px; height: 14px; }
+  .map-flip[aria-pressed="true"] { border-color: rgba(94,234,212,.45); color: var(--accent); }
   .stage.looking { cursor: crosshair; }
   .look-ring { position: absolute; width: 46px; height: 46px; margin: -23px 0 0 -23px; border-radius: 50%; border: 2px solid var(--accent);
                pointer-events: none; z-index: 3; animation: lring .7s ease-out forwards; }
@@ -1492,6 +1633,7 @@ const STYLE = `
     .stage.stale #feed { transition: none; }
     .head-pos .dot { transition: none; }
     .pano-strip span { animation: none; }
+    .map-head, .map-tile .heat { transition: none; }
     .look-ring { animation: lfade .7s ease-out forwards; }
   }
   @keyframes lfade { to { opacity: 0; } }
@@ -1702,6 +1844,17 @@ function viewerPage() {
         <div class="pano-info" id="pano-info">No panorama yet. AYA sweeps the room and the pictures appear here.</div>
         <div class="pano-old" id="pano-old"></div>
       </section>
+      <section class="card" aria-label="Room map" id="map-card">
+        <div class="card-head"><h2>Room map</h2>
+          <button class="btn map-scan" id="map-scan" type="button" title="AYA looks at every part of the room once, then goes back to what she was doing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M14 17.5h7M17.5 14v7"/></svg>Scan room</button></div>
+        <div class="map-wrap" id="map-wrap" hidden>
+          <div class="map-grid" id="map-grid" role="group" aria-label="Views of the room: tap one to look there"></div>
+          <div class="map-marks" id="map-marks" aria-hidden="true"><i class="map-rest" id="map-rest" hidden></i><span id="map-spots"></span><i class="map-head" id="map-head" hidden></i></div>
+        </div>
+        <div class="slim" id="map-empty">No map yet. Switch the head to Patrol or press Scan room.</div>
+        <div class="map-foot" id="map-foot" hidden><span>Brighter = more activity · red = something changed · tap a view to look there</span>
+          <button class="btn map-flip" id="map-flip" type="button" aria-pressed="false" title="Mirror the map if it shows the room the wrong way round"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v18"/><path d="M8 7l-5 5 5 5"/><path d="M16 7l5 5-5 5"/></svg>Flip left-right</button></div>
+      </section>
       <section class="card" aria-label="Camera">
         <div class="card-head"><h2>Camera</h2><span class="mood" id="cam-state">—</span></div>
         <div class="slim">The OV7670 on the display board: a picture every few seconds here, live on the OLED.</div>
@@ -1724,7 +1877,7 @@ function viewerPage() {
         <div class="card-head"><h2>Events</h2><span class="mood" id="gal-count">—</span></div>
         <div class="seg gal-seg" id="gal-seg">
           <button data-k="all" aria-pressed="true">All</button><button data-k="person">People</button>
-          <button data-k="stranger">Strangers</button><button data-k="known">Family</button><button data-k="unusual">Unusual</button>
+          <button data-k="stranger">Strangers</button><button data-k="known">Family</button><button data-k="unusual">Unusual</button><button data-k="changed">Changed</button>
         </div>
         <div class="gal" id="gal"><div class="slim">No events yet. Snapshots appear here when AYA detects someone.</div></div>
         <div class="slim gal-note">The last 60 events are kept until the server restarts. Everything is also saved on the SD card below.</div>
@@ -1851,6 +2004,7 @@ function viewerPage() {
     document.querySelectorAll('.pane').forEach(function (p) { p.hidden = p.dataset.pane !== name; });
     try { localStorage.setItem('aria-tab', name); } catch (e) {}
     if (name === 'health') { renderHealth(); loadHealth(); }   // charts need a visible width; fresh data on open
+    if (name === 'camera') setTimeout(mapLoad, 0);             // after the whole script has run (this runs early on a saved tab)
   }
   document.querySelector('.tabs').addEventListener('click', function (e) {
     var b = e.target.closest('button'); if (b) showTab(b.dataset.tab);
@@ -2041,7 +2195,7 @@ function viewerPage() {
 
   // ── Events: snapshots of people, strangers and family arriving ──
   var gal = [], galKind = 'all', galOpen = -1, galPlay = null;
-  var KIND = { person: 'Person', stranger: 'Stranger', known: 'Family', unusual: 'Unusual' };
+  var KIND = { person: 'Person', stranger: 'Stranger', known: 'Family', unusual: 'Unusual', changed: 'Changed' };
   function galShown() { return gal.filter(function (e) { return galKind === 'all' || e.kind === galKind; }); }
   function galRender() {
     var list = galShown(), box = $('gal');
@@ -2071,7 +2225,8 @@ function viewerPage() {
     $('v-text').textContent = e.text;
     $('v-time').textContent = new Date(e.t).toLocaleString();
     $('v-ai').hidden = !e.ai; $('v-ai').textContent = e.ai || '';
-    $('v-dot').style.background = e.kind === 'stranger' ? 'var(--warn)' : e.kind === 'known' ? 'var(--good)' : '#fb923c';
+    $('v-dot').style.background = e.kind === 'stranger' ? 'var(--warn)' : e.kind === 'known' ? 'var(--good)' :
+                                   e.kind === 'unusual' || e.kind === 'changed' ? 'var(--bad)' : '#fb923c';
     $('v-prev').disabled = i === 0; $('v-next').disabled = i === list.length - 1;
     function show() {
       $('v-img').src = '/gallery/' + e.id + '/' + f + '.jpg';
@@ -2276,9 +2431,10 @@ function viewerPage() {
                head_mode: 'Head mode set', head_look: 'Looking there', head_nudge: 'Moving the head', head_goto: 'Centring the head',
                head_rest_save: 'Rest position saved', head_rest_go: 'Going to the rest position',
                head_spot_save: 'Spot saved', head_spot_go: 'Going to the spot', head_spot_del: 'Spot deleted',
-               head_gesture: 'Gesture sent', head_pano: 'Panorama started · pictures appear below'
+               head_gesture: 'Gesture sent', head_pano: 'Panorama started · pictures appear below',
+               head_map: 'Scanning the room'
              };
-  async function send(cmd, args, extra) {
+  async function send(cmd, args, extra, okText) {
     try {
       var body = { cmd: cmd, args: args || [] };
       for (var k in (extra || {})) body[k] = extra[k];
@@ -2286,7 +2442,7 @@ function viewerPage() {
                                     body: JSON.stringify(body) });
       if (r.status === 401) { location.reload(); return 401; }            // signed out: back to the sign-in page
       else if (r.status >= 400) toast('Not accepted: ' + (await r.text()), 'err');
-      else toast(SENT[cmd] || 'Sent', 'ok');
+      else toast(okText || SENT[cmd] || 'Sent', 'ok');
       return r.status;
     } catch (e) { toast('Could not reach the server', 'err'); return 0; }
   }
@@ -2355,7 +2511,7 @@ function viewerPage() {
   // ── Head: the pan-tilt servos (mode, joystick, click to look, spots, gestures, panorama) ──
   var head = null, headLive = false, spotsKey = '';
   var HEAD_STATE = { search: 'Searching', face: 'Following a face', motion: 'Checking motion', hold: 'Holding',
-                     inspect: 'Taking a close look', gesture: 'Gesturing', spot: 'At a saved spot', pano: 'Taking a panorama', centre: 'Centring', '-': 'Idle' };
+                     inspect: 'Taking a close look', gesture: 'Gesturing', spot: 'At a saved spot', pano: 'Taking a panorama', map: 'Mapping the room', centre: 'Centring', '-': 'Idle' };
   var HEAD_MODE = { follow: 'Follow: turns to faces and motion', patrol: 'Patrol: sweeps the room slowly', hold: 'Hold: stays where you point it' };
   var SVG_X = '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M2 2l8 8M10 2l-8 8"/></svg>';
   es.addEventListener('head', function (e) { try { head = JSON.parse(e.data); renderHead(); } catch (x) {} });
@@ -2368,6 +2524,7 @@ function viewerPage() {
       (HEAD_STATE[h.state] ? ' · ' + HEAD_STATE[h.state] : '') : 'Pan – · Tilt –';
     $('head-sub').textContent = !h ? 'Waiting for AYA to report her head' : !headLive ? 'Last known position · AYA is offline' : HEAD_MODE[h.mode] || '';
     box.classList.toggle('off', !h || !headLive);
+    mapMarks();
     if (h) { dot.style.left = pct(h.pan); dot.style.top = pct(h.tilt); }
     var r = h && h.rest, rd = $('rest-dot');
     rd.hidden = !r;
@@ -2504,6 +2661,137 @@ function viewerPage() {
   });
   $('pano-go').onclick = function () { send('head_pano'); };
   panoLoad();
+
+  // ── Room map: the latest picture of each patrol stop, activity and changes on top ──
+  // Grid from head.map (live) or /map.json: pan p0..p1 across the columns, tilt t0..t1 down
+  // the rows (a smaller tilt looks up, so row 0 is the top). Which way pan runs on screen
+  // is unknown, so the map can be flipped left-right (remembered per browser).
+  var mapData = { cols: null, rows: null, cells: {} }, mapTiles = {}, mapShape = '', mapMax = 0, mapTimer = null, mapFlip = false;
+  var MAP_KINDS = ['person', 'arrive', 'known', 'stranger', 'unknown', 'motion', 'changed', 'unusual', 'wave'];
+  try { mapFlip = localStorage.getItem('aya-mapflip') === '1'; } catch (e) {}
+  function mapGeo() {
+    var g = head && head.map ? head.map : mapData.cols ? mapData : null;
+    var o = { cols: g ? g.cols : 0, rows: g ? g.rows : 0, p0: g && g.p0, p1: g && g.p1, t0: g && g.t0, t1: g && g.t1, known: !!g };
+    Object.keys(mapData.cells).forEach(function (k) {   // pictures beyond the grid (or no grid yet): make room
+      var c = mapData.cells[k]; if (c.c >= o.cols) o.cols = c.c + 1; if (c.r >= o.rows) o.rows = c.r + 1;
+    });
+    return o;
+  }
+  function mapFrac(v, a, b, n) { return n < 2 || a === b ? 0 : (v - a) / (b - a) * (n - 1); }   // fractional cell index
+  function mapAim(g, c, r) {                           // where to point the head for a cell
+    var cell = mapData.cells[c + ',' + r];
+    if (cell && typeof cell.pan === 'number') return [cell.pan, cell.tilt];
+    if (!g.known) return null;
+    return [g.cols < 2 ? g.p0 : g.p0 + (g.p1 - g.p0) * c / (g.cols - 1), g.rows < 2 ? g.t0 : g.t0 + (g.t1 - g.t0) * r / (g.rows - 1)];
+  }
+  function mapPlace(el, g, pan, tilt) {
+    var fc = mapFrac(pan, g.p0, g.p1, g.cols), fr = mapFrac(tilt, g.t0, g.t1, g.rows);
+    if (mapFlip) fc = g.cols - 1 - fc;
+    var x = (fc + 0.5) / g.cols * 100, y = (fr + 0.5) / g.rows * 100;
+    el.style.left = Math.max(0, Math.min(100, x)).toFixed(2) + '%'; el.style.top = Math.max(0, Math.min(100, y)).toFixed(2) + '%';
+  }
+  function mapAgo(t) {
+    var m = Math.round((Date.now() - t) / 60000);
+    return m < 1 ? 'just now' : m < 60 ? m + 'm ago' : m < 1440 ? Math.round(m / 60) + 'h ago' : Math.round(m / 1440) + 'd ago';
+  }
+  function mapRender() {
+    var g = mapGeo(), keys = Object.keys(mapData.cells), grid = $('map-grid');
+    var any = keys.some(function (k) { var c = mapData.cells[k]; return c.t || c.act > 0 || c.changedAt; });
+    var show = any && g.cols > 0;
+    $('map-wrap').hidden = !show; $('map-foot').hidden = !show; $('map-empty').hidden = show;
+    $('map-flip').setAttribute('aria-pressed', String(mapFlip));
+    if (!show) { mapShape = ''; grid.textContent = ''; mapTiles = {}; return; }
+    mapMax = 0;
+    keys.forEach(function (k) { mapMax = Math.max(mapMax, mapData.cells[k].act || 0); });
+    var shape = g.cols + 'x' + g.rows + (mapFlip ? 'f' : '');
+    if (shape !== mapShape) {
+      mapShape = shape; grid.textContent = ''; mapTiles = {};
+      grid.style.gridTemplateColumns = 'repeat(' + g.cols + ', minmax(0, 1fr))';
+      for (var r = 0; r < g.rows; r++) for (var c = 0; c < g.cols; c++) {
+        var b = document.createElement('button'); b.type = 'button'; b.className = 'map-tile empty';
+        b.dataset.c = c; b.dataset.r = r;
+        b.style.gridColumn = String(mapFlip ? g.cols - c : c + 1); b.style.gridRow = String(r + 1);
+        var im = document.createElement('img'); im.alt = ''; im.hidden = true; im.decoding = 'async';
+        im.onerror = function () { this.hidden = true; this.parentNode.classList.add('empty'); };
+        var heat = document.createElement('span'); heat.className = 'heat';
+        var cnt = document.createElement('span'); cnt.className = 'cnt'; cnt.hidden = true;
+        var pill = document.createElement('span'); pill.className = 'pill'; pill.textContent = 'Changed'; pill.hidden = true;
+        b.append(im, heat, cnt, pill);
+        grid.append(b);
+        mapTiles[c + ',' + r] = { el: b, img: im, heat: heat, cnt: cnt, pill: pill, t: null };
+      }
+    }
+    Object.keys(mapTiles).forEach(mapTile);
+    mapMarks();
+  }
+  function mapTile(k) {
+    var o = mapTiles[k]; if (!o) return;
+    var cell = mapData.cells[k] || {}, p = k.split(','), act = cell.act || 0;
+    if (cell.t && o.t !== cell.t) { o.t = cell.t; o.img.src = '/map/' + p[0] + '_' + p[1] + '.jpg?t=' + cell.t; o.img.hidden = false; o.el.classList.remove('empty'); }
+    if (!cell.t) { o.t = null; o.img.hidden = true; o.img.removeAttribute('src'); o.el.classList.add('empty'); }
+    o.heat.style.opacity = mapMax > 0 ? (act / mapMax * 0.5).toFixed(2) : '0';
+    o.cnt.hidden = act < 1; o.cnt.textContent = String(Math.round(act));
+    var chg = !!cell.changedAt && Date.now() - cell.changedAt < 3600000;
+    o.el.classList.toggle('chg', chg); o.pill.hidden = !chg;
+    o.el.title = 'View ' + p[0] + ',' + p[1] + ' · ' + (cell.t ? 'updated ' + mapAgo(cell.t) : 'no picture yet') +
+      (act >= 1 ? ' · ' + Math.round(act) + ' recent events' : '') + (chg ? ' · changed ' + mapAgo(cell.changedAt) : '');
+    o.el.setAttribute('aria-label', 'Look at view ' + p[0] + ',' + p[1] + (chg ? ', something changed' : ''));
+  }
+  var mapMarksKey = '';
+  function mapMarks() {
+    var g = mapGeo(), hd = $('map-head'), rest = $('map-rest'), box = $('map-spots');
+    if ((g.cols + 'x' + g.rows + (mapFlip ? 'f' : '')) !== mapShape && !$('map-wrap').hidden) { mapRender(); return; }
+    var on = g.known && !$('map-wrap').hidden && !!head;
+    hd.hidden = !on; rest.hidden = !(on && head.rest);
+    if (!on) { box.textContent = ''; mapMarksKey = ''; return; }
+    mapPlace(hd, g, head.pan, head.tilt);
+    hd.classList.toggle('off', !headLive);
+    if (head.rest) mapPlace(rest, g, head.rest.pan, head.rest.tilt);
+    var key = JSON.stringify([head.spots || [], g, mapFlip]);
+    if (key === mapMarksKey) return;
+    mapMarksKey = key; box.textContent = '';
+    (head.spots || []).forEach(function (s) {
+      var m = document.createElement('i'); m.className = 'map-spot';
+      var n = document.createElement('b'); n.textContent = s.name; m.append(n);
+      mapPlace(m, g, s.pan, s.tilt); box.append(m);
+    });
+  }
+  async function mapLoad() {
+    try {
+      var d = await (await fetch('/map.json', { cache: 'no-store' })).json(), cells = {};
+      (d.cells || []).forEach(function (c) { cells[c.c + ',' + c.r] = c; });
+      mapData = { cols: d.cols, rows: d.rows, p0: d.p0, p1: d.p1, t0: d.t0, t1: d.t1, cells: cells };
+      mapRender();
+    } catch (e) {}
+  }
+  es.addEventListener('map', function (e) {             // a new picture of one view: refresh just that tile
+    try {
+      var d = JSON.parse(e.data), k = d.c + ',' + d.r;
+      var cell = mapData.cells[k] || { c: d.c, r: d.r, act: 0, changedAt: null };
+      cell.pan = d.pan; cell.tilt = d.tilt; cell.t = d.t; mapData.cells[k] = cell;
+      if (mapTiles[k] && !$('map-wrap').hidden) mapTile(k); else mapRender();
+    } catch (x) {}
+  });
+  es.addEventListener('log', function (e) {             // activity or a change: fresh counts shortly after
+    try {
+      if (MAP_KINDS.indexOf(JSON.parse(e.data).kind) < 0 || $('pane-camera').hidden) return;
+      clearTimeout(mapTimer); mapTimer = setTimeout(mapLoad, 1500);
+    } catch (x) {}
+  });
+  $('map-grid').addEventListener('click', function (e) {
+    var b = e.target.closest('.map-tile'); if (!b) return;
+    var c = +b.dataset.c, r = +b.dataset.r, a = mapAim(mapGeo(), c, r);
+    if (!a) { toast('AYA has not reported where this view is yet', 'err'); return; }
+    send('head_goto', [a[0].toFixed(1), a[1].toFixed(1)], null, 'Looking at view ' + c + ',' + r);
+  });
+  $('map-flip').addEventListener('click', function () {
+    mapFlip = !mapFlip;
+    try { localStorage.setItem('aya-mapflip', mapFlip ? '1' : '0'); } catch (x) {}
+    mapShape = ''; mapRender();
+  });
+  $('map-scan').addEventListener('click', function () { send('head_map'); });
+  setInterval(function () { if (!$('pane-camera').hidden) mapLoad(); }, 60000);
+  mapLoad();
 
   // ── Health history: online + frame rate ──
   var hData = null, hHours = 6, hCharts = [];
