@@ -210,12 +210,18 @@ function handleLogin(req, res) {
   });
 }
 
+// "Poll now": the display polls /display every 2 s but uploads a frame every
+// ~0.5 s, so a command (or a hand sign) waiting for it sets this, and the next
+// upload's reply says ",p" — it polls at once instead of up to 2 s later.
+let deviceKick = false;
+
 function handleCmd(req, res) {
   if (!sessionOk(req) && !keyMatches(req.headers['x-admin-key'], ADMIN_KEY)) return send(res, 401, 'text/plain', 'not logged in');
   readBody(req, SMALL_BODY_MAX, (raw) => {
     let body;
     try { body = JSON.parse(raw.toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
     const cmd = String(body.cmd || ''), args = (body.args || []).map(String);
+    deviceKick = true;
     // Display commands are kept here for the display to pick up (/display).
     if (cmd === 'screen') {
       if (!['on', 'off'].includes(args[0])) return send(res, 400, 'text/plain', 'screen on|off');
@@ -379,7 +385,7 @@ function handlePush(req, res, url) {
     const frame = Buffer.concat(chunks);
     if (!acceptFrame(frame)) return send(res, 400, 'text/plain', 'not a JPEG');
     notePano(url, frame);                          // a panorama frame is also the live picture
-    send(res, 200, 'text/plain', String(viewerCount()));
+    send(res, 200, 'text/plain', String(viewerCount()) + (deviceKick ? ',p' : ''));
   });
 }
 
@@ -681,7 +687,7 @@ function noteSign(meta) {
   if (h && Number.isFinite(h.x) && Number.isFinite(h.w))
     handLast = { hx: Math.round(Math.min(1, Math.max(0, h.x + h.w / 2)) * 1000) / 1000, at: Date.now() };
   const g = meta.gesture;
-  if (g && typeof g.t === 'number' && (!signLast || g.t !== signLast.t)) signLast = { name: String(g.name || ''), t: g.t, at: Date.now() };
+  if (g && typeof g.t === 'number' && (!signLast || g.t !== signLast.t)) { signLast = { name: String(g.name || ''), t: g.t, at: Date.now() }; deviceKick = true; }
 }
 function pendingSign() {
   const s = signLast, now = Date.now();
@@ -876,6 +882,7 @@ function handleDisplayPost(req, res) {
   req.on('end', () => {
     const buf = Buffer.concat(chunks);
     seen.display = Date.now();
+    deviceKick = false;                            // it's polling now
     notePerson(req);
     noteAf(req);
     noteScreen(req);
