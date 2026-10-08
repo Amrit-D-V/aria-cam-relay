@@ -419,6 +419,8 @@ function handleMeta(req, res) {
                     id: String(f.id || ''), name: String(f.name || '').slice(0, 20), admin: !!f.admin, emo: String(f.emo || ''), t: Date.now() };
     }
     seen.tracker = Date.now();
+    if ((Array.isArray(meta.bodies) && meta.bodies.length) || (Array.isArray(meta.faces) && meta.faces.length))
+      aiPersonAt = Date.now();                    // the laptop's detector sees someone (person-event check)
     noteSign(meta);
     trackActivity(meta);
     for (const s of metaSubscribers) s.write(`data: ${latestMeta}\n\n`);
@@ -526,6 +528,12 @@ function noteAf(req) {
   if (JSON.stringify(af) !== JSON.stringify(lastAf)) { lastAf = af; broadcast('af', af || { off: true }); }
 }
 
+// The display's "person" is PIR + camera motion: a curtain swaying in the
+// fan's draught while the PIR caught warm air scored 99%, and 49 of 62
+// person-event photos were curtains. While the laptop tracker is running,
+// its detector (YOLO11x) must also see a body or a face within 4 s either
+// side; otherwise it's logged as plain motion. Tracker off: as before.
+let aiPersonAt = 0;
 function notePerson(req) {
   const [n, conf, dir] = String(req.headers['x-person'] || '').split(';');
   const count = parseInt(n, 10);
@@ -533,9 +541,17 @@ function notePerson(req) {
   if (personSeen !== null && count > personSeen) {
     let text = `Person detected · ${parseInt(conf, 10) || '?'}%`;
     if (dir === 'left' || dir === 'right') text += ` · moving ${dir}`;
-    logEvent('person', text);
-    captureEvent('person', text);
-    autoDescribe();
+    const at = Date.now();
+    const confirm = () => {
+      const trackerOn = seen.tracker && Date.now() - seen.tracker < 15000;
+      if (!trackerOn || Math.abs(aiPersonAt - at) < 4000 || aiPersonAt > at) {
+        logEvent('person', trackerOn ? text + ' · AI confirmed' : text);
+        captureEvent('person', text);
+        autoDescribe();
+      } else logEvent('motion', 'Motion (no person seen by the AI)');
+    };
+    if (seen.tracker && Date.now() - seen.tracker < 15000 && Date.now() - aiPersonAt > 4000) setTimeout(confirm, 4000);   // give the AI a moment
+    else confirm();
   }
   personSeen = count;
 }
