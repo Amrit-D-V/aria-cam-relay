@@ -29,6 +29,18 @@
 //                    Render restarts the relay
 //   GET  /healthz    Render health check
 //
+// AYA's pan-tilt head:
+//   POST /cmd head_*  page → relay: queued in `headq` (≤8), handed to the
+//                    display in its POST /display reply until it acks them
+//                    (X-Head-Ack: <last id applied>)
+//   POST /display    also carries X-Head: pan,tilt,mode,state and
+//                    X-Spots: name:pan:tilt;… → SSE "head", /status .head
+//   POST /push?src=eye2&pano=<id>&k=<i>&n=<count>   panorama frames (kept for
+//                    the last 5 panoramas) → SSE "pano"
+//   GET  /panos      the panoramas kept; GET /pano/<id>/<k>.jpg one frame
+//   The tracker's hand signs (/meta gesture + hand) go to the display once
+//   each, as `sign: {k, t, hx}` in its poll reply.
+//
 // Zero dependencies — Node's http module only.
 'use strict';
 
@@ -256,6 +268,7 @@ function handleCmd(req, res) {
       broadcast('display', publicDisplay());
       return send(res, 202, 'text/plain', 'queued');
     }
+    if (cmd.startsWith('head_')) return headCmd(res, cmd, args);
     send(res, 400, 'text/plain', 'unknown command');
   });
 }
@@ -351,7 +364,7 @@ setInterval(() => {                               // "left" once nobody's been s
   }
 }, 1000);
 
-function handlePush(req, res) {
+function handlePush(req, res, url) {
   if (!keyMatches(req.headers['x-cam-key'], CAM_KEY)) return send(res, 401, 'text/plain', 'bad key');
   const chunks = [];
   let size = 0;
@@ -363,7 +376,9 @@ function handlePush(req, res) {
   req.on('end', () => {
     if (res.writableEnded) return;
     seen.eye2 = Date.now();
-    if (!acceptFrame(Buffer.concat(chunks))) return send(res, 400, 'text/plain', 'not a JPEG');
+    const frame = Buffer.concat(chunks);
+    if (!acceptFrame(frame)) return send(res, 400, 'text/plain', 'not a JPEG');
+    notePano(url, frame);                          // a panorama frame is also the live picture
     send(res, 200, 'text/plain', String(viewerCount()));
   });
 }
@@ -388,6 +403,7 @@ function handleMeta(req, res) {
                     id: String(f.id || ''), name: String(f.name || '').slice(0, 20), admin: !!f.admin, emo: String(f.emo || ''), t: Date.now() };
     }
     seen.tracker = Date.now();
+    noteSign(meta);
     trackActivity(meta);
     for (const s of metaSubscribers) s.write(`data: ${latestMeta}\n\n`);
     send(res, 204, 'text/plain', '');
@@ -547,6 +563,160 @@ function noteBoot(req) {
   if (why) logEvent('restart', `AYA started · ${why}`);
 }
 
+// ── The head: two servos (pan, tilt) on the display board ───────────────
+// Page commands wait in `headq` and ride out on the display's poll reply
+// until it acks them (X-Head-Ack: the last id it applied). Ids restart with
+// the relay, so an ack above the current max id is from before a restart: 0.
+const HEAD_MODES = ['follow', 'patrol', 'hold'];
+const HEAD_STATES = ['search', 'face', 'motion', 'hold', 'gesture', 'spot', 'pano', 'centre', '-'];
+const HEAD_GESTURES = ['nod', 'shake', 'curious', 'startle', 'droop', 'stretch', 'excited'];
+const SPOT_RE = /^[a-z0-9_-]{1,12}$/;
+const HEADQ_MAX = 8;
+const HEADQ_TTL_MS = 60000;       // a nudge from minutes ago must not fire when the display comes back
+const headq = [];                 // {id, op, a, b, name, at}
+let headId = 0;
+let head = null;                  // {pan, tilt, mode, state, spots: [{name, pan, tilt}]} from X-Head / X-Spots
+
+function headPush(op, a, b, name) {
+  headq.push({ id: ++headId, op, a: +a || 0, b: +b || 0, name: name || '', at: Date.now() });
+  while (headq.length > HEADQ_MAX) headq.shift();
+}
+
+function headCmd(res, cmd, args) {
+  const bad = (why) => send(res, 400, 'text/plain', why);
+  const num = (v, lo, hi) => { const n = Number(v); return v !== '' && Number.isFinite(n) && n >= lo && n <= hi ? Math.round(n * 1000) / 1000 : null; };
+  const spot = String(args[0] || '').trim().toLowerCase();
+  switch (cmd) {
+    case 'head_mode':
+      if (!HEAD_MODES.includes(args[0])) return bad('head_mode follow|patrol|hold');
+      headPush('mode', 0, 0, args[0]);
+      break;
+    case 'head_look': {
+      const x = num(args[0], -1, 1), y = num(args[1], -1, 1);
+      if (x === null || y === null) return bad('head_look x y (each -1..1)');
+      headPush('look', x, y, '');
+      break;
+    }
+    case 'head_nudge': {
+      const dp = num(args[0], -45, 45), dt = num(args[1], -45, 45);
+      if (dp === null || dt === null) return bad('head_nudge dpan dtilt (each -45..45 degrees)');
+      headPush('nudge', dp, dt, '');
+      break;
+    }
+    case 'head_goto': {
+      const p = num(args[0], 0, 180), t = num(args[1], 0, 180);
+      if (p === null || t === null) return bad('head_goto pan tilt (each 0..180 degrees)');
+      headPush('goto', p, t, '');
+      break;
+    }
+    case 'head_spot_save': case 'head_spot_go': case 'head_spot_del':
+      if (!SPOT_RE.test(spot)) return bad('spot name: 1-12 of a-z 0-9 _ -');
+      headPush(cmd.slice(5), 0, 0, spot);
+      break;
+    case 'head_gesture':
+      if (!HEAD_GESTURES.includes(args[0])) return bad('head_gesture ' + HEAD_GESTURES.join('|'));
+      headPush('gesture', 0, 0, args[0]);
+      break;
+    case 'head_pano':
+      headPush('pano', 0, 0, '');
+      break;
+    default:
+      return bad('unknown command');
+  }
+  send(res, 202, 'text/plain', 'queued');
+}
+
+function headAck(req) {
+  const a = Number(req.headers['x-head-ack']);
+  return Number.isInteger(a) && a > 0 && a <= headId ? a : 0;
+}
+
+function noteHeadAck(req) {
+  const ack = headAck(req), now = Date.now();
+  for (let i = headq.length - 1; i >= 0; i--)
+    if (headq[i].id <= ack || now - headq[i].at > HEADQ_TTL_MS) headq.splice(i, 1);
+}
+
+// X-Head: "pan,tilt,mode,state"; X-Spots: "name:pan:tilt;name:pan:tilt" (may be empty)
+function noteHead(req) {
+  const v = req.headers['x-head'];
+  if (v === undefined) return;
+  const [p, t, mode, state] = String(v).split(',').map((s) => s.trim());
+  const pan = Number(p), tilt = Number(t);
+  if (p === '' || t === '' || !Number.isFinite(pan) || !Number.isFinite(tilt)) return;
+  const r1 = (n) => Math.round(Math.min(180, Math.max(0, n)) * 10) / 10;
+  let spots = head ? head.spots : [];
+  if (req.headers['x-spots'] !== undefined) {
+    spots = String(req.headers['x-spots']).split(';').map((s) => s.trim().split(':'))
+      .filter((a) => a.length === 3 && SPOT_RE.test(a[0].toLowerCase()) && a[1] !== '' && a[2] !== '' && Number.isFinite(+a[1]) && Number.isFinite(+a[2]))
+      .slice(0, 24).map((a) => ({ name: a[0].toLowerCase(), pan: r1(+a[1]), tilt: r1(+a[2]) }));
+  }
+  const h = { pan: r1(pan), tilt: r1(tilt), mode: HEAD_MODES.includes(mode) ? mode : null,
+              state: HEAD_STATES.includes(state) ? state : '-', spots };
+  if (JSON.stringify(h) !== JSON.stringify(head)) { head = h; broadcast('head', head); }
+}
+
+// Hand signs from the tracker (/meta gesture {name, who, t}, hand {x, y, w, h, g}),
+// passed to the display once each as sign {k, t, hx} while under 4 s old
+let signLast = null;              // {name, t, at}
+let signSentT = null;
+let handLast = null;              // {hx, at}: the hand's centre x (0..1)
+function signKind(name) {
+  const s = String(name).toLowerCase();
+  if (s.includes('point')) return 'point';
+  if (s.includes('wave') || s.includes('palm')) return 'palm';
+  if (s.includes('thumbs down') || s.includes('thumb down')) return 'down';
+  if (s.includes('thumbs up') || s.includes('thumb up')) return 'up';
+  if (s.includes('peace')) return 'peace';
+  if (s.includes('love')) return 'love';
+  if (s.includes('fist')) return 'fist';
+  return null;
+}
+function noteSign(meta) {
+  const h = meta.hand;
+  if (h && Number.isFinite(h.x) && Number.isFinite(h.w))
+    handLast = { hx: Math.round(Math.min(1, Math.max(0, h.x + h.w / 2)) * 1000) / 1000, at: Date.now() };
+  const g = meta.gesture;
+  if (g && typeof g.t === 'number' && (!signLast || g.t !== signLast.t)) signLast = { name: String(g.name || ''), t: g.t, at: Date.now() };
+}
+function pendingSign() {
+  const s = signLast, now = Date.now();
+  // Fresh by arrival time; t itself must also be recent (with some clock skew
+  // allowed), so a tracker re-sending an old gesture after a relay restart isn't replayed
+  if (!s || s.t === signSentT || now - s.at > 4000 || Math.abs(s.at - s.t) > 15000) return null;
+  signSentT = s.t;
+  const k = signKind(s.name);
+  if (!k) return null;
+  return { k, t: s.t, hx: handLast && now - handLast.at < 2000 ? handLast.hx : -1 };
+}
+
+// Panoramas: the display uploads each frame with ?pano=<id>&k=<i>&n=<count>.
+// The last 5 are kept in memory (a relay restart clears them).
+const PANO_KEEP = 5;
+const PANO_MAX_FRAMES = 24;
+const panos = [];                 // oldest first: {id, t, n, frames: [Buffer|null]}
+function panoItem(p) {
+  const got = [];
+  p.frames.forEach((f, i) => { if (f) got.push(i); });
+  return { id: p.id, t: p.t, n: p.n, have: got.length, got };
+}
+function notePano(url, frame) {
+  const id = url.searchParams.get('pano');
+  if (id === null || !/^\d{1,12}$/.test(id)) return;
+  const k = Number(url.searchParams.get('k')), n = Number(url.searchParams.get('n'));
+  if (!Number.isInteger(n) || n < 1 || n > PANO_MAX_FRAMES || !Number.isInteger(k) || k < 0 || k >= n) return;
+  let p = panos.find((x) => x.id === +id);
+  // The same id with another count, or much later: the display restarted and counts again
+  if (p && (p.n !== n || Date.now() - p.t > 10 * 60e3)) { panos.splice(panos.indexOf(p), 1); p = null; }
+  if (!p) {
+    p = { id: +id, t: Date.now(), n, frames: new Array(n).fill(null) };
+    panos.push(p);
+    while (panos.length > PANO_KEEP) panos.shift();
+  }
+  p.frames[k] = frame;
+  broadcast('pano', { id: p.id, t: p.t, n: p.n, have: panoItem(p).have, k });
+}
+
 // ── Event gallery ───────────────────────────────────────────────────────
 // A person, a stranger or a family member arriving keeps a snapshot — the
 // frame at that moment plus up to two more over the next 2 s (whoever it was
@@ -679,6 +849,10 @@ function deviceReply(req) {
     out.log = activity.filter((e) => e.t > logSince).reverse().slice(0, 10).map((e) => ({ t: e.t, kind: e.kind, text: e.text }));
   if (Number.isFinite(shotSince))
     out.shots = gallery.filter((e) => e.t > shotSince).reverse().slice(0, 5).map((e) => ({ t: e.t, kind: e.kind, text: e.text }));
+  const ack = headAck(req), hq = headq.filter((e) => e.id > ack);   // head commands not yet applied
+  if (hq.length) out.headq = hq.map((e) => ({ id: e.id, op: e.op, a: e.a, b: e.b, name: e.name }));
+  const sign = pendingSign();                     // a new hand sign from the tracker (each once)
+  if (sign) out.sign = sign;
   return out;
 }
 
@@ -705,6 +879,8 @@ function handleDisplayPost(req, res) {
     noteSd(req);
     noteDeviceEvent(req);
     noteIdle(req);
+    noteHead(req);
+    noteHeadAck(req);
     if (buf.length === 1024) {
       const out = Buffer.alloc(1024);
       for (let y = 0; y < 64; y++)
@@ -731,6 +907,7 @@ function handleEvents(req, res) {
   for (const e of [...activity].reverse()) res.write(`event: log\ndata: ${JSON.stringify(e)}\n\n`);
   res.write(`event: display\ndata: ${JSON.stringify(publicDisplay())}\n\n`);
   if (lastAf) res.write(`event: af\ndata: ${JSON.stringify(lastAf)}\n\n`);
+  if (head) res.write(`event: head\ndata: ${JSON.stringify(head)}\n\n`);
   if (oledFrame && Date.now() - seen.display < 10000) res.write(`event: oled\ndata: ${JSON.stringify({ f: oledFrame })}\n\n`);
   metaSubscribers.add(res);
   const ping = setInterval(() => res.write(': ping\n\n'), 15000);   // keep proxies from idling it out
@@ -776,7 +953,7 @@ function status() {
   const age = latestAt ? Date.now() - latestAt : null;
   return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
            fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
-           idle: isIdle(), ...ages(), vision: { on: !!HF_TOKEN, used: (visionDay(), vision.used), limit: VISION_DAILY, err: vision.err } };
+           idle: isIdle(), head, ...ages(), vision: { on: !!HF_TOKEN, used: (visionDay(), vision.used), limit: VISION_DAILY, err: vision.err } };
 }
 
 const server = http.createServer((req, res) => {
@@ -785,7 +962,7 @@ const server = http.createServer((req, res) => {
   const device = keyMatches(key, VIEW_KEY);       // the display board's poll
   const authed = sessionOk(req);                  // a logged-in browser
 
-  if (req.method === 'POST' && url.pathname === '/push') return handlePush(req, res);
+  if (req.method === 'POST' && url.pathname === '/push') return handlePush(req, res, url);
   if (req.method === 'POST' && url.pathname === '/meta') return handleMeta(req, res);
   if (req.method === 'POST' && url.pathname === '/cmd') return handleCmd(req, res);
   if (req.method === 'POST' && url.pathname === '/login') return handleLogin(req, res);
@@ -854,6 +1031,9 @@ const server = http.createServer((req, res) => {
     case '/gallery':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(gallery.map(galleryItem)), { 'Cache-Control': 'no-store' });
+    case '/panos':
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return send(res, 200, 'application/json', JSON.stringify(panos.slice().reverse().map(panoItem)), { 'Cache-Control': 'no-store' });
     case '/health':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify({ every: HEALTH_EVERY_MS, samples: healthSamples }));
@@ -865,6 +1045,14 @@ const server = http.createServer((req, res) => {
         const f = ev && ev.frames[+g[2]];
         if (!f) return send(res, 404, 'text/plain', 'gone');
         return send(res, 200, 'image/jpeg', f, { 'Cache-Control': 'private, max-age=86400' });
+      }
+      const pm = /^\/pano\/(\d{1,12})\/(\d{1,2})\.jpg$/.exec(url.pathname);   // one panorama frame
+      if (pm) {
+        if (!authed) return send(res, 401, 'text/plain', 'bad key');
+        const p = panos.find((x) => x.id === +pm[1]);
+        const f = p && p.frames[+pm[2]];
+        if (!f) return send(res, 404, 'text/plain', 'not here');
+        return send(res, 200, 'image/jpeg', f, { 'Cache-Control': 'private, max-age=3600' });
       }
       return send(res, 404, 'text/plain', 'not found');
     }
@@ -1222,6 +1410,62 @@ const STYLE = `
   .login button { background: var(--accent); color: #04110f; border: 0; border-radius: 10px; padding: 12px; font-weight: 700; cursor: pointer; }
   .err { color: var(--bad); }
 
+  /* Head (pan-tilt servos) */
+  .head-seg { display: flex; width: 100%; }
+  .head-seg button { flex: 1 1 0; }
+  .head-read { margin: 10px 0 0; font-size: 14px; font-variant-numeric: tabular-nums; }
+  .head-read b { font-weight: 600; }
+  .head-read small { display: block; color: var(--muted); font-size: 12px; }
+  .head-ctl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: center; margin-top: 10px; }
+  .head-pos { position: relative; justify-self: center; width: 100%; max-width: 128px; aspect-ratio: 1; border-radius: 10px;
+              border: 1px solid var(--line); overflow: hidden;
+              background: linear-gradient(var(--line), var(--line)) 50% 50% / 1px 100% no-repeat,
+                          linear-gradient(var(--line), var(--line)) 50% 50% / 100% 1px no-repeat, var(--surface-2); }
+  .head-pos i { position: absolute; left: 50%; top: 50%; border-radius: 50%; pointer-events: none; }
+  .head-pos .dot { width: 12px; height: 12px; margin: -6px 0 0 -6px; background: var(--accent); z-index: 1;
+                   box-shadow: 0 0 0 4px var(--accent-dim), 0 0 10px rgba(94,234,212,.6); transition: left .6s ease, top .6s ease; }
+  .head-pos .spot-m { width: 7px; height: 7px; margin: -3.5px 0 0 -3.5px; border: 1.5px solid var(--muted); }
+  .head-pos.off .dot { background: var(--muted); box-shadow: none; }
+  .head-pos .ax { position: absolute; font-size: 9px; color: var(--muted); letter-spacing: .04em; }
+  .head-pos .ax.l { left: 4px; bottom: 2px; } .head-pos .ax.r { right: 4px; bottom: 2px; }
+  .joy { display: grid; grid-template-columns: repeat(3, 40px); grid-template-rows: repeat(3, 40px); gap: 4px; }
+  .joy button { display: grid; place-items: center; padding: 0; border: 1px solid var(--line); border-radius: 10px;
+                background: var(--surface-2); color: var(--text); cursor: pointer; }
+  .joy button:hover { border-color: rgba(94,234,212,.4); }
+  .joy button:active { background: var(--accent-dim); color: var(--accent); }
+  .joy button.mid { color: var(--accent); }
+  .joy svg { width: 18px; height: 18px; }
+  .head-gest { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+  .head-gest .btn { padding: 7px 2px; font-size: 12.5px; }
+  .spots { display: flex; flex-wrap: wrap; gap: 6px; }
+  .spot { display: inline-flex; align-items: center; max-width: 100%; padding: 2px 2px 2px 10px; border-radius: 999px;
+          background: var(--surface-2); border: 1px solid var(--line); font-size: 13px; }
+  .spot b { font-weight: 600; margin-right: 4px; overflow-wrap: anywhere; }
+  .spot button { border: 0; background: transparent; cursor: pointer; border-radius: 999px; padding: 4px 8px; font-size: 12px; color: var(--muted); }
+  .spot button:hover { background: var(--accent-dim); color: var(--text); }
+  .spot .go { color: var(--accent); font-weight: 600; }
+  .spot .del { display: grid; place-items: center; padding: 5px 7px; }
+  .spot .del svg { width: 11px; height: 11px; }
+  .spot-form { margin-top: 8px; }
+  .spot-form .btn { white-space: nowrap; }
+  .pano-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 14px; }
+  .pano-head .sub-h { margin: 0; }
+  .pano-strip { display: flex; gap: 2px; margin-top: 8px; overflow-x: auto; border-radius: 10px; background: #000; scrollbar-width: thin; }
+  .pano-strip a, .pano-strip span { flex: none; display: block; height: 84px; aspect-ratio: 4 / 3; }
+  .pano-strip img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .pano-strip span { background: var(--surface-2); animation: pwait 1.2s ease-in-out infinite alternate; }
+  @keyframes pwait { to { opacity: .45; } }
+  .pano-info { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .pano-old { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .pano-old button { font-size: 12px; padding: 5px 9px; }
+  .pano-old button[aria-pressed="true"] { border-color: rgba(94,234,212,.45); color: var(--accent); }
+  .stage.looking { cursor: crosshair; }
+  .look-ring { position: absolute; width: 46px; height: 46px; margin: -23px 0 0 -23px; border-radius: 50%; border: 2px solid var(--accent);
+               pointer-events: none; z-index: 3; animation: lring .7s ease-out forwards; }
+  .look-ring::after { content: ""; position: absolute; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px;
+                      border-radius: 50%; background: var(--accent); }
+  @keyframes lring { from { transform: scale(.3); opacity: 1; } 60% { opacity: 1; } to { transform: scale(1.5); opacity: 0; } }
+
   /* Less motion when the system asks for it: no pulsing, blinking, sliding or smooth scrolling */
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
@@ -1231,7 +1475,11 @@ const STYLE = `
     .toast { animation: none; }
     .toast.out { transition: none; }
     .stage.stale #feed { transition: none; }
+    .head-pos .dot { transition: none; }
+    .pano-strip span { animation: none; }
+    .look-ring { animation: lfade .7s ease-out forwards; }
   }
+  @keyframes lfade { to { opacity: 0; } }
 `;
 
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#07090c"/>
@@ -1289,6 +1537,9 @@ function viewerPage() {
           <button class="btn primary" id="zone-save">Save</button></span>
       </div>
       <div class="controls" id="stage-controls">
+        <button class="icon" id="btn-look" aria-pressed="false" title="Click to look: the head turns to where you click" aria-label="Toggle click to look">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg></button>
         <button class="icon" id="btn-af" aria-pressed="true" title="Auto-framing (follow like the OLED)" aria-label="Toggle auto-framing">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
             <path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/>
@@ -1398,6 +1649,37 @@ function viewerPage() {
     </div>
 
     <div class="pane" id="pane-camera" data-pane="camera" role="tabpanel" aria-labelledby="tab-camera" hidden>
+      <section class="card" aria-label="Head" id="head-card">
+        <div class="card-head"><h2>Head</h2><span class="mood" id="head-state">—</span></div>
+        <div class="seg head-seg" id="head-mode" role="group" aria-label="Head mode">
+          <button data-m="follow" aria-pressed="false" title="Turns to faces and motion">Follow</button><button data-m="patrol" aria-pressed="false" title="Sweeps the room slowly">Patrol</button><button data-m="hold" aria-pressed="false" title="Stays where you point it">Hold</button>
+        </div>
+        <div class="head-read"><b id="head-read">Pan – · Tilt –</b><small id="head-sub">Waiting for AYA to report her head</small></div>
+        <div class="head-ctl">
+          <div class="head-pos" id="head-pos" role="img" aria-label="Head position: pan across, tilt down"><i class="dot" id="head-dot"></i><span class="ax l">0°</span><span class="ax r">180°</span></div>
+          <div class="joy" id="joy" role="group" aria-label="Move the head">
+            <span></span><button data-d="up" aria-label="Look up" title="Up 10°"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 15l6-6 6 6"/></svg></button><span></span>
+            <button data-d="left" aria-label="Look left" title="Left 10°"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button>
+            <button data-d="centre" class="mid" aria-label="Centre the head" title="Centre (90°, 90°)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg></button>
+            <button data-d="right" aria-label="Look right" title="Right 10°"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></button>
+            <span></span><button data-d="down" aria-label="Look down" title="Down 10°"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><span></span>
+          </div>
+        </div>
+        <div class="sub-h">Gestures</div>
+        <div class="head-gest" id="head-gest">
+          <button class="btn" data-g="nod">Nod</button><button class="btn" data-g="shake">Shake</button><button class="btn" data-g="curious">Curious</button><button class="btn" data-g="excited">Excited</button>
+        </div>
+        <div class="sub-h">Saved spots</div>
+        <div class="spots" id="spots"><span class="slim">No saved spots yet.</span></div>
+        <form class="ask spot-form" id="spot-form">
+          <input id="spot-name" maxlength="12" autocomplete="off" spellcheck="false" placeholder="door, window, desk" aria-label="Spot name">
+          <button class="btn" type="submit">Save current view</button>
+        </form>
+        <div class="pano-head"><div class="sub-h">Panorama</div><button class="btn" id="pano-go" type="button">Take panorama</button></div>
+        <div class="pano-strip" id="pano-strip" hidden></div>
+        <div class="pano-info" id="pano-info">No panorama yet. AYA sweeps the room and the pictures appear here.</div>
+        <div class="pano-old" id="pano-old"></div>
+      </section>
       <section class="card" aria-label="Camera">
         <div class="card-head"><h2>Camera</h2><span class="mood" id="cam-state">—</span></div>
         <div class="slim">The OV7670 on the display board: a picture every few seconds here, live on the OLED.</div>
@@ -1606,6 +1888,7 @@ function viewerPage() {
       : s.eye2_age !== null ? 'no frames · ' + ago(s.eye2_age) : 'no frames yet');
     var dispOk = s.display_age !== null && s.display_age < 10000;
     sysCell('sys-display', dispOk ? 'ok' : 'bad', dispOk ? 'online' : s.display_age !== null ? 'offline · ' + ago(s.display_age) : 'not seen');
+    if (dispOk !== headLive) { headLive = dispOk; renderHead(); }
     if (s.vision) $('ask-left').textContent = s.vision.on ? (s.vision.limit - s.vision.used) + ' left today' : 'AI not set up';
     var trOk = s.tracker_age !== null && s.tracker_age < 5000;
     sysCell('sys-tracker', trOk ? 'ok' : '', trOk ? 'running' : s.tracker_age !== null ? 'stopped · ' + ago(s.tracker_age) + ' ago' : 'not running');
@@ -1628,7 +1911,7 @@ function viewerPage() {
   var es = new EventSource('/events' + q);
   es.onerror = function () { if (es.readyState !== 1) { $('live').className = 'live off'; $('live-text').textContent = 'Reconnecting…'; } };
   var esOpens = 0;
-  es.onopen = function () { refresh(); if (esOpens++) galLoad(); };   // a reconnect: fetch events missed meanwhile
+  es.onopen = function () { refresh(); if (esOpens++) { galLoad(); panoLoad(); } };   // a reconnect: fetch events missed meanwhile
   es.onmessage = function (e) { try { meta = JSON.parse(e.data); metaAt = Date.now(); render(); gesturePop(); } catch (x) {} };
 
   // A new hand sign: pop its emoji over the video (only ones made in the last few seconds,
@@ -1968,6 +2251,9 @@ function viewerPage() {
 
   var SENT = { ignore: 'Ignore zones saved', message: 'Message sent to the display', emotion: 'Sent to the display', view: 'Display updated',
                screen: 'Display switched', restart_all: 'Restarting camera + display…', shutdown: 'Shutting down…', zoom2: 'Camera 2 zoom set',
+               head_mode: 'Head mode set', head_look: 'Looking there', head_nudge: 'Moving the head', head_goto: 'Centring the head',
+               head_spot_save: 'Spot saved', head_spot_go: 'Going to the spot', head_spot_del: 'Spot deleted',
+               head_gesture: 'Gesture sent', head_pano: 'Panorama started · pictures appear below'
              };
   async function send(cmd, args, extra) {
     try {
@@ -2042,6 +2328,143 @@ function viewerPage() {
     send('emotion', [b.dataset.e]);
     b.classList.add('sent'); setTimeout(function () { b.classList.remove('sent'); }, 900);
   });
+
+  // ── Head: the pan-tilt servos (mode, joystick, click to look, spots, gestures, panorama) ──
+  var head = null, headLive = false, spotsKey = '';
+  var HEAD_STATE = { search: 'Searching', face: 'Following a face', motion: 'Checking motion', hold: 'Holding',
+                     gesture: 'Gesturing', spot: 'At a saved spot', pano: 'Taking a panorama', centre: 'Centring', '-': 'Idle' };
+  var HEAD_MODE = { follow: 'Follow: turns to faces and motion', patrol: 'Patrol: sweeps the room slowly', hold: 'Hold: stays where you point it' };
+  var SVG_X = '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M2 2l8 8M10 2l-8 8"/></svg>';
+  es.addEventListener('head', function (e) { try { head = JSON.parse(e.data); renderHead(); } catch (x) {} });
+  function pct(deg) { return Math.max(0, Math.min(100, deg / 180 * 100)).toFixed(1) + '%'; }
+  function renderHead() {
+    var h = head, box = $('head-pos'), dot = $('head-dot');
+    $('head-state').textContent = !h ? '—' : headLive ? 'Live' : 'Offline';
+    $('head-mode').querySelectorAll('button').forEach(function (b) { b.setAttribute('aria-pressed', String(!!h && b.dataset.m === h.mode)); });
+    $('head-read').textContent = h ? 'Pan ' + Math.round(h.pan) + '° · Tilt ' + Math.round(h.tilt) + '°' +
+      (HEAD_STATE[h.state] ? ' · ' + HEAD_STATE[h.state] : '') : 'Pan – · Tilt –';
+    $('head-sub').textContent = !h ? 'Waiting for AYA to report her head' : !headLive ? 'Last known position · AYA is offline' : HEAD_MODE[h.mode] || '';
+    box.classList.toggle('off', !h || !headLive);
+    if (h) { dot.style.left = pct(h.pan); dot.style.top = pct(h.tilt); }
+    var spots = h ? h.spots || [] : [], key = JSON.stringify(spots);
+    if (key === spotsKey) return;                     // only redraw the spots when they change
+    spotsKey = key;
+    box.querySelectorAll('.spot-m').forEach(function (m) { m.remove(); });
+    var list = $('spots'); list.textContent = '';
+    spots.forEach(function (s) {
+      var m = document.createElement('i'); m.className = 'spot-m'; m.style.left = pct(s.pan); m.style.top = pct(s.tilt); box.append(m);
+      var c = document.createElement('span'); c.className = 'spot'; c.title = 'Pan ' + Math.round(s.pan) + '° · Tilt ' + Math.round(s.tilt) + '°';
+      var n = document.createElement('b'); n.textContent = s.name;
+      var go = document.createElement('button'); go.type = 'button'; go.className = 'go'; go.textContent = 'Go';
+      go.setAttribute('aria-label', 'Go to ' + s.name);
+      go.addEventListener('click', function () { send('head_spot_go', [s.name]); });
+      var del = document.createElement('button'); del.type = 'button'; del.className = 'del'; del.innerHTML = SVG_X;
+      del.setAttribute('aria-label', 'Delete ' + s.name); del.title = 'Delete';
+      del.addEventListener('click', function () { if (confirm('Delete the saved spot "' + s.name + '"?')) send('head_spot_del', [s.name]); });
+      c.append(n, go, del); list.append(c);
+    });
+    if (!spots.length) { var p = document.createElement('span'); p.className = 'slim'; p.textContent = 'No saved spots yet.'; list.append(p); }
+  }
+  $('head-mode').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    if (head) { head.mode = b.dataset.m; renderHead(); }   // optimistic; the next head event confirms
+    send('head_mode', [b.dataset.m]);
+  });
+  // Tilt direction: this assumes a SMALLER tilt angle looks UP (and the position box
+  // draws tilt 0 at the top). If the head moves the wrong way, flip the sign of TILT_UP.
+  var TILT_UP = -10, PAN_RIGHT = 10;
+  $('joy').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    var d = b.dataset.d;
+    if (d === 'centre') { send('head_goto', [90, 90]); return; }
+    var v = { up: [0, TILT_UP], down: [0, -TILT_UP], left: [-PAN_RIGHT, 0], right: [PAN_RIGHT, 0] }[d];
+    if (v) send('head_nudge', v);
+  });
+  $('head-gest').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (b) send('head_gesture', [b.dataset.g]);
+  });
+  $('spot-form').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    var n = $('spot-name').value.trim().toLowerCase();
+    if (!/^[a-z0-9_-]{1,12}$/.test(n)) { toast('Spot names: 1 to 12 letters, digits, - or _', 'err'); return; }
+    if (await send('head_spot_save', [n]) === 202) $('spot-name').value = '';
+  });
+
+  // Click to look: a click on the picture turns the head there (x, y in -1..1 from the centre)
+  var lookOn = false;
+  try { lookOn = localStorage.getItem('aya-look') === '1'; } catch (e) {}
+  function applyLook() { $('btn-look').setAttribute('aria-pressed', String(lookOn)); stage.classList.toggle('looking', lookOn); }
+  applyLook();
+  $('btn-look').onclick = function () {
+    lookOn = !lookOn;
+    try { localStorage.setItem('aya-look', lookOn ? '1' : '0'); } catch (e) {}
+    applyLook();
+    toast(lookOn ? 'Click to look on: click the video to turn the head' : 'Click to look off');
+  };
+  stage.addEventListener('click', function (e) {
+    if (!lookOn || zoneEdit || e.target.closest('.controls, .zones, .zone-bar, .offline')) return;
+    // The image box after the .frame transform (auto-framing zoom/pan), then the picture inside it (object-fit: contain)
+    var r = img.getBoundingClientRect(), nw = img.naturalWidth || 4, nh = img.naturalHeight || 3;
+    var k = Math.min(r.width / nw, r.height / nh), dw = nw * k, dh = nh * k;
+    var x = (e.clientX - r.left - (r.width - dw) / 2) / dw * 2 - 1, y = (e.clientY - r.top - (r.height - dh) / 2) / dh * 2 - 1;
+    if (!(Math.abs(x) <= 1 && Math.abs(y) <= 1)) return;   // on the black bars, not the picture
+    var sr = stage.getBoundingClientRect(), ring = document.createElement('i');
+    ring.className = 'look-ring';
+    ring.style.left = (e.clientX - sr.left - stage.clientLeft) + 'px'; ring.style.top = (e.clientY - sr.top - stage.clientTop) + 'px';
+    stage.append(ring); setTimeout(function () { ring.remove(); }, 800);
+    send('head_look', [x.toFixed(3), y.toFixed(3)]);
+  });
+
+  // Panorama: frames arrive one by one over the "pano" event
+  var panos = [], panoSel = null;                      // panoSel: id picked from the older ones, null = newest
+  function panoTime(t) { return new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+  function panoCell(p, k) {
+    if (p.got.indexOf(k) < 0) { var s = document.createElement('span'); s.title = 'Picture ' + (k + 1) + ' (coming)'; return s; }
+    var a = document.createElement('a'); a.href = '/pano/' + p.id + '/' + k + '.jpg?t=' + p.t; a.target = '_blank'; a.rel = 'noopener';
+    a.title = 'Picture ' + (k + 1) + ' of ' + p.n;
+    var im = document.createElement('img'); im.alt = 'Panorama picture ' + (k + 1); im.src = a.href; a.append(im);
+    return a;
+  }
+  function panoShown() { return panos.find(function (x) { return x.id === panoSel; }) || panos[0]; }
+  function panoInfo(p) { $('pano-info').textContent = p ? panoTime(p.t) + ' · ' + p.have + ' of ' + p.n + ' pictures' + (p.have < p.n ? ' so far' : '') :
+                                                          'No panorama yet. AYA sweeps the room and the pictures appear here.'; }
+  function panoRender() {
+    var p = panoShown(), strip = $('pano-strip'), old = $('pano-old');
+    strip.textContent = ''; old.textContent = '';
+    strip.hidden = !p; panoInfo(p);
+    if (!p) return;
+    for (var k = 0; k < p.n; k++) strip.append(panoCell(p, k));
+    if (panos.length > 1) panos.forEach(function (x, i) {
+      var b = document.createElement('button'); b.type = 'button'; b.className = 'btn';
+      b.textContent = (i ? '' : 'Latest · ') + panoTime(x.t) + ' · ' + x.have + '/' + x.n;
+      b.setAttribute('aria-pressed', String(x === p));
+      b.addEventListener('click', function () { panoSel = i ? x.id : null; panoRender(); });
+      old.append(b);
+    });
+  }
+  async function panoLoad() {
+    try { panos = await (await fetch('/panos', { cache: 'no-store' })).json(); panoRender(); } catch (e) {}
+  }
+  es.addEventListener('pano', function (e) {
+    try {
+      var d = JSON.parse(e.data), p = panos.find(function (x) { return x.id === d.id && x.t === d.t; });
+      if (typeof d.k !== 'number') { panoLoad(); return; }
+      if (!p) {                                          // a new panorama: show it
+        panos = panos.filter(function (x) { return x.id !== d.id; });
+        p = { id: d.id, t: d.t, n: d.n, have: 0, got: [] };
+        panos.unshift(p); if (panos.length > 5) panos.pop();
+        panoSel = null; p.got.push(d.k); p.have = d.have; panoRender(); return;
+      }
+      if (p.got.indexOf(d.k) < 0) p.got.push(d.k);
+      p.have = d.have;
+      var strip = $('pano-strip');
+      if (panoShown() === p && strip.children.length === p.n) { strip.replaceChild(panoCell(p, d.k), strip.children[d.k]); panoInfo(p); }
+      else panoRender();
+      if (p.have === p.n && panoShown() === p) toast('Panorama ready', 'ok');
+    } catch (x) {}
+  });
+  $('pano-go').onclick = function () { send('head_pano'); };
+  panoLoad();
 
   // ── Health history: online + frame rate ──
   var hData = null, hHours = 6, hCharts = [];
