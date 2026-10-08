@@ -620,6 +620,9 @@ function headCmd(res, cmd, args) {
     case 'head_pano':
       headPush('pano', 0, 0, '');
       break;
+    case 'head_rest_save': case 'head_rest_go':          // save the current position as the rest position / go there
+      headPush(cmd.slice(5), 0, 0, '');
+      break;
     default:
       return bad('unknown command');
   }
@@ -637,11 +640,11 @@ function noteHeadAck(req) {
     if (headq[i].id <= ack || now - headq[i].at > HEADQ_TTL_MS) headq.splice(i, 1);
 }
 
-// X-Head: "pan,tilt,mode,state"; X-Spots: "name:pan:tilt;name:pan:tilt" (may be empty)
+// X-Head: "pan,tilt,mode,state[,restpan,resttilt]"; X-Spots: "name:pan:tilt;name:pan:tilt" (may be empty)
 function noteHead(req) {
   const v = req.headers['x-head'];
   if (v === undefined) return;
-  const [p, t, mode, state] = String(v).split(',').map((s) => s.trim());
+  const [p, t, mode, state, rp, rt] = String(v).split(',').map((s) => s.trim());
   const pan = Number(p), tilt = Number(t);
   if (p === '' || t === '' || !Number.isFinite(pan) || !Number.isFinite(tilt)) return;
   const r1 = (n) => Math.round(Math.min(180, Math.max(0, n)) * 10) / 10;
@@ -652,7 +655,8 @@ function noteHead(req) {
       .slice(0, 24).map((a) => ({ name: a[0].toLowerCase(), pan: r1(+a[1]), tilt: r1(+a[2]) }));
   }
   const h = { pan: r1(pan), tilt: r1(tilt), mode: HEAD_MODES.includes(mode) ? mode : null,
-              state: HEAD_STATES.includes(state) ? state : '-', spots };
+              state: HEAD_STATES.includes(state) ? state : '-', spots,
+              rest: rp && rt && Number.isFinite(+rp) && Number.isFinite(+rt) ? { pan: r1(+rp), tilt: r1(+rt) } : null };
   if (JSON.stringify(h) !== JSON.stringify(head)) { head = h; broadcast('head', head); }
 }
 
@@ -1426,6 +1430,10 @@ const STYLE = `
                    box-shadow: 0 0 0 4px var(--accent-dim), 0 0 10px rgba(94,234,212,.6); transition: left .6s ease, top .6s ease; }
   .head-pos .spot-m { width: 7px; height: 7px; margin: -3.5px 0 0 -3.5px; border: 1.5px solid var(--muted); }
   .head-pos.off .dot { background: var(--muted); box-shadow: none; }
+  .head-pos .rest-m { width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 2px; border: 1.5px dashed var(--accent); }
+  .head-pos .rest-m[hidden] { display: none; }
+  .rest-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  .rest-row .step-seg { flex: 1 1 140px; }
   .head-pos .ax { position: absolute; font-size: 9px; color: var(--muted); letter-spacing: .04em; }
   .head-pos .ax.l { left: 4px; bottom: 2px; } .head-pos .ax.r { right: 4px; bottom: 2px; }
   .joy { display: grid; grid-template-columns: repeat(3, 40px); grid-template-rows: repeat(3, 40px); gap: 4px; }
@@ -1656,15 +1664,22 @@ function viewerPage() {
         </div>
         <div class="head-read"><b id="head-read">Pan – · Tilt –</b><small id="head-sub">Waiting for AYA to report her head</small></div>
         <div class="head-ctl">
-          <div class="head-pos" id="head-pos" role="img" aria-label="Head position: pan across, tilt down"><i class="dot" id="head-dot"></i><span class="ax l">0°</span><span class="ax r">180°</span></div>
+          <div class="head-pos" id="head-pos" role="img" aria-label="Head position: pan across, tilt down"><i class="rest-m" id="rest-dot" hidden></i><i class="dot" id="head-dot"></i><span class="ax l">0°</span><span class="ax r">180°</span></div>
           <div class="joy" id="joy" role="group" aria-label="Move the head">
             <span></span><button data-d="up" aria-label="Look up" title="Up 10°"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 15l6-6 6 6"/></svg></button><span></span>
             <button data-d="left" aria-label="Look left" title="Left 10°"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button>
-            <button data-d="centre" class="mid" aria-label="Centre the head" title="Centre (90°, 90°)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg></button>
+            <button data-d="centre" class="mid" aria-label="Go to the rest position" title="Rest position"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg></button>
             <button data-d="right" aria-label="Look right" title="Right 10°"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></button>
             <span></span><button data-d="down" aria-label="Look down" title="Down 10°"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><span></span>
           </div>
         </div>
+        <div class="rest-row">
+          <div class="seg step-seg" id="joy-step" role="group" aria-label="Joystick step">
+            <button data-s="1" aria-pressed="false">1°</button><button data-s="5" aria-pressed="false">5°</button><button data-s="10" aria-pressed="false">10°</button>
+          </div>
+          <button class="btn" id="rest-save" type="button" title="Use where the head points now as its rest position">Set as rest</button>
+        </div>
+        <div class="slim" id="rest-info">Rest position: –</div>
         <div class="sub-h">Gestures</div>
         <div class="head-gest" id="head-gest">
           <button class="btn" data-g="nod">Nod</button><button class="btn" data-g="shake">Shake</button><button class="btn" data-g="curious">Curious</button><button class="btn" data-g="excited">Excited</button>
@@ -2252,6 +2267,7 @@ function viewerPage() {
   var SENT = { ignore: 'Ignore zones saved', message: 'Message sent to the display', emotion: 'Sent to the display', view: 'Display updated',
                screen: 'Display switched', restart_all: 'Restarting camera + display…', shutdown: 'Shutting down…', zoom2: 'Camera 2 zoom set',
                head_mode: 'Head mode set', head_look: 'Looking there', head_nudge: 'Moving the head', head_goto: 'Centring the head',
+               head_rest_save: 'Rest position saved', head_rest_go: 'Going to the rest position',
                head_spot_save: 'Spot saved', head_spot_go: 'Going to the spot', head_spot_del: 'Spot deleted',
                head_gesture: 'Gesture sent', head_pano: 'Panorama started · pictures appear below'
              };
@@ -2346,6 +2362,10 @@ function viewerPage() {
     $('head-sub').textContent = !h ? 'Waiting for AYA to report her head' : !headLive ? 'Last known position · AYA is offline' : HEAD_MODE[h.mode] || '';
     box.classList.toggle('off', !h || !headLive);
     if (h) { dot.style.left = pct(h.pan); dot.style.top = pct(h.tilt); }
+    var r = h && h.rest, rd = $('rest-dot');
+    rd.hidden = !r;
+    if (r) { rd.style.left = pct(r.pan); rd.style.top = pct(r.tilt); }
+    $('rest-info').textContent = r ? 'Rest position: pan ' + Math.round(r.pan) + '° · tilt ' + Math.round(r.tilt) + '° (the middle button goes there)' : 'Rest position: –';
     var spots = h ? h.spots || [] : [], key = JSON.stringify(spots);
     if (key === spotsKey) return;                     // only redraw the spots when they change
     spotsKey = key;
@@ -2372,12 +2392,24 @@ function viewerPage() {
   });
   // Tilt direction: this assumes a SMALLER tilt angle looks UP (and the position box
   // draws tilt 0 at the top). If the head moves the wrong way, flip the sign of TILT_UP.
-  var TILT_UP = -10, PAN_RIGHT = 10;
+  var TILT_DIR = -1, PAN_DIR = 1, joyStep = 10;
+  try { joyStep = +localStorage.getItem('aya-joystep') || 10; } catch (e) {}
+  function applyStep() { $('joy-step').querySelectorAll('button').forEach(function (b) { b.setAttribute('aria-pressed', String(+b.dataset.s === joyStep)); }); }
+  applyStep();
+  $('joy-step').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    joyStep = +b.dataset.s; applyStep();
+    try { localStorage.setItem('aya-joystep', String(joyStep)); } catch (x) {}
+  });
+  $('rest-save').addEventListener('click', function () {
+    if (!head) { toast('AYA has not reported her head yet', 'err'); return; }
+    if (confirm('Make pan ' + Math.round(head.pan) + '° · tilt ' + Math.round(head.tilt) + '° the rest position?')) send('head_rest_save', []);
+  });
   $('joy').addEventListener('click', function (e) {
     var b = e.target.closest('button'); if (!b) return;
     var d = b.dataset.d;
-    if (d === 'centre') { send('head_goto', [90, 90]); return; }
-    var v = { up: [0, TILT_UP], down: [0, -TILT_UP], left: [-PAN_RIGHT, 0], right: [PAN_RIGHT, 0] }[d];
+    if (d === 'centre') { send('head_rest_go', []); return; }
+    var v = { up: [0, TILT_DIR * joyStep], down: [0, -TILT_DIR * joyStep], left: [-PAN_DIR * joyStep, 0], right: [PAN_DIR * joyStep, 0] }[d];
     if (v) send('head_nudge', v);
   });
   $('head-gest').addEventListener('click', function (e) {
