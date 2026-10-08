@@ -1813,7 +1813,7 @@ function viewerPage() {
         </div>
         <div class="head-read"><b id="head-read">Pan – · Tilt –</b><small id="head-sub">Waiting for AYA to report her head</small></div>
         <div class="head-ctl">
-          <div class="head-pos" id="head-pos" role="img" aria-label="Head position: pan across, tilt down"><i class="rest-m" id="rest-dot" hidden></i><i class="dot" id="head-dot"></i><span class="ax l">0°</span><span class="ax r">180°</span></div>
+          <div class="head-pos" id="head-pos" role="img" aria-label="Head position: pan across, tilt down"><i class="rest-m" id="rest-dot" hidden></i><i class="dot" id="head-dot"></i><span class="ax l">180°</span><span class="ax r">0°</span></div>
           <div class="joy" id="joy" role="group" aria-label="Move the head">
             <span></span><button data-d="up" aria-label="Look up" title="Up 10°"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 15l6-6 6 6"/></svg></button><span></span>
             <button data-d="left" aria-label="Look left" title="Left 10°"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button>
@@ -2515,6 +2515,7 @@ function viewerPage() {
   var HEAD_MODE = { follow: 'Follow: turns to faces and motion', patrol: 'Patrol: sweeps the room slowly', hold: 'Hold: stays where you point it' };
   var SVG_X = '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M2 2l8 8M10 2l-8 8"/></svg>';
   es.addEventListener('head', function (e) { try { head = JSON.parse(e.data); renderHead(); } catch (x) {} });
+  function pctPan(deg) { return pct(180 - deg); }   // a bigger pan angle looks LEFT: draw it on the left
   function pct(deg) { return Math.max(0, Math.min(100, deg / 180 * 100)).toFixed(1) + '%'; }
   function renderHead() {
     var h = head, box = $('head-pos'), dot = $('head-dot');
@@ -2525,10 +2526,10 @@ function viewerPage() {
     $('head-sub').textContent = !h ? 'Waiting for AYA to report her head' : !headLive ? 'Last known position · AYA is offline' : HEAD_MODE[h.mode] || '';
     box.classList.toggle('off', !h || !headLive);
     mapMarks();
-    if (h) { dot.style.left = pct(h.pan); dot.style.top = pct(h.tilt); }
+    if (h) { dot.style.left = pctPan(h.pan); dot.style.top = pct(h.tilt); }
     var r = h && h.rest, rd = $('rest-dot');
     rd.hidden = !r;
-    if (r) { rd.style.left = pct(r.pan); rd.style.top = pct(r.tilt); }
+    if (r) { rd.style.left = pctPan(r.pan); rd.style.top = pct(r.tilt); }
     $('rest-info').textContent = r ? 'Rest position: pan ' + Math.round(r.pan) + '° · tilt ' + Math.round(r.tilt) + '° (the middle button goes there)' : 'Rest position: –';
     var spots = h ? h.spots || [] : [], key = JSON.stringify(spots);
     if (key === spotsKey) return;                     // only redraw the spots when they change
@@ -2536,7 +2537,7 @@ function viewerPage() {
     box.querySelectorAll('.spot-m').forEach(function (m) { m.remove(); });
     var list = $('spots'); list.textContent = '';
     spots.forEach(function (s) {
-      var m = document.createElement('i'); m.className = 'spot-m'; m.style.left = pct(s.pan); m.style.top = pct(s.tilt); box.append(m);
+      var m = document.createElement('i'); m.className = 'spot-m'; m.style.left = pctPan(s.pan); m.style.top = pct(s.tilt); box.append(m);
       var c = document.createElement('span'); c.className = 'spot'; c.title = 'Pan ' + Math.round(s.pan) + '° · Tilt ' + Math.round(s.tilt) + '°';
       var n = document.createElement('b'); n.textContent = s.name;
       var go = document.createElement('button'); go.type = 'button'; go.className = 'go'; go.textContent = 'Go';
@@ -2556,7 +2557,7 @@ function viewerPage() {
   });
   // Tilt direction: this assumes a SMALLER tilt angle looks UP (and the position box
   // draws tilt 0 at the top). If the head moves the wrong way, flip the sign of TILT_UP.
-  var TILT_DIR = -1, PAN_DIR = 1, joyStep = 10;
+  var TILT_DIR = -1, PAN_DIR = -1, joyStep = 10;   // a bigger pan angle turns AYA LEFT (measured): right = pan down
   try { joyStep = +localStorage.getItem('aya-joystep') || 10; } catch (e) {}
   function applyStep() { $('joy-step').querySelectorAll('button').forEach(function (b) { b.setAttribute('aria-pressed', String(+b.dataset.s === joyStep)); }); }
   applyStep();
@@ -2668,7 +2669,9 @@ function viewerPage() {
   // is unknown, so the map can be flipped left-right (remembered per browser).
   var mapData = { cols: null, rows: null, cells: {} }, mapTiles = {}, mapShape = '', mapMax = 0, mapTimer = null, mapFlip = false;
   var MAP_KINDS = ['person', 'arrive', 'known', 'stranger', 'unknown', 'motion', 'changed', 'unusual', 'wave'];
-  try { mapFlip = localStorage.getItem('aya-mapflip') === '1'; } catch (e) {}
+  // a bigger pan angle turns AYA LEFT on this mount (seen on the first real
+  // scan), so the map is drawn flipped unless this browser chose otherwise
+  try { mapFlip = localStorage.getItem('aya-mapflip') !== '0'; } catch (e) { mapFlip = true; }
   function mapGeo() {
     var g = head && head.map ? head.map : mapData.cols ? mapData : null;
     var o = { cols: g ? g.cols : 0, rows: g ? g.rows : 0, p0: g && g.p0, p1: g && g.p1, t0: g && g.t0, t1: g && g.t1, known: !!g };
