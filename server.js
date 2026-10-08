@@ -568,7 +568,7 @@ function noteBoot(req) {
 // until it acks them (X-Head-Ack: the last id it applied). Ids restart with
 // the relay, so an ack above the current max id is from before a restart: 0.
 const HEAD_MODES = ['follow', 'patrol', 'hold'];
-const HEAD_STATES = ['search', 'face', 'motion', 'hold', 'gesture', 'spot', 'pano', 'centre', '-'];
+const HEAD_STATES = ['search', 'face', 'motion', 'inspect', 'hold', 'gesture', 'spot', 'pano', 'centre', '-'];
 const HEAD_GESTURES = ['nod', 'shake', 'curious', 'startle', 'droop', 'stretch', 'excited'];
 const SPOT_RE = /^[a-z0-9_-]{1,12}$/;
 const HEADQ_MAX = 8;
@@ -2348,7 +2348,7 @@ function viewerPage() {
   // ── Head: the pan-tilt servos (mode, joystick, click to look, spots, gestures, panorama) ──
   var head = null, headLive = false, spotsKey = '';
   var HEAD_STATE = { search: 'Searching', face: 'Following a face', motion: 'Checking motion', hold: 'Holding',
-                     gesture: 'Gesturing', spot: 'At a saved spot', pano: 'Taking a panorama', centre: 'Centring', '-': 'Idle' };
+                     inspect: 'Taking a close look', gesture: 'Gesturing', spot: 'At a saved spot', pano: 'Taking a panorama', centre: 'Centring', '-': 'Idle' };
   var HEAD_MODE = { follow: 'Follow: turns to faces and motion', patrol: 'Patrol: sweeps the room slowly', hold: 'Hold: stays where you point it' };
   var SVG_X = '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M2 2l8 8M10 2l-8 8"/></svg>';
   es.addEventListener('head', function (e) { try { head = JSON.parse(e.data); renderHead(); } catch (x) {} });
