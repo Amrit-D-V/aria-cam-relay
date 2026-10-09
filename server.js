@@ -379,6 +379,16 @@ setInterval(() => {                               // "left" once nobody's been s
   }
 }, 1000);
 
+// Vision on Render (nothing runs on the laptop): YOLO11n + YuNet + SFace in
+// onnxruntime-node, one frame at a time (a busy analyzer drops the frame).
+// FACE_DB_PATH / FACE_DB_JSON hold the enrolled faces — never in git.
+let localVision = null;
+try {
+  if (process.env.VISION_OFF === '1') throw new Error('VISION_OFF=1');      // kill switch (Render env var)
+  localVision = require('./vision');
+  localVision.init({}).then(() => console.log('[vision] ready'), (e) => { console.error('[vision] ' + e.message); localVision = null; });
+} catch (e) { console.error('[vision] not available: ' + e.message); }
+
 function handlePush(req, res, url) {
   if (!keyMatches(req.headers['x-cam-key'], CAM_KEY)) return send(res, 401, 'text/plain', 'bad key');
   const chunks = [];
@@ -394,6 +404,8 @@ function handlePush(req, res, url) {
     const frame = Buffer.concat(chunks);
     if (!acceptFrame(frame)) return send(res, 400, 'text/plain', 'not a JPEG');
     notePano(url, frame);                          // a panorama frame is also the live picture
+    if (localVision && Date.now() - metaHttpAt > 3000)  // (the laptop tracker, when it runs, wins)
+      localVision.analyze(frame).then((m) => { if (m) ingestMeta(m); }, () => {});
     noteMapFrame(url, frame);                      // so is a room map frame
     send(res, 200, 'text/plain', String(viewerCount()) + (deviceKick ? ',p' : ''));
   });
@@ -412,6 +424,17 @@ function handleMeta(req, res) {
     if (res.writableEnded) return;
     let meta;
     try { meta = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
+    metaHttpAt = Date.now();                      // the laptop tracker (if it runs) wins over the local vision for 3 s
+    ingestMeta(meta);
+    send(res, 204, 'text/plain', '');
+  });
+}
+
+// The vision result, from the laptop tracker (POST /meta) or from vision.js
+// running in this process on each eye2 frame
+let metaHttpAt = 0;
+function ingestMeta(meta) {
+  {
     latestMeta = JSON.stringify(meta);            // re-serialised: only valid JSON reaches viewers
     const f = Array.isArray(meta.faces) && meta.faces[0];       // the face, passed to the display on its poll
     if (f && [f.x, f.y, f.w, f.h].every(Number.isFinite)) {
@@ -424,8 +447,7 @@ function handleMeta(req, res) {
     noteSign(meta);
     trackActivity(meta);
     for (const s of metaSubscribers) s.write(`data: ${latestMeta}\n\n`);
-    send(res, 204, 'text/plain', '');
-  });
+  }
 }
 
 // The display's poll: GET /display, or POST /display with its 1 KB screen
@@ -1094,6 +1116,57 @@ const server = http.createServer((req, res) => {
     return handleDisplayPost(req, res);
   }
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'text/plain', 'method not allowed');
+
+  // ── BEGIN Next.js app ──────────────────────────────────────────────────
+  // The dashboard in web/ is a static export copied to next/ (next to this
+  // file: `cd web && npm run export`). When that directory exists, `/` serves
+  // its index.html (the app shows its own login and calls POST /login), other
+  // paths serve the matching file under next/ (immutable cache for /_next/
+  // static/), and the old single-page dashboard stays at /classic. API routes
+  // always win: a path whose first segment is one of ours never reaches the
+  // files. Without next/, everything below behaves as before.
+  {
+    const fs = require('fs'), path = require('path');
+    const NEXT_DIR = path.join(__dirname, 'next');
+    const API_SEGMENTS = new Set(['healthz', 'manifest.webmanifest', 'icon.svg', 'logout', 'stream', 'snapshot', 'events', 'display',
+      'status', 'sd', 'gallery', 'panos', 'map.json', 'map', 'health', 'pano', 'push', 'meta', 'cmd', 'login', 'ask', 'sdres', 'classic']);
+    const NEXT_TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+      '.json': 'application/json', '.txt': 'text/plain; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg',
+      '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.woff': 'font/woff', '.webmanifest': 'application/manifest+json', '.map': 'application/json' };
+    const nextFile = (rel) => {                       // the file under next/ for a request path, or null
+      if (!/^\/[A-Za-z0-9._~\-\/%]*$/.test(rel) || rel.includes('..') || rel.includes('//')) return null;
+      let dec;
+      try { dec = decodeURIComponent(rel); } catch { return null; }
+      if (dec.includes('..') || dec.includes('\0') || dec.includes('\\')) return null;
+      const abs = path.resolve(NEXT_DIR, '.' + dec);
+      if (abs !== NEXT_DIR && !abs.startsWith(NEXT_DIR + path.sep)) return null;
+      return abs;
+    };
+    const nextServe = (abs, type, cache) => {
+      fs.readFile(abs, (err, data) => {
+        if (err) return send(res, 404, 'text/plain', 'not found');
+        send(res, 200, type, data, cache);
+      });
+    };
+    const nextIndex = nextFile('/index.html');
+    const hasNext = nextIndex && fs.existsSync(nextIndex);
+    if (hasNext && url.pathname === '/classic')       // the old page, as / used to be
+      return send(res, authed ? 200 : 401, 'text/html; charset=utf-8', authed ? viewerPage() : loginPage(''), { 'Referrer-Policy': 'no-referrer' });
+    if (hasNext && url.pathname === '/')
+      return nextServe(nextIndex, 'text/html; charset=utf-8', { 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+    if (hasNext && !API_SEGMENTS.has(url.pathname.split('/')[1] || '')) {
+      const abs = nextFile(url.pathname);
+      let st = null;
+      try { st = abs && fs.statSync(abs); } catch { st = null; }
+      if (st && st.isFile()) {
+        const ext = path.extname(abs).toLowerCase();
+        const immutable = url.pathname.startsWith('/_next/static/');
+        return nextServe(abs, NEXT_TYPES[ext] || 'application/octet-stream',
+          { 'Cache-Control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache', 'Referrer-Policy': 'no-referrer' });
+      }
+    }
+  }
+  // ── END Next.js app ────────────────────────────────────────────────────
 
   switch (url.pathname) {
     case '/healthz':
