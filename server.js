@@ -411,41 +411,6 @@ function handlePush(req, res, url) {
   });
 }
 
-// POST /pushbatch: several pictures in one request, because each request costs a ~300 ms round trip
-// through Cloudflare whatever its size (3 KB and 12 KB take the same), and that limited AYA to ~1.7
-// pictures a second. Body: for each picture a 4-byte little-endian length, then the JPEG (oldest
-// first). Shown paced out 110 ms apart (the camera's own pace) rather than all at once.
-const BATCH_MAX_BYTES = 40 * 1024, BATCH_MAX_FRAMES = 6, BATCH_SPACING_MS = 110;
-function handlePushBatch(req, res, url) {
-  if (!keyMatches(req.headers['x-cam-key'], CAM_KEY)) return send(res, 401, 'text/plain', 'bad key');
-  const chunks = [];
-  let size = 0;
-  req.on('data', (c) => {
-    size += c.length;
-    if (size > BATCH_MAX_BYTES) { send(res, 413, 'text/plain', 'batch too large'); req.destroy(); return; }
-    chunks.push(c);
-  });
-  req.on('end', () => {
-    if (res.writableEnded) return;
-    const body = Buffer.concat(chunks), frames = [];
-    for (let at = 0; at + 4 <= body.length && frames.length < BATCH_MAX_FRAMES;) {
-      const n = body.readUInt32LE(at);
-      if (n < 4 || at + 4 + n > body.length) break;
-      frames.push(body.subarray(at + 4, at + 4 + n));
-      at += 4 + n;
-    }
-    if (!frames.length || !frames.every((f) => f[0] === 0xff && f[1] === 0xd8)) return send(res, 400, 'text/plain', 'not JPEGs');
-    seen.eye2 = Date.now();
-    send(res, 200, 'text/plain', String(viewerCount()) + (deviceKick ? ',p' : ''));   // answer first: AYA waits for this
-    frames.forEach((f, i) => setTimeout(() => {
-      seen.eye2 = Date.now();
-      acceptFrame(f);
-      if (i === frames.length - 1 && localVision && Date.now() - metaHttpAt > 3000)   // the newest one is analysed
-        localVision.analyze(f).then((m) => { if (m) ingestMeta(m); }, () => {});
-    }, i * BATCH_SPACING_MS));
-  });
-}
-
 function handleMeta(req, res) {
   if (!keyMatches(req.headers['x-cam-key'], CAM_KEY)) return send(res, 401, 'text/plain', 'bad key');
   const chunks = [];
@@ -1138,7 +1103,6 @@ const server = http.createServer((req, res) => {
   const authed = sessionOk(req);                  // a logged-in browser
 
   if (req.method === 'POST' && url.pathname === '/push') return handlePush(req, res, url);
-  if (req.method === 'POST' && url.pathname === '/pushbatch') return handlePushBatch(req, res, url);
   if (req.method === 'POST' && url.pathname === '/meta') return handleMeta(req, res);
   if (req.method === 'POST' && url.pathname === '/cmd') return handleCmd(req, res);
   if (req.method === 'POST' && url.pathname === '/login') return handleLogin(req, res);
