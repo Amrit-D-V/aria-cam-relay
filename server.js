@@ -404,10 +404,10 @@ function handlePush(req, res, url) {
     const frame = Buffer.concat(chunks);
     if (!acceptFrame(frame)) return send(res, 400, 'text/plain', 'not a JPEG');
     notePano(url, frame);                          // a panorama frame is also the live picture
-    if (localVision && Date.now() - metaHttpAt > 3000)  // (the laptop tracker, when it runs, wins)
-      localVision.analyze(frame).then((m) => { if (m) ingestMeta(m); }, () => {});
     noteMapFrame(url, frame);                      // so is a room map frame
-    send(res, 200, 'text/plain', String(viewerCount()) + (deviceKick ? ',p' : ''));
+    send(res, 200, 'text/plain', String(viewerCount()) + (deviceKick ? ',p' : ''));   // answer first: AYA waits for this
+    if (localVision && Date.now() - metaHttpAt > 3000)  // (the laptop tracker, when it runs, wins)
+      setImmediate(() => localVision.analyze(frame).then((m) => { if (m) ingestMeta(m); }, () => {}));   // then analyse
   });
 }
 
