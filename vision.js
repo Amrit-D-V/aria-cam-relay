@@ -26,7 +26,13 @@ const YUNET_CONF = 0.65, YUNET_NMS = 0.3;             // cv2.FaceDetectorYN.crea
 const MIN_FACE_FRAC = 0.07, FACE_AR_MIN = 0.55, FACE_AR_MAX = 1.5;   // is_face_shaped()
 const RECOG_THRESHOLD = 0.363;                        // SFace cosine, sface_recognition.MATCH_THRESHOLD
 const RECOG_INTERVAL_MS = 950;                        // the recogniser worker ran ~once a second
-const YOLO_SIZE = 320, YOLO_CONF = 0.35, YOLO_IOU = 0.45, YOLO_MAX_DET = 300;   // detect_objects(frame, conf=0.35)
+// YOLO11s at 320 by default. On 400 of AYA's own frames (labels checked by eye), with the two-in-a-row
+// rule below: 24/32 person frames found and 3 false-alarm frames of 368, against 27/32 and 25 for the
+// old yolo11n at 320 (the rule costs the first frame of each appearance, ~1 s). ~2.8x the n model's
+// CPU. VISION_YOLO_MODEL / VISION_YOLO_SIZE / VISION_YOLO_EVERY to change; yolo11n at 320 is the
+// fallback if the file is missing.
+let YOLO_SIZE = 320;
+const YOLO_CONF = 0.35, YOLO_IOU = 0.45, YOLO_MAX_DET = 300;   // detect_objects(frame, conf=0.35)
 const OBJECT_KINDS = new Set(['cat', 'dog', 'bird', 'backpack', 'handbag', 'suitcase', 'umbrella',
   'cell phone', 'bottle', 'cup', 'knife', 'scissors', 'teddy bear', 'sports ball']);
 const OBJECT_MIN_SCORE = 0.55, OBJECT_MAX_AREA = 0.35, OBJECT_HISTORY = 5, OBJECT_NEED = 3;
@@ -52,7 +58,7 @@ let admins = new Set(['amrit']);
 let yoloEvery = 1;
 let busy = false;
 let ready = false;
-const stats = { frames: 0, dropped: 0, errors: 0, backend: 'none', ms: {}, rss: 0 };
+const stats = { frames: 0, dropped: 0, errors: 0, backend: 'none', ms: {}, rss: 0, still: 0, yolo: '' };
 const timings = { decode: [], enhance: [], yunet: [], sface: [], yolo: [], total: [] };
 function tick(stage, t0) {
   const dt = Number(process.hrtime.bigint() - t0) / 1e6;
@@ -215,7 +221,14 @@ async function init(opt = {}) {
   loadFaceDb(opt);
   if (!disabled.yunet) sessions.yunet = await loadSession('yunet', path.join(modelsDir, 'face_detection_yunet.onnx'));
   if (!disabled.sface) sessions.sface = await loadSession('sface', path.join(modelsDir, 'face_recognition_sface_2021dec.onnx'));
-  if (!disabled.yolo) sessions.yolo = await loadSession('yolo', path.join(modelsDir, 'yolo11n.onnx'));
+  if (!disabled.yolo) {
+    const want = process.env.VISION_YOLO_MODEL || 'yolo11s_320.onnx';
+    YOLO_SIZE = Number(process.env.VISION_YOLO_SIZE || 320) | 0;
+    let used = want;
+    if (fs.existsSync(path.join(modelsDir, want))) sessions.yolo = await loadSession('yolo', path.join(modelsDir, want));
+    if (!sessions.yolo) { used = 'yolo11n.onnx'; YOLO_SIZE = 320; sessions.yolo = await loadSession('yolo', path.join(modelsDir, used)); }   // the fallback
+    stats.yolo = sessions.yolo ? `${used} @${YOLO_SIZE}, every ${yoloEvery} frames` : 'off';
+  }
   stats.backend = ort ? 'onnxruntime-node cpu' : 'none';
   ready = true;
   console.log(`[vision] ready: yunet=${!!sessions.yunet} sface=${!!sessions.sface} yolo=${!!sessions.yolo} enrolled=${faceDb.names.length} admins=${[...admins].join(',')}`);
@@ -332,6 +345,63 @@ function matchFace(emb) {                 // {name|null, score}: best cosine ove
 
 // ── YOLO11n objects (ultralytics letterbox + decode + per-class NMS) ─────
 // Returns [{label, score, box:[x, y, w, h] px}] best first.
+// Still "people": hanging clothes and curtain folds pass for a person on this tiny grey picture, and they
+// never move. A person box whose picture stays the same (8x8 cell means, brightness-normalised, within
+// STILL_DIFF grey levels) for STILL_MS with no face in it is dropped. Real people always move a little;
+// a head turn (servo) gives a new picture and restarts the clock.
+const STILL_MS = 30000, STILL_DIFF = 5;
+let stillTracks = [];
+function boxSig(img, b) {                                  // b = [x, y, w, h] in px
+  const { w, h, bgr } = img, sig = new Float32Array(64);
+  let mean = 0;
+  for (let gy = 0; gy < 8; gy++) for (let gx = 0; gx < 8; gx++) {
+    const x0 = Math.max(0, Math.floor(b[0] + b[2] * gx / 8)), x1 = Math.min(w, Math.max(x0 + 1, Math.floor(b[0] + b[2] * (gx + 1) / 8)));
+    const y0 = Math.max(0, Math.floor(b[1] + b[3] * gy / 8)), y1 = Math.min(h, Math.max(y0 + 1, Math.floor(b[1] + b[3] * (gy + 1) / 8)));
+    let t = 0, n = 0;
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { t += bgr[(y * w + x) * 3 + 1]; n++; }
+    sig[gy * 8 + gx] = n ? t / n : 0; mean += sig[gy * 8 + gx];
+  }
+  mean /= 64;
+  for (let i = 0; i < 64; i++) sig[i] -= mean;            // a camera exposure change doesn't count as movement
+  return sig;
+}
+function iouXYWH(a, b) {
+  const iw = Math.max(0, Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0])), ih = Math.max(0, Math.min(a[1] + a[3], b[1] + b[3]) - Math.max(a[1], b[1]));
+  const i = iw * ih, u = a[2] * a[3] + b[2] * b[3] - i;
+  return u > 0 ? i / u : 0;
+}
+function dropStill(people, img, now, face) {
+  const out = [], used = [];
+  for (const p of people) {
+    const b = p.box, sig = boxSig(img, b);
+    let tr = null, best = 0;
+    for (const t of stillTracks) { const u = iouXYWH(t.box, b); if (u > best) { best = u; tr = t; } }
+    if (!tr || best < 0.6) tr = { box: b, ref: sig, since: now };
+    else {
+      let d = 0; for (let i = 0; i < 64; i++) d += Math.abs(sig[i] - tr.ref[i]);
+      if (d / 64 > STILL_DIFF) { tr.ref = sig; tr.since = now; }
+      tr.box = b;
+    }
+    tr.seen = now; used.push(tr);
+    const faceIn = face && face.x + face.w / 2 >= b[0] && face.x + face.w / 2 <= b[0] + b[2] && face.y + face.h / 2 >= b[1] && face.y + face.h / 2 <= b[1] + b[3];
+    if (!faceIn && now - tr.since > STILL_MS) { stats.still++; continue; }
+    out.push(p);
+  }
+  stillTracks = used.concat(stillTracks.filter((t) => !used.includes(t) && now - t.seen < 10000)).slice(0, 12);
+  return out;
+}
+
+// A person must be seen on two YOLO passes in a row, in about the same place (within 3 s): curtain folds
+// and shadows that pass for a person flicker in and out; people stay. (On 400 of AYA's frames this cut
+// false-alarm frames from 17 to 3 of 368, for the first frame of each appearance.)
+let lastPeople = [], lastPeopleT = 0;
+function confirmed(people, now) {
+  const prev = now - lastPeopleT < 3000 ? lastPeople : [];
+  const out = people.filter((p) => prev.some((q) => iouXYWH(p.box, q.box) > 0.3));
+  lastPeople = people; lastPeopleT = now;
+  return out;
+}
+
 async function detectObjects(img) {
   const s = sessions.yolo; if (!s) return [];
   const { w, h, bgr } = img, S = YOLO_SIZE;
@@ -463,7 +533,7 @@ async function analyze(jpegBuf, opt = {}) {
       let bodies = [], objects = [];
       try {
         const found = await detectObjects(img);
-        bodies = found.filter((o) => o.label === 'person').map((p) => [r3(p.box[0] / w), r3(p.box[1] / h), r3(p.box[2] / w), r3(p.box[3] / h)]);
+        bodies = confirmed(dropStill(found.filter((o) => o.label === 'person'), img, now, face), now).map((p) => [r3(p.box[0] / w), r3(p.box[1] / h), r3(p.box[2] / w), r3(p.box[3] / h)]);
         const raw = found.filter((o) => OBJECT_KINDS.has(o.label) && o.score >= OBJECT_MIN_SCORE)
           .map((o) => ({ label: o.label, score: o.score, x: r3(o.box[0] / w), y: r3(o.box[1] / h), w: r3(o.box[2] / w), h: r3(o.box[3] / h) }))
           .filter((o) => o.w * o.h <= OBJECT_MAX_AREA);
@@ -516,7 +586,7 @@ async function analyze(jpegBuf, opt = {}) {
 function getStats() {
   const ms = {};
   for (const k of Object.keys(timings)) { const s = summary(timings[k]); if (s) ms[k] = s; }
-  return { frames: stats.frames, dropped: stats.dropped, errors: stats.errors, backend: stats.backend, ms,
+  return { frames: stats.frames, dropped: stats.dropped, errors: stats.errors, backend: stats.backend, yolo: stats.yolo, still_dropped: stats.still, ms,
     stages: { yunet: !!sessions.yunet, sface: !!sessions.sface, yolo: !!sessions.yolo }, enrolled: faceDb.names.length,
     rssMB: Math.round(process.memoryUsage().rss / 1048576), busy };
 }
