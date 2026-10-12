@@ -111,7 +111,9 @@ const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'sh
 const MSG_MAX = 120;
 const VIEWS = ['auto', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
 // view/zoom2 start as null: after a relay restart the display keeps what it shows until someone picks
-const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, shutdown: 0, view: null, zoom2: null, ignore: null };
+const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, shutdown: 0, view: null, zoom2: null, ignore: null,
+                       set: null, anim: null };   // set: {t, speed, accel, doze} motion/standby settings; anim: {t, name} boot|dead preview
+const ANIMS = ['boot', 'dead'];
 
 // SSE subscribers: a page that stops reading (sleeping phone, dead link) would
 // otherwise buffer every event here. Over 1 MB queued, it's skipped; still
@@ -142,7 +144,7 @@ function publicDisplay() {
   const m = displayState.msg;
   return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
            emotion: displayState.emotion, restart: displayState.restart, shutdown: displayState.shutdown,
-           view: displayState.view, zoom2: displayState.zoom2,
+           view: displayState.view, zoom2: displayState.zoom2, set: displayState.set, anim: displayState.anim,
            ignore: displayState.ignore, face: boardFace && Date.now() - boardFace.t < 3000 ? boardFace : null };
 }
 
@@ -274,6 +276,22 @@ function handleCmd(req, res) {
       if (!(z === 0 || (z >= 10 && z <= 30))) return send(res, 400, 'text/plain', 'zoom2 0 (auto) or 10..30');
       displayState.zoom2 = z;
       broadcast('display', publicDisplay());
+      return send(res, 202, 'text/plain', 'queued');
+    }
+    if (cmd === 'tune') {              // motion and standby settings: {speed °/s, accel °/s², doze min}, any subset
+      const num = (v, lo, hi) => (v === undefined || v === null || v === '' ? undefined
+        : Number.isFinite(+v) && +v >= lo && +v <= hi ? Math.round(+v) : null);
+      const speed = num(body.speed, 20, 150), accel = num(body.accel, 50, 1000), doze = num(body.doze, 0, 1440);
+      if (speed === null || accel === null || doze === null) return send(res, 400, 'text/plain', 'tune speed 20..150, accel 50..1000, doze 0..1440');
+      if (speed === undefined && accel === undefined && doze === undefined) return send(res, 400, 'text/plain', 'tune: nothing to set');
+      const prev = displayState.set || {};
+      displayState.set = { t: Date.now(), speed: speed ?? prev.speed, accel: accel ?? prev.accel, doze: doze ?? prev.doze };
+      broadcast('display', publicDisplay());
+      return send(res, 202, 'text/plain', 'queued');
+    }
+    if (cmd === 'anim') {              // replay the boot screen, or preview the dying animation (she restarts after it)
+      if (!ANIMS.includes(args[0])) return send(res, 400, 'text/plain', 'anim ' + ANIMS.join('|'));
+      displayState.anim = { t: Date.now(), name: args[0] };
       return send(res, 202, 'text/plain', 'queued');
     }
     if (cmd === 'emotion') {
@@ -537,6 +555,25 @@ function noteDeviceEvent(req) {
 }
 
 // Sent with the display's first poll after it starts: why it (re)started
+// X-Power: "V,mA,mW,mAhUsed,pct,state,hours" (mA < 0 = charging; hours = to full while charging, else left)
+// X-Sys: "uptime s,heap KB,block KB,rssi,offline 0|1,cpu MHz,servo speed,servo accel,standby min"
+let power = null, board = null;
+function noteSys(req) {
+  const pv = req.headers['x-power'];
+  if (pv !== undefined) {
+    const a = String(pv).split(',');
+    const n = (i) => (a[i] !== undefined && a[i] !== '' && Number.isFinite(+a[i]) ? +a[i] : null);
+    const st = /^[a-z]{1,12}$/.test(a[5] || '') ? a[5] : null;
+    if (n(0) !== null) power = { v: n(0), ma: n(1), mw: n(2), mah_used: n(3), pct: n(4), state: st, hours: n(6), t: Date.now() };
+  }
+  const sv = req.headers['x-sys'];
+  if (sv !== undefined) {
+    const a = String(sv).split(',').map((x) => (x !== '' && Number.isFinite(+x) ? +x : null));
+    if (a.length >= 9) board = { uptime: a[0], heap_kb: a[1], block_kb: a[2], rssi: a[3], offline: a[4], cpu_mhz: a[5],
+                                 servo_speed: a[6], servo_accel: a[7], doze_min: a[8], t: Date.now() };
+  }
+}
+
 function noteBoot(req) {
   const why = String(req.headers['x-boot'] || '').replace(/[^\x20-\x7e]/g, '').slice(0, 60);
   if (why) logEvent('restart', `AYA started · ${why}`);
@@ -938,6 +975,7 @@ function handleDisplayPost(req, res) {
     noteSd(req);
     noteDeviceEvent(req);
     noteIdle(req);
+    noteSys(req);
     noteHeadAck(req);
     if (buf.length === 1024) {
       const out = Buffer.alloc(1024);
@@ -1011,7 +1049,8 @@ function status() {
   const age = latestAt ? Date.now() - latestAt : null;
   return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
            fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
-           idle: isIdle(), head, map: mapGeom(), ...ages(), detector: localVision ? localVision.stats() : null };   // Render-side detection: frames, dropped, ms per stage
+           idle: isIdle(), head, map: mapGeom(), ...ages(),
+           power: power && { ...power, age: Date.now() - power.t }, board: board && { ...board, age: Date.now() - board.t }, detector: localVision ? localVision.stats() : null };   // Render-side detection: frames, dropped, ms per stage
 }
 
 const server = http.createServer((req, res) => {
