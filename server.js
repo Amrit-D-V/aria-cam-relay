@@ -95,12 +95,14 @@ const presence = { here: false, lastFace: 0, who: null, sleeping: null };
 // memory only — a relay restart starts it over.
 const HEALTH_EVERY_MS = 30000;
 const HEALTH_KEEP = 24 * 3600 * 1000 / HEALTH_EVERY_MS;
-const healthSamples = [];         // {t, on, fps}
+const healthSamples = [];         // {t, on, fps, pct?, v?, ma?} (the battery's, while AYA reports it)
 let lastGesture = 0;
 
 setInterval(() => {
   const on = status().online;
-  healthSamples.push({ t: Date.now(), on, fps: on ? Math.round(fps() * 10) / 10 : null });
+  const smp = { t: Date.now(), on, fps: on ? Math.round(fps() * 10) / 10 : null };
+  if (power && Date.now() - power.t < 60000) Object.assign(smp, { pct: power.pct, v: power.v, ma: power.ma });
+  healthSamples.push(smp);
   if (healthSamples.length > HEALTH_KEEP) healthSamples.shift();
 }, HEALTH_EVERY_MS);
 
@@ -425,7 +427,12 @@ function handlePush(req, res, url) {
     if (!acceptFrame(frame)) return send(res, 400, 'text/plain', 'not a JPEG');
     notePano(url, frame);                          // a panorama frame is also the live picture
     noteMapFrame(url, frame);                      // so is a room map frame
-    send(res, 200, 'text/plain', String(viewerCount()) + (deviceKick ? ',p' : ''));   // answer first: AYA waits for this
+    // Head commands ride on this reply too ("N[,p]\n{headq}"): an upload goes out every ~0.1-0.5 s, so a
+    // joystick press reaches the servos a round trip sooner than via the poll. X-Head-Ack drops what she applied.
+    noteHeadAck(req);
+    const ack = headAck(req), hq = req.headers['x-head-ack'] !== undefined ? headq.filter((e) => e.id > ack) : [];
+    const tail = hq.length ? '\n' + JSON.stringify({ headq: hq.map((e) => ({ id: e.id, op: e.op, a: e.a, b: e.b, name: e.name })) }) : '';
+    send(res, 200, 'text/plain', String(viewerCount()) + (deviceKick ? ',p' : '') + tail);   // answer first: AYA waits for this
     if (localVision && Date.now() - metaHttpAt > 3000)  // (the laptop tracker, when it runs, wins)
       setImmediate(() => localVision.analyze(frame).then((m) => { if (m) ingestMeta(m); }, () => {}));   // then analyse
   });
