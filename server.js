@@ -281,11 +281,13 @@ function handleCmd(req, res) {
     if (cmd === 'tune') {              // motion and standby settings: {speed °/s, accel °/s², doze min}, any subset
       const num = (v, lo, hi) => (v === undefined || v === null || v === '' ? undefined
         : Number.isFinite(+v) && +v >= lo && +v <= hi ? Math.round(+v) : null);
-      const speed = num(body.speed, 20, 150), accel = num(body.accel, 50, 1000), doze = num(body.doze, 0, 1440);
-      if (speed === null || accel === null || doze === null) return send(res, 400, 'text/plain', 'tune speed 20..150, accel 50..1000, doze 0..1440');
-      if (speed === undefined && accel === undefined && doze === undefined) return send(res, 400, 'text/plain', 'tune: nothing to set');
+      const speed = num(body.speed, 20, 150), accel = num(body.accel, 50, 1000), doze = num(body.doze, 0, 1440), pmode = num(body.pmode, 0, 2);
+      if (speed === null || accel === null || doze === null || pmode === null)
+        return send(res, 400, 'text/plain', 'tune speed 20..150, accel 50..1000, doze 0..1440, pmode 0..2');
+      if ([speed, accel, doze, pmode].every((v) => v === undefined)) return send(res, 400, 'text/plain', 'tune: nothing to set');
       const prev = displayState.set || {};
-      displayState.set = { t: Date.now(), speed: speed ?? prev.speed, accel: accel ?? prev.accel, doze: doze ?? prev.doze };
+      displayState.set = { t: Date.now(), speed: speed ?? prev.speed, accel: accel ?? prev.accel, doze: doze ?? prev.doze, pmode: pmode ?? prev.pmode };
+      if (pmode !== undefined) logEvent('power', `Power mode: ${['performance', 'balanced', 'saver'][pmode]}`);
       broadcast('display', publicDisplay());
       return send(res, 202, 'text/plain', 'queued');
     }
@@ -556,7 +558,7 @@ function noteDeviceEvent(req) {
 
 // Sent with the display's first poll after it starts: why it (re)started
 // X-Power: "V,mA,mW,mAhUsed,pct,state,hours" (mA < 0 = charging; hours = to full while charging, else left)
-// X-Sys: "uptime s,heap KB,block KB,rssi,offline 0|1,cpu MHz,servo speed,servo accel,standby min"
+// X-Sys: "uptime s,heap KB,block KB,rssi,offline 0|1,cpu MHz,servo speed,servo accel,standby min,power mode 0..2"
 let power = null, board = null;
 function noteSys(req) {
   const pv = req.headers['x-power'];
@@ -570,7 +572,7 @@ function noteSys(req) {
   if (sv !== undefined) {
     const a = String(sv).split(',').map((x) => (x !== '' && Number.isFinite(+x) ? +x : null));
     if (a.length >= 9) board = { uptime: a[0], heap_kb: a[1], block_kb: a[2], rssi: a[3], offline: a[4], cpu_mhz: a[5],
-                                 servo_speed: a[6], servo_accel: a[7], doze_min: a[8], t: Date.now() };
+                                 servo_speed: a[6], servo_accel: a[7], doze_min: a[8], pmode: a.length > 9 ? a[9] : 0, t: Date.now() };
   }
 }
 
