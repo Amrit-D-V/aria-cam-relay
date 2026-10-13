@@ -115,7 +115,7 @@ const VIEWS = ['auto', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
 // view/zoom2 start as null: after a relay restart the display keeps what it shows until someone picks
 const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, shutdown: 0, view: null, zoom2: null, ignore: null,
                        set: null, anim: null };   // set: {t, speed, accel, doze} motion/standby settings; anim: {t, name} boot|dead preview
-const ANIMS = ['boot', 'dead'];
+const ANIMS = ['boot', 'dead', 'show'];   // show: the ~35 s showcase for filming
 
 // SSE subscribers: a page that stops reading (sleeping phone, dead link) would
 // otherwise buffer every event here. Over 1 MB queued, it's skipped; still
@@ -293,7 +293,7 @@ function handleCmd(req, res) {
       broadcast('display', publicDisplay());
       return send(res, 202, 'text/plain', 'queued');
     }
-    if (cmd === 'anim') {              // replay the boot screen, or preview the dying animation (she restarts after it)
+    if (cmd === 'anim') {              // replay the boot screen, the showcase, or preview the dying animation (she restarts after it)
       if (!ANIMS.includes(args[0])) return send(res, 400, 'text/plain', 'anim ' + ANIMS.join('|'));
       displayState.anim = { t: Date.now(), name: args[0] };
       return send(res, 202, 'text/plain', 'queued');
