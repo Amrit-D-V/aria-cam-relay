@@ -200,6 +200,7 @@ function readBody(req, max, cb) {
     chunks.push(c);
   });
   req.on('end', () => { if (!over) cb(Buffer.concat(chunks)); });
+  req.on('error', () => { over = true; });
 }
 const SMALL_BODY_MAX = 8 * 1024;
 function handleLogin(req, res) {
@@ -420,6 +421,7 @@ function handlePush(req, res, url) {
     if (size > MAX_FRAME_BYTES) { send(res, 413, 'text/plain', 'frame too large'); req.destroy(); return; }
     chunks.push(c);
   });
+  req.on('error', () => {});
   req.on('end', () => {
     if (res.writableEnded) return;
     seen.eye2 = Date.now();
@@ -447,6 +449,7 @@ function handleMeta(req, res) {
     if (size > MAX_META_BYTES) { send(res, 413, 'text/plain', 'too large'); req.destroy(); return; }
     chunks.push(c);
   });
+  req.on('error', () => {});
   req.on('end', () => {
     if (res.writableEnded) return;
     let meta;
