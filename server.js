@@ -115,7 +115,7 @@ const MSG_MAX = 120;
 const VIEWS = ['auto', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
 // view/zoom2 start as null: after a relay restart the display keeps what it shows until someone picks
 const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, shutdown: 0, view: null, zoom2: null, ignore: null,
-                       set: null, anim: null };   // set: {t, speed, accel, doze} motion/standby settings; anim: {t, name} boot|dead preview
+                       set: null, anim: null, motion: null };   // motion: {t, f: [[dpan, dtilt, hold ms, speed], …]} a composed head motion   // set: {t, speed, accel, doze} motion/standby settings; anim: {t, name} boot|dead preview
 const ANIMS = ['boot', 'dead', 'show'];   // show: the ~35 s showcase for filming
 
 // SSE subscribers: a page that stops reading (sleeping phone, dead link) would
@@ -147,7 +147,7 @@ function publicDisplay() {
   const m = displayState.msg;
   return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
            emotion: displayState.emotion, restart: displayState.restart, shutdown: displayState.shutdown,
-           view: displayState.view, zoom2: displayState.zoom2, set: displayState.set, anim: displayState.anim,
+           view: displayState.view, zoom2: displayState.zoom2, set: displayState.set, anim: displayState.anim, motion: displayState.motion,
            ignore: displayState.ignore, face: boardFace && Date.now() - boardFace.t < 3000 ? boardFace : null };
 }
 
@@ -297,6 +297,14 @@ function applyCmd(cmd, args, body = {}) {
   if (cmd === 'anim') {              // replay the boot screen, the showcase, or preview the dying animation (she restarts after it)
     if (!ANIMS.includes(args[0])) return reply(400, 'anim ' + ANIMS.join('|'));
     displayState.anim = { t: Date.now(), name: args[0] };
+    return reply(202, 'queued');
+  }
+  if (cmd === 'head_seq') {           // a head motion composed by the brain: up to 16 steps relative to where the head is
+    const f = Array.isArray(body.frames) ? body.frames.slice(0, 16) : [];
+    const ok = (v, lo, hi) => Number.isFinite(+v) && +v >= lo && +v <= hi;
+    if (!f.length || !f.every((x) => Array.isArray(x) && ok(x[0], -60, 60) && ok(x[1], -40, 40) && ok(x[2], 0, 3000) && ok(x[3], 10, 150)))
+      return reply(400, 'head_seq frames: [[dpan -60..60, dtilt -40..40, hold 0..3000 ms, speed 10..150], …] (1-16)');
+    displayState.motion = { t: Date.now(), f: f.map((x) => x.map((v) => Math.round(+v))) };
     return reply(202, 'queued');
   }
   if (cmd === 'emotion') {
@@ -968,6 +976,10 @@ function deviceReply(req) {
     out.shots = gallery.filter((e) => e.t > shotSince).reverse().slice(0, 5).map((e) => ({ t: e.t, kind: e.kind, text: e.text }));
   const ack = headAck(req), hq = headq.filter((e) => e.id > ack);   // head commands not yet applied
   if (hq.length) out.headq = hq.map((e) => ({ id: e.id, op: e.op, a: e.a, b: e.b, name: e.name }));
+  if (brain && roomMap.cols === 9 && roomMap.rows === 4) {   // which patrol views are worth a look (brain.js map labels)
+    const w = brain.patrolWeights(9, 4);
+    if (w) out.pweights = w;
+  }
   const sign = pendingSign();                     // a new hand sign from the tracker (each once)
   if (sign) out.sign = sign;
   return out;
@@ -1087,6 +1099,7 @@ brain = require('./brain')({
   sdPut: (path, text) => sdRequest('put', path, text),
   online: () => !!seen.display && Date.now() - seen.display < 10000,
   broadcast,
+  mapCells: () => [...roomMap.cells.entries()].map(([k, v]) => ({ key: k, pan: v.pan, tilt: v.tilt, t: v.t, jpeg: v.jpeg })),
 });
 
 function handleBrain(req, res, url) {

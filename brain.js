@@ -26,7 +26,8 @@ const RPD = +process.env.GROQ_RPD || 900;
 const TZ = process.env.AYA_TZ || 'Asia/Kolkata';
 
 const MEM_MAX = 5000;
-const RULES_FILE = '/aya/brain/rules.json', NOTES_FILE = '/aya/brain/notes.json';
+const RULES_FILE = '/aya/brain/rules.json', NOTES_FILE = '/aya/brain/notes.json', MAP_FILE = '/aya/brain/map.json';
+const MOODS = { nod: ['nod', null], shake: ['shake', null], think: ['curious', 'think'], happy: ['nod', 'giggle'], sad: [null, 'shy'] };
 
 module.exports = function createBrain(ctx) {
   // ctx: { applyCmd(cmd,args,body)→[code,text], status()→obj, frame()→{buf,at}|null, logEvent(kind,text),
@@ -35,6 +36,7 @@ module.exports = function createBrain(ctx) {
   const memory = [];                 // oldest first: {t, kind, text}
   let rules = [];                    // {id, text, kinds[], from, to, battery_below, cooldown_min, actions[], last}
   let notes = [];                    // {id, text, t}
+  const labels = new Map();          // room-map view "c,r" → {label, desc, interest 0-3, t}: what's in each view
   let loaded = false, loading = false;
   const usage = { calls: [], day: '', today: 0, errors: 0, lastError: '' };
   let modelOk = null;                // did the vision/tool model answer last time
@@ -114,6 +116,8 @@ module.exports = function createBrain(ctx) {
       if (rr.ok) try { rules = JSON.parse(rr.body.toString('utf8')).filter((x) => x && x.id); } catch { /* keep */ }
       const nn = await ctx.sdGet(NOTES_FILE);
       if (nn.ok) try { notes = JSON.parse(nn.body.toString('utf8')).filter((x) => x && x.id); } catch { /* keep */ }
+      const mm = await ctx.sdGet(MAP_FILE);           // {"c,r": [label, interest, desc, t]}
+      if (mm.ok) try { for (const [k, v] of Object.entries(JSON.parse(mm.body.toString('utf8')))) labels.set(k, { label: v[0], interest: v[1], desc: v[2], t: v[3] || 0 }); } catch { /* keep */ }
       loaded = true;
       console.log(`[brain] loaded ${memory.length} events, ${rules.length} rules, ${notes.length} notes from AYA's card`);
     } catch (e) { console.error('[brain] load: ' + e.message); }
@@ -123,6 +127,13 @@ module.exports = function createBrain(ctx) {
   setTimeout(loadFromCard, 8000);
 
   async function save(file, list) {                    // compact JSON, under the board's 2 KB limit
+    if (file === MAP_FILE) {                          // (an object: drop descriptions, then views, until it fits)
+      const obj = list[0] || {};
+      let s = JSON.stringify(obj);
+      if (s.length > 2000) { for (const k in obj) obj[k][2] = ''; s = JSON.stringify(obj); }
+      while (s.length > 2000) { delete obj[Object.keys(obj)[0]]; s = JSON.stringify(obj); }
+      return (await ctx.sdPut(file, s)).ok;
+    }
     let s = JSON.stringify(list);
     while (s.length > 2000 && list.length) { list.shift(); s = JSON.stringify(list); }
     const r = await ctx.sdPut(file, s);
@@ -145,13 +156,16 @@ module.exports = function createBrain(ctx) {
     }
     const f = ctx.frame();
     if (!f || Date.now() - f.at > 15000) throw new Error('the camera has no fresh picture (AYA offline or the camera is restarting)');
+    return seeImage(f.buf, question, auto);
+  }
+  async function seeImage(buf, question, auto, maxTokens = 220) {
     const msg = await llm([
       { role: 'system', content: 'You are the eyes of AYA, a small desk robot. The image is her camera: 160x120 pixels, grayscale, low quality, often dim. Describe only what is actually visible, briefly and concretely. If unsure, say so. No speculation about identity.' },
       { role: 'user', content: [
         { type: 'text', text: question || 'What do you see? One or two short sentences.' },
-        { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + f.buf.toString('base64') } },
+        { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + buf.toString('base64') } },
       ] },
-    ], { maxTokens: 220, auto });
+    ], { maxTokens, auto });
     return msg.content || '(no description)';
   }
 
@@ -174,6 +188,8 @@ module.exports = function createBrain(ctx) {
     fn('set_screen', 'What her screen shows, or turn it on/off.', { view: { type: 'string', enum: ['auto', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2', 'on', 'off'] } }, ['view']),
     fn('set_power_mode', 'performance (full speed), balanced, or saver (longest battery).', { mode: { type: 'string', enum: ['performance', 'balanced', 'saver'] } }, ['mode']),
     fn('showcase', 'Her ~40 s eyes + head performance (for filming).', {}),
+    fn('perform_motion', 'Compose and play a new head motion from a description: "dance", "look around nervously", "act sleepy", "a happy wiggle", "pretend to search the floor".', { description: str('The motion, in plain words') }, ['description']),
+    fn('look_at', 'Turn to a thing or place in the room by name ("the door", "the window", "my desk"), using her map of the room.', { thing: str('What to look at') }, ['thing']),
     fn('add_rule', 'Save a standing rule given in plain language, e.g. "if someone comes in after 11 pm, alert me and look at the door".', { text: str('The rule, in the owner\'s words') }, ['text']),
     fn('list_rules', 'List the saved rules.', {}),
     fn('delete_rule', 'Delete a rule by id.', { id: str('Rule id') }, ['id']),
@@ -222,6 +238,17 @@ module.exports = function createBrain(ctx) {
       case 'set_power_mode': actions.push('power ' + a.mode);
         return cmd('tune', [], { pmode: { performance: 0, balanced: 1, saver: 2 }[a.mode] });
       case 'showcase': actions.push('showcase'); return cmd('anim', ['show']);
+      case 'perform_motion': { const r = await compose(a.description); actions.push('motion: ' + String(a.description).slice(0, 24)); return r; }
+      case 'look_at': {
+        const hit = findInMap(a.thing);
+        if (!hit) {
+          if (!labels.size) { cmd('head_map'); lastMoveAt = Date.now(); return 'I have not mapped the room yet; I started a room scan. Ask again in a few minutes.'; }
+          return 'I could not find that in my map of the room. Known views: ' + [...labels.values()].map((l) => l.label).filter((x, i, arr) => arr.indexOf(x) === i).join(', ');
+        }
+        const r = cmd('head_goto', [hit.pan, hit.tilt]); lastMoveAt = Date.now();
+        actions.push('looked at ' + hit.label);
+        return `${r}: turned to the view labelled "${hit.label}" (${hit.desc}). Call look to see it now.`;
+      }
       case 'add_rule': { const r = await makeRule(a.text); actions.push('rule added'); return JSON.stringify(r); }
       case 'list_rules': return JSON.stringify(rules.map((r) => ({ id: r.id, text: r.text })));
       case 'delete_rule': {
@@ -268,6 +295,9 @@ module.exports = function createBrain(ctx) {
       'you see / is anyone there" use look; to see a place, move_head (or a spot) then look. For history use get_events.',
       'Never invent events, people or readings. If a tool fails, say what went wrong. Keep answers under 80 words',
       'unless asked for detail. Don\'t describe your tools; just use them.',
+      'End every final answer with exactly one body-language tag, which your head and eyes act out: [nod] (yes, done,',
+      'agreed), [shake] (no, can\'t), [think] (unsure, pondering), [happy] (glad, playful), [sad] (sorry, bad news) or [none].',
+      'For a head motion the owner describes (dance, wiggle, act scared…) use perform_motion; for "look at the X" use look_at.',
       'Now: ' + JSON.stringify(s),
       notes.length ? 'Things the owner asked you to remember: ' + notes.map((n) => `[${n.id}] ${n.text}`).join('; ') : '',
       rules.length ? 'Your standing rules: ' + rules.map((r) => `[${r.id}] ${r.text}`).join('; ') : '',
@@ -276,12 +306,24 @@ module.exports = function createBrain(ctx) {
 
   async function ask(q, history) {
     const actions = [];
+    ctx.applyCmd('emotion', ['think']);                // she ponders while the model works
     const messages = [{ role: 'system', content: systemPrompt() }];
     for (const m of (history || []).slice(-8)) if ((m.role === 'user' || m.role === 'assistant') && m.content) messages.push({ role: m.role, content: String(m.content).slice(0, 1500) });
     messages.push({ role: 'user', content: String(q).slice(0, 1500) });
     for (let round = 0; round < 6; round++) {
       const msg = await llm(messages, { tools: TOOLS });
-      if (!msg.tool_calls || !msg.tool_calls.length) return { answer: msg.content || '…', actions };
+      if (!msg.tool_calls || !msg.tool_calls.length) {
+        let answer = msg.content || '…';
+        const m = /\[(nod|shake|think|happy|sad|none)\]\s*$/i.exec(answer);
+        answer = answer.replace(/\s*\[(nod|shake|think|happy|sad|none)\]\s*/gi, ' ').trim();
+        const mood = m ? m[1].toLowerCase() : 'none';
+        if (MOODS[mood] && !actions.some((x) => x.startsWith('motion'))) {   // act it out (not over a motion she was asked for)
+          const [g, e] = MOODS[mood];
+          if (e) ctx.applyCmd('emotion', [e]);
+          if (g) ctx.applyCmd('head_gesture', [g]);
+        }
+        return { answer, actions, mood };
+      }
       messages.push({ role: 'assistant', content: msg.content || '', tool_calls: msg.tool_calls });
       for (const tc of msg.tool_calls) {
         let out;
@@ -291,6 +333,78 @@ module.exports = function createBrain(ctx) {
       }
     }
     return { answer: 'I ran out of steps on that one. Try asking more simply.', actions };
+  }
+
+  // ── composed head motions ──
+  async function compose(description) {
+    const msg = await llm([
+      { role: 'system', content: 'You choreograph the head of a small desk robot (two hobby servos: pan and tilt). Reply with JSON only: ' +
+        '{"frames":[[dpan,dtilt,hold_ms,speed],...],"expression":"giggle"|"surprise"|"curious"|"think"|"shy"|"dizzy"|"yawn"|"wink"|"squint"|null}. ' +
+        'Each frame is a target RELATIVE to where the head starts: dpan -60..60 degrees (positive = her left), dtilt -40..40 ' +
+        '(positive = DOWN, negative = up), hold_ms 0..3000 (pause after arriving), speed 20..150 deg/s (calm 30-50, lively 80-120, ' +
+        'snappy 150). 3 to 16 frames, under 12 s in total, ending with [0,0,0,40] to return to the start. Make it expressive ' +
+        'and readable: clear poses, rhythm, a mix of big and small moves.' },
+      { role: 'user', content: String(description).slice(0, 200) },
+    ], { model: TEXT_MODEL, json: true, maxTokens: 500 });
+    let j;
+    try { j = JSON.parse(msg.content); } catch { throw new Error('could not compose that motion'); }
+    const cl = (v, a, b) => Math.min(b, Math.max(a, Math.round(+v || 0)));
+    const frames = (Array.isArray(j.frames) ? j.frames : []).filter(Array.isArray).slice(0, 16)
+      .map((f) => [cl(f[0], -60, 60), cl(f[1], -40, 40), cl(f[2], 0, 3000), cl(f[3] || 60, 20, 150)]);
+    if (frames.length < 2) throw new Error('that motion came out empty');
+    const last = frames[frames.length - 1];
+    if (last[0] || last[1]) { if (frames.length >= 16) frames.pop(); frames.push([0, 0, 0, 40]); }   // always end where it began
+    const [code, text] = ctx.applyCmd('head_seq', [], { frames });
+    if (code >= 300) throw new Error(text);
+    if (j.expression) ctx.applyCmd('emotion', [String(j.expression)]);
+    const secs = frames.reduce((s, f, i) => s + f[2] / 1000 + Math.hypot(f[0] - (frames[i - 1] || [0, 0])[0], f[1] - (frames[i - 1] || [0, 0])[1]) / f[3], 0);
+    return `playing a ${frames.length}-step motion (~${secs.toFixed(1)} s)`;
+  }
+
+  // ── the room: what each map view shows (labelled by the vision model, a couple at a time) ──
+  async function labelSome() {
+    if (!KEY || !ctx.online() || !budget(true)) return;
+    const cells = ctx.mapCells().filter((c) => c.jpeg && (!labels.has(c.key) || labels.get(c.key).t < c.t - 6 * 3600e3))
+      .sort((a, b) => (labels.has(a.key) ? 1 : 0) - (labels.has(b.key) ? 1 : 0));
+    for (const c of cells.slice(0, 2)) {
+      try {
+        const d = await seeImage(c.jpeg, 'This is one view from a home camera robot that sweeps the room. Reply JSON only: ' +
+          '{"label":"1-3 words for the main thing in view (door, window, desk, bed, sofa, shelf, wall, ceiling, floor, cupboard, tv, ...)",' +
+          '"desc":"under 8 words","interest":0-3} where interest is how worth watching it is for a home camera: 0 = blank wall/ceiling/' +
+          'nothing, 1 = ordinary, 2 = where people sit or things happen, 3 = a door, window or entrance.', true, 120);
+        const m = /\{[\s\S]*\}/.exec(d); if (!m) continue;
+        const j = JSON.parse(m[0]);
+        labels.set(c.key, { label: String(j.label || '?').toLowerCase().slice(0, 20), desc: String(j.desc || '').slice(0, 40),
+                            interest: Number.isFinite(+j.interest) ? Math.min(3, Math.max(0, Math.round(+j.interest))) : 1, t: Date.now() });
+      } catch { break; }
+    }
+    if (cells.length) {
+      const obj = {};
+      for (const [k, v] of labels) obj[k] = [v.label, v.interest, v.desc.slice(0, 24), v.t];
+      save(MAP_FILE, Object.entries(obj).length ? [obj] : []).catch(() => {});
+    }
+  }
+  setInterval(() => { labelSome().catch(() => {}); }, +process.env.BRAIN_LABEL_MS || 90000);
+
+  function findInMap(thing) {
+    const words = String(thing || '').toLowerCase().replace(/\b(the|my|a|an|at|to)\b/g, ' ').split(/\W+/).filter((w) => w.length > 2);
+    if (!words.length) return null;
+    const cells = new Map(ctx.mapCells().map((c) => [c.key, c]));
+    let best = null, score = 0;
+    for (const [k, l] of labels) {
+      const hay = (l.label + ' ' + l.desc).toLowerCase();
+      const sc = words.filter((w) => hay.includes(w)).length * 10 + l.interest;
+      const c = cells.get(k);
+      if (sc >= 10 && sc > score && c) { score = sc; best = { ...l, pan: c.pan, tilt: c.tilt }; }
+    }
+    return best;
+  }
+
+  function patrolWeights(cols, rows) {
+    if (labels.size < 6) return null;                 // not enough of the room known yet: patrol everything
+    let w = '';
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) { const l = labels.get(c + ',' + r); w += l ? l.interest : 1; }
+    return /[1-3]/.test(w) ? w : null;
   }
 
   // ── rules ──
@@ -410,12 +524,13 @@ module.exports = function createBrain(ctx) {
   // ── HTTP ──
   function info() {
     return { enabled: !!KEY, model: MODEL, text_model: TEXT_MODEL, model_ok: modelOk, loaded_from_card: loaded,
-             memory_events: memory.length, rules: rules.map((r) => ({ id: r.id, text: r.text })), notes: notes.map((n) => ({ id: n.id, text: n.text })),
+             memory_events: memory.length, map_views_labelled: labels.size,
+             map: [...labels.entries()].map(([k, l]) => ({ view: k, label: l.label, interest: l.interest })), rules: rules.map((r) => ({ id: r.id, text: r.text })), notes: notes.map((n) => ({ id: n.id, text: n.text })),
              usage: { last_minute: usage.calls.filter((t) => Date.now() - t < 60000).length, today: usage.today, per_minute: RPM, per_day: RPD, errors: usage.errors, last_error: usage.lastError } };
   }
 
   return {
-    onEvent, onCapture, info, brief,
+    onEvent, onCapture, info, brief, patrolWeights,
     ask: async (q, history) => ask(q, history),
     deleteRule: async (id) => { rules = rules.filter((r) => r.id !== id); return save(RULES_FILE, rules); },
     deleteNote: async (id) => { notes = notes.filter((n) => n.id !== id); return save(NOTES_FILE, notes); },
