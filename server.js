@@ -88,6 +88,7 @@ let oledFrame = null;
 // Activity timeline, derived from /meta. Presence is debounced — a face that
 // drops out for a frame or two doesn't log "left" and "arrived" again.
 const LOG_MAX = 30;
+let brain = null;                 // AYA's brain (brain.js), set up below once everything it uses exists
 const activity = [];              // newest first: {t, kind, text}
 const presence = { here: false, lastFace: 0, who: null, sleeping: null };
 
@@ -228,85 +229,93 @@ function handleLogin(req, res) {
 // upload's reply says ",p" — it polls at once instead of up to 2 s later.
 let deviceKick = false;
 
+// One place that applies a command: the dashboard (POST /cmd) and AYA's brain (brain.js) both use it.
+// Returns [http code, text]; 202 = queued for the display's next poll.
+function applyCmd(cmd, args, body = {}) {
+  args = (args || []).map(String);
+  const reply = (code, text) => [code, text];
+  deviceKick = true;
+  // Display commands are kept here for the display to pick up (/display).
+  if (cmd === 'screen') {
+    if (!['on', 'off'].includes(args[0])) return reply(400, 'screen on|off');
+    displayState.screen = args[0] === 'on' ? 1 : 0;
+    broadcast('display', publicDisplay());
+    return reply(202, 'queued');
+  }
+  if (cmd === 'message') {
+    // The OLED fonts are ASCII: anything else becomes '?'. Blank clears it.
+    const text = String(body.text || '').replace(/[\r\n\t]+/g, ' ').replace(/[^\x20-\x7e]/g, '?').trim().slice(0, MSG_MAX);
+    const secs = Math.min(Math.max(parseInt(body.secs, 10) || 15, 5), 600);
+    displayState.msg = text ? { id: ++displayState.seq, text, secs, t: Date.now() } : null;
+    if (text) logEvent('message', `Message: "${text}"`);
+    broadcast('display', publicDisplay());
+    return reply(202, 'queued');
+  }
+  if (cmd === 'restart_all') {       // the display (and its camera) picks it up on its next poll (≤2 s)
+    displayState.restart = Date.now();
+    logEvent('privacy', 'System restart');
+    return reply(202, 'restarting');
+  }
+  if (cmd === 'shutdown') {          // deep sleep on its next poll; only a touch (or EN / power) wakes it
+    displayState.shutdown = Date.now();
+    logEvent('restart', 'Shut down from the page · touch AYA to wake her');
+    return reply(202, 'shutting down');
+  }
+  if (cmd === 'view') {              // what the OLED shows: auto rotation, one screen, or camera 2 live
+    if (!VIEWS.includes(args[0])) return reply(400, 'view ' + VIEWS.join('|'));
+    displayState.view = args[0];
+    broadcast('display', publicDisplay());
+    return reply(202, 'queued');
+  }
+  if (cmd === 'ignore') {            // camera zones AYA never counts as motion: 12 rows x 16 bits as 48 hex digits
+    if (!/^[0-9a-f]{48}$/.test(args[0] || '')) return reply(400, 'ignore <48 hex digits>');
+    displayState.ignore = args[0];
+    logEvent('privacy', 'Motion ignore zones updated');
+    broadcast('display', publicDisplay());
+    return reply(202, 'queued');
+  }
+  if (cmd === 'zoom2') {             // camera 2 (the display's OV7670): digital zoom ×10
+    const z = parseInt(args[0], 10);
+    if (!(z === 0 || (z >= 10 && z <= 30))) return reply(400, 'zoom2 0 (auto) or 10..30');
+    displayState.zoom2 = z;
+    broadcast('display', publicDisplay());
+    return reply(202, 'queued');
+  }
+  if (cmd === 'tune') {              // motion and standby settings: {speed °/s, accel °/s², doze min}, any subset
+    const num = (v, lo, hi) => (v === undefined || v === null || v === '' ? undefined
+      : Number.isFinite(+v) && +v >= lo && +v <= hi ? Math.round(+v) : null);
+    const speed = num(body.speed, 20, 150), accel = num(body.accel, 50, 1000), doze = num(body.doze, 0, 1440), pmode = num(body.pmode, 0, 2);
+    if (speed === null || accel === null || doze === null || pmode === null)
+      return reply(400, 'tune speed 20..150, accel 50..1000, doze 0..1440, pmode 0..2');
+    if ([speed, accel, doze, pmode].every((v) => v === undefined)) return reply(400, 'tune: nothing to set');
+    const prev = displayState.set || {};
+    displayState.set = { t: Date.now(), speed: speed ?? prev.speed, accel: accel ?? prev.accel, doze: doze ?? prev.doze, pmode: pmode ?? prev.pmode };
+    if (pmode !== undefined) logEvent('power', `Power mode: ${['performance', 'balanced', 'saver'][pmode]}`);
+    broadcast('display', publicDisplay());
+    return reply(202, 'queued');
+  }
+  if (cmd === 'anim') {              // replay the boot screen, the showcase, or preview the dying animation (she restarts after it)
+    if (!ANIMS.includes(args[0])) return reply(400, 'anim ' + ANIMS.join('|'));
+    displayState.anim = { t: Date.now(), name: args[0] };
+    return reply(202, 'queued');
+  }
+  if (cmd === 'emotion') {
+    if (!EMOTIONS.includes(args[0])) return reply(400, 'unknown emotion');
+    displayState.emotion = { id: ++displayState.seq, name: args[0], t: Date.now() };
+    broadcast('display', publicDisplay());
+    return reply(202, 'queued');
+  }
+  if (cmd.startsWith('head_')) return headCmd(cmd, args);
+  return reply(400, 'unknown command');
+}
+
 function handleCmd(req, res) {
   if (!sessionOk(req) && !keyMatches(req.headers['x-admin-key'], ADMIN_KEY)) return send(res, 401, 'text/plain', 'not logged in');
   readBody(req, SMALL_BODY_MAX, (raw) => {
     let body;
     try { body = JSON.parse(raw.toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
-    const cmd = String(body.cmd || ''), args = (body.args || []).map(String);
-    deviceKick = true;
-    // Display commands are kept here for the display to pick up (/display).
-    if (cmd === 'screen') {
-      if (!['on', 'off'].includes(args[0])) return send(res, 400, 'text/plain', 'screen on|off');
-      displayState.screen = args[0] === 'on' ? 1 : 0;
-      broadcast('display', publicDisplay());
-      return send(res, 202, 'text/plain', 'queued');
-    }
-    if (cmd === 'message') {
-      // The OLED fonts are ASCII: anything else becomes '?'. Blank clears it.
-      const text = String(body.text || '').replace(/[\r\n\t]+/g, ' ').replace(/[^\x20-\x7e]/g, '?').trim().slice(0, MSG_MAX);
-      const secs = Math.min(Math.max(parseInt(body.secs, 10) || 15, 5), 600);
-      displayState.msg = text ? { id: ++displayState.seq, text, secs, t: Date.now() } : null;
-      if (text) logEvent('message', `Message: "${text}"`);
-      broadcast('display', publicDisplay());
-      return send(res, 202, 'text/plain', 'queued');
-    }
-    if (cmd === 'restart_all') {       // the display (and its camera) picks it up on its next poll (≤2 s)
-      displayState.restart = Date.now();
-      logEvent('privacy', 'System restart');
-      return send(res, 202, 'text/plain', 'restarting');
-    }
-    if (cmd === 'shutdown') {          // deep sleep on its next poll; only a touch (or EN / power) wakes it
-      displayState.shutdown = Date.now();
-      logEvent('restart', 'Shut down from the page · touch AYA to wake her');
-      return send(res, 202, 'text/plain', 'shutting down');
-    }
-    if (cmd === 'view') {              // what the OLED shows: auto rotation, one screen, or camera 2 live
-      if (!VIEWS.includes(args[0])) return send(res, 400, 'text/plain', 'view ' + VIEWS.join('|'));
-      displayState.view = args[0];
-      broadcast('display', publicDisplay());
-      return send(res, 202, 'text/plain', 'queued');
-    }
-    if (cmd === 'ignore') {            // camera zones AYA never counts as motion: 12 rows x 16 bits as 48 hex digits
-      if (!/^[0-9a-f]{48}$/.test(args[0] || '')) return send(res, 400, 'text/plain', 'ignore <48 hex digits>');
-      displayState.ignore = args[0];
-      logEvent('privacy', 'Motion ignore zones updated');
-      broadcast('display', publicDisplay());
-      return send(res, 202, 'text/plain', 'queued');
-    }
-    if (cmd === 'zoom2') {             // camera 2 (the display's OV7670): digital zoom ×10
-      const z = parseInt(args[0], 10);
-      if (!(z === 0 || (z >= 10 && z <= 30))) return send(res, 400, 'text/plain', 'zoom2 0 (auto) or 10..30');
-      displayState.zoom2 = z;
-      broadcast('display', publicDisplay());
-      return send(res, 202, 'text/plain', 'queued');
-    }
-    if (cmd === 'tune') {              // motion and standby settings: {speed °/s, accel °/s², doze min}, any subset
-      const num = (v, lo, hi) => (v === undefined || v === null || v === '' ? undefined
-        : Number.isFinite(+v) && +v >= lo && +v <= hi ? Math.round(+v) : null);
-      const speed = num(body.speed, 20, 150), accel = num(body.accel, 50, 1000), doze = num(body.doze, 0, 1440), pmode = num(body.pmode, 0, 2);
-      if (speed === null || accel === null || doze === null || pmode === null)
-        return send(res, 400, 'text/plain', 'tune speed 20..150, accel 50..1000, doze 0..1440, pmode 0..2');
-      if ([speed, accel, doze, pmode].every((v) => v === undefined)) return send(res, 400, 'text/plain', 'tune: nothing to set');
-      const prev = displayState.set || {};
-      displayState.set = { t: Date.now(), speed: speed ?? prev.speed, accel: accel ?? prev.accel, doze: doze ?? prev.doze, pmode: pmode ?? prev.pmode };
-      if (pmode !== undefined) logEvent('power', `Power mode: ${['performance', 'balanced', 'saver'][pmode]}`);
-      broadcast('display', publicDisplay());
-      return send(res, 202, 'text/plain', 'queued');
-    }
-    if (cmd === 'anim') {              // replay the boot screen, the showcase, or preview the dying animation (she restarts after it)
-      if (!ANIMS.includes(args[0])) return send(res, 400, 'text/plain', 'anim ' + ANIMS.join('|'));
-      displayState.anim = { t: Date.now(), name: args[0] };
-      return send(res, 202, 'text/plain', 'queued');
-    }
-    if (cmd === 'emotion') {
-      if (!EMOTIONS.includes(args[0])) return send(res, 400, 'text/plain', 'unknown emotion');
-      displayState.emotion = { id: ++displayState.seq, name: args[0], t: Date.now() };
-      broadcast('display', publicDisplay());
-      return send(res, 202, 'text/plain', 'queued');
-    }
-    if (cmd.startsWith('head_')) return headCmd(res, cmd, args);
-    send(res, 400, 'text/plain', 'unknown command');
+    const [code, text] = applyCmd(String(body.cmd || ''), body.args || [], body);
+    send(res, code, 'text/plain', text);
   });
 }
 
@@ -357,6 +366,7 @@ function logEvent(kind, text) {
   if (activity.length > LOG_MAX) activity.pop();
   const line = `event: log\ndata: ${JSON.stringify(e)}\n\n`;
   for (const s of metaSubscribers) sseWrite(s, line);
+  if (brain) brain.onEvent(e);                    // her memory, rules and smart alerts (brain.js)
 }
 
 const objectSeen = new Map();       // label → last time seen
@@ -610,8 +620,8 @@ function headPush(op, a, b, name) {
   while (headq.length > HEADQ_MAX) headq.shift();
 }
 
-function headCmd(res, cmd, args) {
-  const bad = (why) => send(res, 400, 'text/plain', why);
+function headCmd(cmd, args) {
+  const bad = (why) => [400, why];
   const num = (v, lo, hi) => { const n = Number(v); return v !== '' && Number.isFinite(n) && n >= lo && n <= hi ? Math.round(n * 1000) / 1000 : null; };
   const spot = String(args[0] || '').trim().toLowerCase();
   switch (cmd) {
@@ -657,7 +667,7 @@ function headCmd(res, cmd, args) {
     default:
       return bad('unknown command');
   }
-  send(res, 202, 'text/plain', 'queued');
+  return [202, 'queued'];
 }
 
 function headAck(req) {
@@ -841,6 +851,7 @@ function captureEvent(kind, text) {
   gallery.unshift(ev);
   if (gallery.length > GALLERY_MAX) gallery.pop();
   broadcast('gallery', galleryItem(ev));
+  if (brain) brain.onCapture(ev);                 // an AI description arrives a few seconds later
   let tries = 0;
   const more = () => {
     if (latestFrame && latestFrame !== ev.frames[ev.frames.length - 1]) ev.frames.push(latestFrame);
@@ -876,10 +887,11 @@ function sdPathOk(p) {
   return typeof p === 'string' && p.startsWith('/') && p.length < 120 && !p.includes('..') && !/[\\\x00-\x1f]/.test(p);
 }
 
-function sdRequest(op, path) {
+// op 'put' (brain.js only): write `data` (text, at most 2 KB) to a file under /aya/brain/ on the card
+function sdRequest(op, path, data) {
   return new Promise((resolve) => {
-    let r = sdPending.find((x) => x.op === op && x.path === path);
-    if (!r) { r = { id: ++sdNextId, op, path, at: Date.now(), sentAt: 0, waiters: [] }; sdPending.push(r); }
+    let r = op === 'put' ? null : sdPending.find((x) => x.op === op && x.path === path);
+    if (!r) { r = { id: ++sdNextId, op, path, data, at: Date.now(), sentAt: 0, waiters: [] }; sdPending.push(r); }
     const done = (v) => { clearTimeout(timer); resolve(v); };
     const timer = setTimeout(() => {
       r.waiters = r.waiters.filter((w) => w !== done);
@@ -946,7 +958,7 @@ function deviceReply(req) {
   const due = sdPending.filter((r) => r.waiters.length && (!r.sentAt || Date.now() - r.sentAt > 8000)).slice(0, 3);
   if (due.length) {                               // SD card requests from the page
     for (const r of due) r.sentAt = Date.now();
-    out.sdreq = due.map((r) => ({ id: r.id, op: r.op, path: r.path }));
+    out.sdreq = due.map((r) => (r.data !== undefined ? { id: r.id, op: r.op, path: r.path, data: r.data } : { id: r.id, op: r.op, path: r.path }));
   }
   const logSince = Number(req.headers['x-log-since']), shotSince = Number(req.headers['x-shot-since']);
   if (Number.isFinite(logSince) || Number.isFinite(shotSince)) out.now = Date.now();
@@ -1065,6 +1077,36 @@ function status() {
            power: power && { ...power, age: Date.now() - power.t }, board: board && { ...board, age: Date.now() - board.t }, detector: localVision ? localVision.stats() : null };   // Render-side detection: frames, dropped, ms per stage
 }
 
+// ── AYA's brain (brain.js): chat with tools, vision, memory, rules, summaries ──
+brain = require('./brain')({
+  applyCmd,
+  status,
+  frame: () => (latestFrame ? { buf: latestFrame, at: latestAt } : null),
+  logEvent,
+  sdGet: (path) => sdRequest('get', path),
+  sdPut: (path, text) => sdRequest('put', path, text),
+  online: () => !!seen.display && Date.now() - seen.display < 10000,
+  broadcast,
+});
+
+function handleBrain(req, res, url) {
+  if (!sessionOk(req) && !keyMatches(req.headers['x-admin-key'], ADMIN_KEY)) return send(res, 401, 'text/plain', 'not logged in');
+  readBody(req, SMALL_BODY_MAX, async (raw) => {
+    let body;
+    try { body = JSON.parse(raw.toString('utf8')); } catch { return send(res, 400, 'text/plain', 'bad json'); }
+    try {
+      if (url.pathname === '/ask') {               // {q, history: [{role, content}]}
+        const q = String(body.q || '').trim();
+        if (!q) return send(res, 400, 'text/plain', 'ask what?');
+        return send(res, 200, 'application/json', JSON.stringify(await brain.ask(q, Array.isArray(body.history) ? body.history : [])));
+      }
+      if (body.op === 'delete_rule') return send(res, 200, 'application/json', JSON.stringify({ saved: await brain.deleteRule(String(body.id)) }));
+      if (body.op === 'delete_note') return send(res, 200, 'application/json', JSON.stringify({ saved: await brain.deleteNote(String(body.id)) }));
+      send(res, 400, 'text/plain', 'unknown op');
+    } catch (e) { send(res, 503, 'text/plain', e.message); }
+  });
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   const key = url.searchParams.get('key');
@@ -1074,6 +1116,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && url.pathname === '/push') return handlePush(req, res, url);
   if (req.method === 'POST' && url.pathname === '/meta') return handleMeta(req, res);
   if (req.method === 'POST' && url.pathname === '/cmd') return handleCmd(req, res);
+  if (req.method === 'POST' && (url.pathname === '/ask' || url.pathname === '/brain')) return handleBrain(req, res, url);
   if (req.method === 'POST' && url.pathname === '/login') return handleLogin(req, res);
   if (req.method === 'POST' && url.pathname === '/sdres') {   // the display answering an SD request
     if (!device) return send(res, 401, 'text/plain', 'bad key');
@@ -1096,7 +1139,7 @@ const server = http.createServer((req, res) => {
     const fs = require('fs'), path = require('path');
     const NEXT_DIR = path.join(__dirname, 'next');
     const API_SEGMENTS = new Set(['healthz', 'manifest.webmanifest', 'icon.svg', 'logout', 'stream', 'snapshot', 'events', 'display',
-      'status', 'sd', 'gallery', 'panos', 'map.json', 'map', 'health', 'pano', 'push', 'meta', 'cmd', 'login', 'ask', 'sdres']);
+      'status', 'sd', 'gallery', 'panos', 'map.json', 'map', 'health', 'pano', 'push', 'meta', 'cmd', 'login', 'ask', 'sdres', 'brain']);
     const NEXT_TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
       '.json': 'application/json', '.txt': 'text/plain; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg',
       '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.woff': 'font/woff', '.webmanifest': 'application/manifest+json', '.map': 'application/json' };
@@ -1192,6 +1235,16 @@ const server = http.createServer((req, res) => {
     case '/map.json':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify(mapJson()), { 'Cache-Control': 'no-store' });
+    case '/brain':                                 // what the brain knows: rules, notes, usage
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      return send(res, 200, 'application/json', JSON.stringify(brain.info()));
+    case '/brain/brief': {                         // "since you were away"
+      if (!authed) return send(res, 401, 'text/plain', 'bad key');
+      const since = Math.max(Date.now() - 72 * 3600e3, Number(url.searchParams.get('since')) || Date.now() - 3600e3);
+      brain.brief(since).then((text) => send(res, 200, 'application/json', JSON.stringify({ since, text })),
+                              (e) => send(res, 503, 'text/plain', e.message));
+      return;
+    }
     case '/health':
       if (!authed) return send(res, 401, 'text/plain', 'bad key');
       return send(res, 200, 'application/json', JSON.stringify({ every: HEALTH_EVERY_MS, samples: healthSamples }));
