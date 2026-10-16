@@ -112,7 +112,7 @@ setInterval(() => {
 const EMOTIONS = ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'shy', 'dizzy',
                   'roll', 'nod', 'yawn', 'purr', 'squint', 'sleep', 'wake'];
 const MSG_MAX = 120;
-const VIEWS = ['auto', 'eyes', 'luffy', 'clock', 'weather', 'stats', 'detect', 'cam2'];
+const VIEWS = ['auto', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2'];
 // view/zoom2 start as null: after a relay restart the display keeps what it shows until someone picks
 const displayState = { screen: 1, msg: null, emotion: null, seq: 0, restart: 0, shutdown: 0, view: null, zoom2: null, ignore: null,
                        set: null, anim: null, motion: null };   // motion: {t, f: [[dpan, dtilt, hold ms, speed], …]} a composed head motion   // set: {t, speed, accel, doze} motion/standby settings; anim: {t, name} boot|dead preview

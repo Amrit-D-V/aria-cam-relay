@@ -185,7 +185,7 @@ module.exports = function createBrain(ctx) {
     fn('scan_room', 'Look at every part of the room once (builds the room map), then go back to the mode.', {}),
     fn('show_message', 'Show a short text on her screen.', { text: str('ASCII, up to 120 characters'), seconds: num('5-600 (default 30)') }, ['text']),
     fn('set_expression', 'An expression on her face.', { name: { type: 'string', enum: ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'shy', 'dizzy', 'roll', 'nod', 'squint', 'purr', 'yawn', 'sleep', 'wake'] } }, ['name']),
-    fn('set_screen', 'What her screen shows (luffy = a Luffy-style cartoon face), or turn it on/off.', { view: { type: 'string', enum: ['auto', 'eyes', 'luffy', 'clock', 'weather', 'stats', 'detect', 'cam2', 'on', 'off'] } }, ['view']),
+    fn('set_screen', 'What her screen shows, or turn it on/off.', { view: { type: 'string', enum: ['auto', 'eyes', 'clock', 'weather', 'stats', 'detect', 'cam2', 'on', 'off'] } }, ['view']),
     fn('set_power_mode', 'performance (full speed), balanced, or saver (longest battery).', { mode: { type: 'string', enum: ['performance', 'balanced', 'saver'] } }, ['mode']),
     fn('showcase', 'Her ~40 s eyes + head performance (for filming).', {}),
     fn('perform_motion', 'Compose and play a new head motion from a description: "dance", "look around nervously", "act sleepy", "a happy wiggle", "pretend to search the floor".', { description: str('The motion, in plain words') }, ['description']),
