@@ -148,7 +148,14 @@ function publicDisplay() {
   return { screen: displayState.screen, msg: m && Date.now() - m.t < m.secs * 1000 ? m : null,
            emotion: displayState.emotion, restart: displayState.restart, shutdown: displayState.shutdown,
            view: displayState.view, zoom2: displayState.zoom2, set: displayState.set, anim: displayState.anim, motion: displayState.motion,
-           ignore: displayState.ignore, face: boardFace && Date.now() - boardFace.t < 3000 ? boardFace : null };
+           ignore: displayState.ignore, face: faceForBoard() };
+}
+// the face for the board: id (a new detection or a repeat) and age (ms since its picture reached the relay;
+// the board adds the upload time and places it with its head position back then)
+function faceForBoard() {
+  if (!boardFace || Date.now() - boardFace.t >= 3000) return null;
+  const { ft, t, ...f } = boardFace;
+  return { ...f, age: Date.now() - ft + 150 };
 }
 
 // ── Login: one key (ADMIN_KEY) opens the page ────────────────────────────
@@ -284,12 +291,22 @@ function applyCmd(cmd, args, body = {}) {
   if (cmd === 'tune') {              // motion and standby settings: {speed °/s, accel °/s², doze min}, any subset
     const num = (v, lo, hi) => (v === undefined || v === null || v === '' ? undefined
       : Number.isFinite(+v) && +v >= lo && +v <= hi ? Math.round(+v) : null);
-    const speed = num(body.speed, 20, 150), accel = num(body.accel, 50, 1000), doze = num(body.doze, 0, 1440), pmode = num(body.pmode, 0, 2);
-    if (speed === null || accel === null || doze === null || pmode === null)
-      return reply(400, 'tune speed 20..150, accel 50..1000, doze 0..1440, pmode 0..2');
-    if ([speed, accel, doze, pmode].every((v) => v === undefined)) return reply(400, 'tune: nothing to set');
+    const R = { speed: [20, 150], accel: [50, 1000], doze: [0, 1440], pmode: [0, 2], fstyle: [0, 1], fsens: [0, 2], prest: [0, 600],
+                sleepq: [0, 240], pmin: [0, 180], pmax: [0, 180], tmin: [0, 180], tmax: [0, 180], invx: [0, 1], invy: [0, 1] };
+    const got = {};
+    for (const [k, [lo, hi]] of Object.entries(R)) {
+      const v = num(body[k], lo, hi);
+      if (v === null) return reply(400, `tune ${k}: ${lo}..${hi}`);
+      if (v !== undefined) got[k] = v;
+    }
+    if (body.test !== undefined) { if (!['x', 'y'].includes(body.test)) return reply(400, 'tune test: x|y'); got.test = body.test; }
+    if ((got.pmin !== undefined) !== (got.pmax !== undefined) || (got.tmin !== undefined) !== (got.tmax !== undefined))
+      return reply(400, 'tune: pmin+pmax and tmin+tmax go together');
+    if (!Object.keys(got).length) return reply(400, 'tune: nothing to set');
     const prev = displayState.set || {};
-    displayState.set = { t: Date.now(), speed: speed ?? prev.speed, accel: accel ?? prev.accel, doze: doze ?? prev.doze, pmode: pmode ?? prev.pmode };
+    const { t: _t, test: _x, ...keep } = prev;            // every setting so far rides along (two quick changes both arrive)
+    displayState.set = { t: Date.now(), ...keep, ...got };   // (the one-shot "test" only with its own request)
+    const pmode = got.pmode;
     if (pmode !== undefined) logEvent('power', `Power mode: ${['performance', 'balanced', 'saver'][pmode]}`);
     broadcast('display', publicDisplay());
     return reply(202, 'queued');
@@ -451,10 +468,13 @@ function handlePush(req, res, url) {
     // joystick press reaches the servos a round trip sooner than via the poll. X-Head-Ack drops what she applied.
     noteHeadAck(req);
     const ack = headAck(req), hq = req.headers['x-head-ack'] !== undefined ? headq.filter((e) => e.id > ack) : [];
-    const tail = hq.length ? '\n' + JSON.stringify({ headq: hq.map((e) => ({ id: e.id, op: e.op, a: e.a, b: e.b, name: e.name })) }) : '';
+    const extra = {};
+    if (hq.length) extra.headq = hq.map((e) => ({ id: e.id, op: e.op, a: e.a, b: e.b, name: e.name }));
+    if (req.headers['x-head-ack'] !== undefined) { const f = faceForBoard(); if (f) extra.face = f; }   // faces ride here too: ~3x a second
+    const tail = Object.keys(extra).length ? '\n' + JSON.stringify(extra) : '';
     send(res, 200, 'text/plain', String(viewerCount()) + (deviceKick ? ',p' : '') + tail);   // answer first: AYA waits for this
     if (localVision && Date.now() - metaHttpAt > 3000)  // (the laptop tracker, when it runs, wins)
-      setImmediate(() => localVision.analyze(frame).then((m) => { if (m) ingestMeta(m); }, () => {}));   // then analyse
+      setImmediate(() => { const ft = Date.now(); localVision.analyze(frame).then((m) => { if (m) ingestMeta(m, ft); }, () => {}); });   // then analyse
   });
 }
 
@@ -481,13 +501,15 @@ function handleMeta(req, res) {
 // The vision result, from the laptop tracker (POST /meta) or from vision.js
 // running in this process on each eye2 frame
 let metaHttpAt = 0;
-function ingestMeta(meta) {
+let boardFaceId = 0;
+function ingestMeta(meta, frameAt) {                // frameAt: when the analysed picture arrived (Render vision)
   {
     latestMeta = JSON.stringify(meta);            // re-serialised: only valid JSON reaches viewers
     const f = Array.isArray(meta.faces) && meta.faces[0];       // the face, passed to the display on its poll
     if (f && [f.x, f.y, f.w, f.h].every(Number.isFinite)) {
       boardFace = { x: +((f.x + f.w / 2) * 2 - 1).toFixed(2), y: +((f.y + f.h / 2) * 2 - 1).toFixed(2), s: +f.w.toFixed(3),
-                    id: String(f.id || ''), name: String(f.name || '').slice(0, 20), admin: !!f.admin, emo: String(f.emo || ''), t: Date.now() };
+                    id: String(f.id || ''), name: String(f.name || '').slice(0, 20), admin: !!f.admin, emo: String(f.emo || ''), t: Date.now(),
+                    fid: ++boardFaceId, ft: frameAt || Date.now() };
     }
     seen.tracker = Date.now();
     if ((Array.isArray(meta.bodies) && meta.bodies.length) || (Array.isArray(meta.faces) && meta.faces.length))
@@ -587,7 +609,7 @@ function noteDeviceEvent(req) {
 // Sent with the display's first poll after it starts: why it (re)started
 // X-Power: "V,mA,mW,mAhUsed,pct,state,hours" (mA < 0 = charging; hours = to full while charging, else left)
 // X-Sys: "uptime s,heap KB,block KB,rssi,offline 0|1,cpu MHz,servo speed,servo accel,standby min,power mode 0..2"
-let power = null, board = null;
+let power = null, board = null, tune = null;
 function noteSys(req) {
   const pv = req.headers['x-power'];
   if (pv !== undefined) {
@@ -595,6 +617,12 @@ function noteSys(req) {
     const n = (i) => (a[i] !== undefined && a[i] !== '' && Number.isFinite(+a[i]) ? +a[i] : null);
     const st = /^[a-z]{1,12}$/.test(a[5] || '') ? a[5] : null;
     if (n(0) !== null) power = { v: n(0), ma: n(1), mw: n(2), mah_used: n(3), pct: n(4), state: st, hours: n(6), t: Date.now() };
+  }
+  const tv = req.headers['x-tune'];               // "fstyle,fsens,prest,sleepq,pmin,pmax,tmin,tmax,invx,invy"
+  if (tv !== undefined) {
+    const a = String(tv).split(',').map(Number);
+    if (a.length === 10 && a.every(Number.isFinite))
+      tune = { fstyle: a[0], fsens: a[1], prest: a[2], sleepq: a[3], pmin: a[4], pmax: a[5], tmin: a[6], tmax: a[7], invx: a[8], invy: a[9] };
   }
   const sv = req.headers['x-sys'];
   if (sv !== undefined) {
@@ -614,7 +642,7 @@ function noteBoot(req) {
 // until it acks them (X-Head-Ack: the last id it applied). Ids restart with
 // the relay, so an ack above the current max id is from before a restart: 0.
 const HEAD_MODES = ['follow', 'patrol', 'hold'];
-const HEAD_STATES = ['search', 'face', 'motion', 'inspect', 'hold', 'gesture', 'spot', 'pano', 'map', 'centre', '-'];
+const HEAD_STATES = ['search', 'face', 'motion', 'inspect', 'hold', 'gesture', 'spot', 'pano', 'map', 'centre', 'rest', '-'];
 const HEAD_GESTURES = ['nod', 'shake', 'curious', 'startle', 'droop', 'stretch', 'excited'];
 const SPOT_RE = /^[a-z0-9_-]{1,12}$/;
 const HEADQ_MAX = 8;
@@ -961,8 +989,15 @@ async function handleSdGet(req, res, url, op) {
   return send(res, 200, sdType(path), r.body, extra);
 }
 
+let pwSent = '', pwSentAt = 0;
 function deviceReply(req) {
   const out = publicDisplay();
+  // Requests that only matter when new ride out for a minute, not on every poll forever (the board's
+  // heap is small; each reply is parsed whole). It acts on a new t; after a restart it keeps its saved values.
+  const fresh = (x, ms) => x && Date.now() - x.t < ms;
+  if (!fresh(out.set, 60000)) delete out.set;
+  if (!fresh(out.anim, 60000)) delete out.anim;
+  if (!fresh(out.motion, 30000)) delete out.motion;
   const due = sdPending.filter((r) => r.waiters.length && (!r.sentAt || Date.now() - r.sentAt > 8000)).slice(0, 3);
   if (due.length) {                               // SD card requests from the page
     for (const r of due) r.sentAt = Date.now();
@@ -978,7 +1013,7 @@ function deviceReply(req) {
   if (hq.length) out.headq = hq.map((e) => ({ id: e.id, op: e.op, a: e.a, b: e.b, name: e.name }));
   if (brain && roomMap.cols === 9 && roomMap.rows === 4) {   // which patrol views are worth a look (brain.js map labels)
     const w = brain.patrolWeights(9, 4);
-    if (w) out.pweights = w;
+    if (w && (w !== pwSent || Date.now() - pwSentAt > 300000)) { out.pweights = w; pwSent = w; pwSentAt = Date.now(); }
   }
   const sign = pendingSign();                     // a new hand sign from the tracker (each once)
   if (sign) out.sign = sign;
@@ -1086,7 +1121,7 @@ function status() {
   return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
            fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
            idle: isIdle(), head, map: mapGeom(), ...ages(),
-           power: power && { ...power, age: Date.now() - power.t }, board: board && { ...board, age: Date.now() - board.t }, detector: localVision ? localVision.stats() : null };   // Render-side detection: frames, dropped, ms per stage
+           power: power && { ...power, age: Date.now() - power.t }, board: board && { ...board, age: Date.now() - board.t }, tune, detector: localVision ? localVision.stats() : null };   // Render-side detection: frames, dropped, ms per stage
 }
 
 // ── AYA's brain (brain.js): chat with tools, vision, memory, rules, summaries ──
