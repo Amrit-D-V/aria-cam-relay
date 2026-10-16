@@ -186,6 +186,8 @@ module.exports = function createBrain(ctx) {
     fn('show_message', 'Show a short text on her screen.', { text: str('ASCII, up to 120 characters'), seconds: num('5-600 (default 30)') }, ['text']),
     fn('set_expression', 'An expression on her face.', { name: { type: 'string', enum: ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'shy', 'dizzy', 'roll', 'nod', 'squint', 'purr', 'yawn', 'sleep', 'wake'] } }, ['name']),
     fn('set_screen', 'What her screen shows (iris = a single glowing iris), or turn it on/off.', { view: { type: 'string', enum: ['auto', 'eyes', 'iris', 'clock', 'weather', 'stats', 'detect', 'cam2', 'on', 'off'] } }, ['view']),
+    fn('set_face', 'Her face style on the eyes screen: original (her animated eyes), pill, orb, status (clock), lens, wave, radar, viewfinder, iris, dots, lines.',
+      { style: { type: 'string', enum: ['original', 'pill', 'orb', 'status', 'lens', 'wave', 'radar', 'viewfinder', 'iris', 'dots', 'lines'] } }, ['style']),
     fn('set_power_mode', 'performance (full speed), balanced, or saver (longest battery).', { mode: { type: 'string', enum: ['performance', 'balanced', 'saver'] } }, ['mode']),
     fn('showcase', 'Her ~40 s eyes + head performance (for filming).', {}),
     fn('perform_motion', 'Compose and play a new head motion from a description: "dance", "look around nervously", "act sleepy", "a happy wiggle", "pretend to search the floor".', { description: str('The motion, in plain words') }, ['description']),
@@ -235,6 +237,12 @@ module.exports = function createBrain(ctx) {
       case 'set_expression': actions.push(a.name); return cmd('emotion', [a.name]);
       case 'set_screen': actions.push('screen ' + a.view);
         return a.view === 'on' || a.view === 'off' ? cmd('screen', [a.view]) : cmd('view', [a.view]);
+      case 'set_face': {
+        const i = ['original', 'pill', 'orb', 'status', 'lens', 'wave', 'radar', 'viewfinder', 'iris', 'dots', 'lines'].indexOf(a.style);
+        if (i < 0) return 'unknown style';
+        actions.push('face: ' + a.style); cmd('view', ['eyes']);
+        return cmd('tune', [], { face: i });
+      }
       case 'set_power_mode': actions.push('power ' + a.mode);
         return cmd('tune', [], { pmode: { performance: 0, balanced: 1, saver: 2 }[a.mode] });
       case 'showcase': actions.push('showcase'); return cmd('anim', ['show']);
