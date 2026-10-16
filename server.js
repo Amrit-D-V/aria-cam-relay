@@ -609,7 +609,7 @@ function noteDeviceEvent(req) {
 // Sent with the display's first poll after it starts: why it (re)started
 // X-Power: "V,mA,mW,mAhUsed,pct,state,hours" (mA < 0 = charging; hours = to full while charging, else left)
 // X-Sys: "uptime s,heap KB,block KB,rssi,offline 0|1,cpu MHz,servo speed,servo accel,standby min,power mode 0..2"
-let power = null, board = null, tune = null;
+let power = null, board = null, tune = null, restarts = [], lowHeapNoted = false;
 function noteSys(req) {
   const pv = req.headers['x-power'];
   if (pv !== undefined) {
@@ -626,9 +626,22 @@ function noteSys(req) {
   }
   const sv = req.headers['x-sys'];
   if (sv !== undefined) {
-    const a = String(sv).split(',').map((x) => (x !== '' && Number.isFinite(+x) ? +x : null));
+    const raw = String(sv).split(',');
+    const a = raw.map((x) => (x !== '' && Number.isFinite(+x) ? +x : null));
     if (a.length >= 9) board = { uptime: a[0], heap_kb: a[1], block_kb: a[2], rssi: a[3], offline: a[4], cpu_mhz: a[5],
-                                 servo_speed: a[6], servo_accel: a[7], doze_min: a[8], pmode: a.length > 9 ? a[9] : 0, t: Date.now() };
+                                 servo_speed: a[6], servo_accel: a[7], doze_min: a[8], pmode: a.length > 9 ? a[9] : 0,
+                                 heap_min: a.length > 10 ? a[10] : null,                     // least free heap since boot (bytes)
+                                 fw: raw.length > 11 ? raw[11].replace(/[^\x20-\x7e]/g, '').slice(0, 24) : null, t: Date.now() };
+    if (board.heap_min !== null && board.heap_min < 1500 && !lowHeapNoted) {   // near out of memory: worth knowing
+      lowHeapNoted = true;
+      logEvent('alert', `AYA's memory ran very low (${board.heap_min} bytes free at worst) — a freeze is likely`);
+    }
+    if (board.uptime !== null && board.uptime < 60) lowHeapNoted = false;      // (once per boot)
+  }
+  const rv = req.headers['x-restarts'];            // "epoch:why;epoch:why…" newest first, once a boot
+  if (rv !== undefined) {
+    restarts = String(rv).split(';').map((x) => { const i = x.indexOf(':'); return { t: +x.slice(0, i) * 1000, why: x.slice(i + 1).replace(/[^\x20-\x7e]/g, '').slice(0, 40) }; })
+      .filter((r) => r.why && Number.isFinite(r.t)).slice(0, 12);
   }
 }
 
@@ -1121,7 +1134,7 @@ function status() {
   return { online: age !== null && age < OFFLINE_AFTER_MS, lastFrameAgeMs: age, viewers: viewerCount(),
            fps: Math.round(fps() * 10) / 10, width: frameSize && frameSize.w, height: frameSize && frameSize.h,
            idle: isIdle(), head, map: mapGeom(), ...ages(),
-           power: power && { ...power, age: Date.now() - power.t }, board: board && { ...board, age: Date.now() - board.t }, tune, detector: localVision ? localVision.stats() : null };   // Render-side detection: frames, dropped, ms per stage
+           power: power && { ...power, age: Date.now() - power.t }, board: board && { ...board, age: Date.now() - board.t }, tune, restarts, sd: sdInfo, detector: localVision ? localVision.stats() : null };   // Render-side detection: frames, dropped, ms per stage
 }
 
 // ── AYA's brain (brain.js): chat with tools, vision, memory, rules, summaries ──
