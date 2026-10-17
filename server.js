@@ -292,7 +292,7 @@ function applyCmd(cmd, args, body = {}) {
     const num = (v, lo, hi) => (v === undefined || v === null || v === '' ? undefined
       : Number.isFinite(+v) && +v >= lo && +v <= hi ? Math.round(+v) : null);
     const R = { speed: [20, 150], accel: [50, 1000], doze: [0, 1440], pmode: [0, 2], fstyle: [0, 1], fsens: [0, 2], prest: [0, 600],
-                sleepq: [0, 240], pmin: [0, 180], pmax: [0, 180], tmin: [0, 180], tmax: [0, 180], invx: [0, 1], invy: [0, 1], face: [0, 10] };
+                sleepq: [0, 240], pmin: [0, 180], pmax: [0, 180], tmin: [0, 180], tmax: [0, 180], invx: [0, 1], invy: [0, 1], face: [0, 10], gauto: [0, 1] };
     const got = {};
     for (const [k, [lo, hi]] of Object.entries(R)) {
       const v = num(body[k], lo, hi);
@@ -610,6 +610,7 @@ function noteDeviceEvent(req) {
 // X-Power: "V,mA,mW,mAhUsed,pct,state,hours" (mA < 0 = charging; hours = to full while charging, else left)
 // X-Sys: "uptime s,heap KB,block KB,rssi,offline 0|1,cpu MHz,servo speed,servo accel,standby min,power mode 0..2"
 let power = null, board = null, tune = null, restarts = [], lowHeapNoted = false;
+let boardSelfN = null;                            // the board's count of screen changes it made itself (X-Tune)
 function noteSys(req) {
   const pv = req.headers['x-power'];
   if (pv !== undefined) {
@@ -618,11 +619,27 @@ function noteSys(req) {
     const st = /^[a-z]{1,12}$/.test(a[5] || '') ? a[5] : null;
     if (n(0) !== null) power = { v: n(0), ma: n(1), mw: n(2), mah_used: n(3), pct: n(4), state: st, hours: n(6), t: Date.now() };
   }
-  const tv = req.headers['x-tune'];               // "fstyle,fsens,prest,sleepq,pmin,pmax,tmin,tmax,invx,invy[,face]"
+  const tv = req.headers['x-tune'];               // "fstyle,fsens,prest,sleepq,pmin,pmax,tmin,tmax,invx,invy[,face[,gauto,selfn,view]]"
   if (tv !== undefined) {
-    const a = String(tv).split(',').map(Number);
-    if (a.length >= 10 && a.every(Number.isFinite))
-      tune = { fstyle: a[0], fsens: a[1], prest: a[2], sleepq: a[3], pmin: a[4], pmax: a[5], tmin: a[6], tmax: a[7], invx: a[8], invy: a[9], face: a.length > 10 ? a[10] : 0 };
+    const raw = String(tv).split(',');
+    const a = raw.slice(0, 13).map(Number);
+    if (a.length >= 10 && a.every(Number.isFinite)) {
+      const view = VIEWS.includes(raw[13]) ? raw[13] : null;
+      tune = { fstyle: a[0], fsens: a[1], prest: a[2], sleepq: a[3], pmin: a[4], pmax: a[5], tmin: a[6], tmax: a[7], invx: a[8], invy: a[9],
+               face: a.length > 10 ? a[10] : 0, gauto: a.length > 11 ? a[11] : 0, view };
+      // the board changed the screen by itself (IR double tap, Glitch turning itself off): the page follows,
+      // so "Display shows" is right and picking Glitch again reaches her (she only acts on a change)
+      const selfN = a.length > 12 ? a[12] : null;
+      if (selfN !== null && view) {
+        if (boardSelfN !== null && selfN > boardSelfN && displayState.view !== view) {   // (a restart resets the count: not a change)
+          if (displayState.view === 'glitch') logEvent('screen', view === 'eyes' && tune.gauto ? 'Malfunction screen turned itself off · every check passed for a minute'
+                                                                                              : `Malfunction screen off · switched to ${view} on AYA`);
+          displayState.view = view;
+          broadcast('display', publicDisplay());
+        }
+        boardSelfN = selfN;
+      }
+    }
   }
   const sv = req.headers['x-sys'];
   if (sv !== undefined) {
