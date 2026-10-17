@@ -185,7 +185,7 @@ module.exports = function createBrain(ctx) {
     fn('scan_room', 'Look at every part of the room once (builds the room map), then go back to the mode.', {}),
     fn('show_message', 'Show a short text on her screen.', { text: str('ASCII, up to 120 characters'), seconds: num('5-600 (default 30)') }, ['text']),
     fn('set_expression', 'An expression on her face.', { name: { type: 'string', enum: ['giggle', 'wink', 'heart', 'surprise', 'curious', 'think', 'shy', 'dizzy', 'roll', 'nod', 'squint', 'purr', 'yawn', 'sleep', 'wake'] } }, ['name']),
-    fn('set_screen', 'What her screen shows (iris = a single glowing iris), or turn it on/off.', { view: { type: 'string', enum: ['auto', 'eyes', 'iris', 'clock', 'weather', 'stats', 'detect', 'cam2', 'on', 'off'] } }, ['view']),
+    fn('set_screen', 'What her screen shows (iris = a single glowing iris), or turn it on/off.', { view: { type: 'string', enum: ['auto', 'eyes', 'iris', 'glitch', 'clock', 'weather', 'stats', 'detect', 'cam2', 'on', 'off'] } }, ['view']),
     fn('set_face', 'Her face style on the eyes screen: original (her animated eyes), pill, orb, status (clock), lens, wave, radar, viewfinder, iris, dots, lines.',
       { style: { type: 'string', enum: ['original', 'pill', 'orb', 'status', 'lens', 'wave', 'radar', 'viewfinder', 'iris', 'dots', 'lines'] } }, ['style']),
     fn('set_power_mode', 'performance (full speed), balanced, or saver (longest battery).', { mode: { type: 'string', enum: ['performance', 'balanced', 'saver'] } }, ['mode']),
